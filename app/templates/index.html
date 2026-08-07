@@ -594,6 +594,18 @@
             submitButton.classList.toggle("cursor-not-allowed", submitting);
         };
 
+        const readResponsePayload = async (response) => {
+            const contentType = (response.headers.get("content-type") || "").toLowerCase();
+            if (contentType.includes("application/json")) {
+                try {
+                    return { kind: "json", value: await response.json() };
+                } catch (error) {
+                    return { kind: "invalid-json", value: null };
+                }
+            }
+            return { kind: "text", value: await response.text() };
+        };
+
         const submitForm = async () => {
             message.textContent = "";
             setSubmitting(true);
@@ -609,19 +621,39 @@
             }
 
             try {
-                const response = await fetch("/api/evidence", {
-                    method: "POST",
-                    body: formData,
-                });
-                const data = await response.json();
-                if (!response.ok) {
-                    const errorText = response.status === 429
-                        ? "今天存得有点多啦,明天再来"
-                        : (data.detail || "保存失败,请稍后再试");
+                let response;
+                try {
+                    response = await fetch("/api/evidence", {
+                        method: "POST",
+                        body: formData,
+                    });
+                } catch (error) {
+                    console.error(error);
+                    const errorText = "请求没能发出去,请检查网络";
                     showBanner(errorText, "error");
                     message.textContent = errorText;
                     return;
                 }
+
+                const parsed = await readResponsePayload(response);
+                if (!response.ok) {
+                    let errorText = `服务器返回了意外的响应 (状态码 ${response.status})`;
+                    if (parsed.kind === "json") {
+                        errorText = response.status === 429
+                            ? "今天存得有点多啦,明天再来"
+                            : (parsed.value?.detail || errorText);
+                    }
+                    showBanner(errorText, "error");
+                    message.textContent = errorText;
+                    return;
+                }
+                if (parsed.kind !== "json") {
+                    const errorText = `服务器返回了意外的响应 (状态码 ${response.status})`;
+                    showBanner(errorText, "error");
+                    message.textContent = errorText;
+                    return;
+                }
+
                 textarea.value = "";
                 counterpartInput.value = "";
                 clearSelectedFile();
@@ -630,10 +662,6 @@
                     JSON.stringify({ tone: "success", text: hasFile ? "已保存,原件已完整保存" : "已保存,正在解析…" }),
                 );
                 window.location.reload();
-            } catch (error) {
-                const errorText = "网络异常,请稍后再试";
-                showBanner(errorText, "error");
-                message.textContent = errorText;
             } finally {
                 setSubmitting(false);
             }

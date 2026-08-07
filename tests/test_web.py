@@ -55,6 +55,39 @@ def _upload_png(
     )
 
 
+def _multipart_request(
+    client: TestClient,
+    *,
+    data: dict[str, str],
+    file_part: tuple[str, bytes, str] | None = None,
+):
+    boundary = "----workchain-boundary"
+    body = bytearray()
+
+    for key, value in data.items():
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    if file_part is not None:
+        filename, payload, content_type = file_part
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("ascii"))
+        body.extend(payload)
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("ascii"))
+    return client.post(
+        "/api/evidence",
+        content=bytes(body),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+
 def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -703,6 +736,67 @@ def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypa
         assert row["media_type"] == "image"
         assert row["raw_text"] == "[文件] annotated.png"
         assert row["plain_summary"] == "这是我补充的说明"
+    finally:
+        conn.close()
+
+
+def test_multipart_file_only_submission_returns_200(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _multipart_request(
+            client,
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            file_part=("x.png", PNG_BYTES, "image/png"),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["media_type"] == "image"
+
+
+def test_multipart_text_and_file_submission_returns_200(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _multipart_request(
+            client,
+            data={"text": "说明", "source": "飞书", "source_detail": "项目复盘群"},
+            file_part=("x.png", PNG_BYTES, "image/png"),
+        )
+
+    assert response.status_code == 200
+    evidence_id = response.json()["evidence_id"]
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT plain_summary FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["plain_summary"] == "说明"
+    finally:
+        conn.close()
+
+
+def test_multipart_text_only_submission_returns_200(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _multipart_request(
+            client,
+            data={"text": "只有文字的 multipart 提交", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["media_type"] == "text"
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT raw_text FROM evidence WHERE evidence_id = ?",
+            (response.json()["evidence_id"],),
+        ).fetchone()
+        assert row["raw_text"] == "只有文字的 multipart 提交"
     finally:
         conn.close()
 
