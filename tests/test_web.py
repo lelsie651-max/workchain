@@ -35,8 +35,10 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert response.status_code == 200
     html = response.text
     assert "这不是我要的" in html
+    assert '<h1 class="text-4xl' not in html
     assert "你手上的事" in html
     assert "事项线" not in html
+    assert "自动留证" in html
     assert "渠道复盘数据" in html
     assert "用户明细导出" in html
     assert "接口文档补充" in html
@@ -71,6 +73,7 @@ def test_thread_channel_page_contains_10_evidence_cards(tmp_path, monkeypatch):
     assert response.text.count('data-testid="timeline-card"') == 10
     assert "⚠️ 需求在这里发生了变更" in response.text
     assert "10 条记录" in response.text
+    assert 'href="/help"' in response.text
 
 
 def test_thread_userlist_page_contains_3_evidence_cards(tmp_path, monkeypatch):
@@ -102,6 +105,20 @@ def test_index_does_not_expose_hash_fields(tmp_path, monkeypatch):
     assert "chain_hash" not in html
     assert "content_hash" not in html
     assert "prev_hash" not in html
+    assert 'href="/help"' in html
+
+
+def test_help_page_returns_200_and_contains_review_notes(tmp_path, monkeypatch):
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/help")
+
+    assert response.status_code == 200
+    html = response.text
+    assert "给评审的说明" in html
+    assert "即将开放" in html
+    assert "https://github.com/lelsie651-max/workchain" in html
 
 
 def test_startup_auto_generates_demo_data_when_directory_missing(tmp_path, monkeypatch):

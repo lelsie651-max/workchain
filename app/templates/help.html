@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="space-y-6">
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+        <h2 class="text-2xl font-semibold text-white">一、这是什么</h2>
+        <div class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
+            <p>这是一个帮你把工作聊天整理清楚的小工具。谁提了要求、你答应了什么、后来又改了什么，都会按时间顺序摆出来。</p>
+            <p>真到需要说清经过的时候，你可以拿出完整记录，而且还能证明这些内容不是事后改出来的。</p>
+        </div>
+    </article>
+
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+        <h2 class="text-2xl font-semibold text-white">二、怎么用</h2>
+        <ol class="mt-4 space-y-4 text-sm text-slate-300">
+            <li class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                <div class="flex flex-wrap items-center gap-3">
+                    <span class="font-medium text-white">1. 把聊天记录粘进输入框,或上传截图、文档</span>
+                    <span class="rounded-full bg-slate-700 px-3 py-1 text-xs text-slate-200">即将开放</span>
+                </div>
+            </li>
+            <li class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                <div class="flex flex-wrap items-center gap-3">
+                    <span class="font-medium text-white">2. 系统读懂这段话在要求谁做什么、什么时候要</span>
+                    <span class="rounded-full bg-slate-700 px-3 py-1 text-xs text-slate-200">即将开放</span>
+                </div>
+            </li>
+            <li class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                <div class="flex flex-wrap items-center gap-3">
+                    <span class="font-medium text-white">3. 同一件事的记录自动串成一条时间线</span>
+                    <span class="rounded-full bg-cyan-400/15 px-3 py-1 text-xs text-cyan-200">演示中</span>
+                </div>
+            </li>
+            <li class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                <div class="flex flex-wrap items-center gap-3">
+                    <span class="font-medium text-white">4. 需要时导出,对方可以自行验证真伪</span>
+                    <span class="rounded-full bg-slate-700 px-3 py-1 text-xs text-slate-200">即将开放</span>
+                </div>
+            </li>
+        </ol>
+    </article>
+
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+        <h2 class="text-2xl font-semibold text-white">三、页面上的词都是什么意思</h2>
+        <div class="mt-4 overflow-x-auto">
+            <table class="min-w-full text-left text-sm text-slate-300">
+                <thead class="text-slate-400">
+                    <tr>
+                        <th class="border-b border-slate-800 px-3 py-3">页面上的词</th>
+                        <th class="border-b border-slate-800 px-3 py-3">意思</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">提出需求</td><td class="border-b border-slate-800 px-3 py-3">有人明确把一件事交给你或别人去做。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">确认</td><td class="border-b border-slate-800 px-3 py-3">有人回应说会做、会给，或者确认了时间。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">变更</td><td class="border-b border-slate-800 px-3 py-3">原来的要求又变了，范围、内容或时间有调整。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">交付</td><td class="border-b border-slate-800 px-3 py-3">东西已经发出去了，比如文档、数据、版本结果。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">争议</td><td class="border-b border-slate-800 px-3 py-3">双方对“到底要什么”或“是不是已经交付”出现分歧。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">参考信息</td><td class="border-b border-slate-800 px-3 py-3">只是背景聊天或通知，不算一件正在推进的工作。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">未约定时限</td><td class="border-b border-slate-800 px-3 py-3">没人把截止时间说明白。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">时限被提前</td><td class="border-b border-slate-800 px-3 py-3">时间要求被突然提前，留给你的处理时间更少了。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">已超期</td><td class="border-b border-slate-800 px-3 py-3">约好的时间已经过去，这件事还没收尾。</td></tr>
+                    <tr><td class="border-b border-slate-800 px-3 py-3">变更未确认</td><td class="border-b border-slate-800 px-3 py-3">需求改过了，但关键人没有把新说法确认清楚。</td></tr>
+                    <tr><td class="px-3 py-3">已变更3次</td><td class="px-3 py-3">这件事反复被改，沟通成本已经明显升高。</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </article>
+
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+        <h2 class="text-2xl font-semibold text-white">四、给评审的说明</h2>
+        <ul class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
+            <li>当前站点展示的是预置演示数据,共 18 条记录。</li>
+            <li>这 18 条的完整性校验链由项目的 Python 引擎真实生成,并非静态假数据。</li>
+            <li>事项线的归并与变更检测,当前为人工编排的演示数据;自动归并算法已完成设计但尚未实现。</li>
+            <li>项目仓库：<a href="https://github.com/lelsie651-max/workchain" target="_blank" rel="noreferrer" class="text-cyan-200 underline underline-offset-4">https://github.com/lelsie651-max/workchain</a></li>
+            <li>当前无需登录即可体验全部已上线功能。</li>
+        </ul>
+    </article>
+
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
+        <h2 class="text-2xl font-semibold text-white">五、技术说明</h2>
+        <div class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
+            <p>每条记录都会计算内容摘要，再和前一条记录的摘要串起来，形成一条不能从中间悄悄改写的连续序列。</p>
+            <p>导出包里还会附带独立校验脚本，不依赖本项目任何代码，也能单独验证数据是否被改过。</p>
+        </div>
+    </article>
+</section>
+{% endblock %}

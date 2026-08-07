@@ -243,6 +243,16 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.get("/help", response_class=HTMLResponse)
+    def help_page(request: Request) -> HTMLResponse:
+        return TEMPLATES.TemplateResponse(
+            request,
+            "help.html",
+            {
+                "page_title": "使用说明",
+            },
+        )
+
     @app.get("/thread/{thread_id}", response_class=HTMLResponse)
     def thread_detail(
         request: Request,
