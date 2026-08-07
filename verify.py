@@ -19,7 +19,20 @@ DIGEST_FIELDS = (
     "seq",
     "source_hint",
 )
-INT_FIELDS = frozenset({"seq", "occurred_at", "captured_at"})
+INT_FIELDS = frozenset(
+    {
+        "seq",
+        "occurred_at",
+        "captured_at",
+        "slot_due",
+        "current_due",
+        "created_at",
+        "last_activity_at",
+        "first_seen_at",
+        "at_seq",
+        "version",
+    }
+)
 
 
 def build_digest_payload(record: dict) -> dict:
@@ -88,7 +101,18 @@ def compute_record_digest(record: dict) -> str:
     return hashlib.sha256(canonical_json(build_digest_payload(record))).hexdigest()
 
 
+def is_valid_hash(value) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+
+    return all(char in "0123456789abcdef" for char in value)
+
+
 def compute_chain_hash(prev_hash: str, record_digest: str) -> str:
+    if not is_valid_hash(prev_hash):
+        raise ValueError("prev_hash must be a 64-character lowercase hex string")
+    if not is_valid_hash(record_digest):
+        raise ValueError("record_digest must be a 64-character lowercase hex string")
     return hashlib.sha256((prev_hash + record_digest).encode("ascii")).hexdigest()
 
 
@@ -110,6 +134,15 @@ def verify_export_dir(directory: Path) -> tuple[bool, int | None, str | None]:
         seq = record["seq"]
         if seq != expected_seq:
             return False, expected_seq, "seq gap"
+
+        if not is_valid_hash(record.get("prev_hash")):
+            return False, seq, "malformed hash"
+        if not is_valid_hash(record.get("chain_hash")):
+            return False, seq, "malformed hash"
+        if not is_valid_hash(record.get("content_hash")):
+            return False, seq, "malformed hash"
+        if not is_valid_hash(record.get("record_digest")):
+            return False, seq, "malformed hash"
 
         digest = compute_record_digest(record)
         if digest != record["record_digest"]:
@@ -159,8 +192,11 @@ def main(argv: list[str] | None = None) -> int:
     except json.JSONDecodeError as exc:
         print(f"invalid manifest json: {exc.msg}")
         return 2
-    except (KeyError, TypeError, ValueError) as exc:
-        print(f"verification failed: {exc}")
+    except (UnicodeEncodeError, KeyError, TypeError, ValueError) as exc:
+        print(f"FAIL reason={exc}")
+        return 1
+    except Exception as exc:
+        print(f"FAIL reason={exc}")
         return 1
 
     if ok:

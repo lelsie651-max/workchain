@@ -27,6 +27,10 @@ def _blob_relative_path(content_hash: str) -> Path:
     return Path(content_hash[:2]) / f"{content_hash}.bin"
 
 
+def _repo_verify_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "verify.py"
+
+
 def export_evidence_package(conn, *, blobs_root: Path, out_dir: Path) -> Path:
     blobs_root = Path(blobs_root)
     out_dir = Path(out_dir)
@@ -79,7 +83,9 @@ def export_evidence_package(conn, *, blobs_root: Path, out_dir: Path) -> Path:
         encoding="utf-8",
     )
 
-    repo_verify_path = Path(__file__).resolve().parents[1] / "verify.py"
+    repo_verify_path = _repo_verify_path()
+    if not repo_verify_path.exists():
+        raise FileNotFoundError(f"verify.py not found at {repo_verify_path}")
     shutil.copyfile(repo_verify_path, out_dir / "verify.py")
 
     return out_dir

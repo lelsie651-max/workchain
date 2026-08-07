@@ -9,8 +9,10 @@ from pathlib import Path
 
 import pytest
 
+from evidence_core import canonical
 from evidence_core.chain import compute_record_digest
 from evidence_core.db import init_db
+from evidence_core import export as export_module
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots
 
@@ -281,3 +283,79 @@ def test_verify_source_does_not_reference_project_package():
 
     assert "evidence_core" not in source
     assert "from evidence_core" not in source
+
+
+def test_verify_constants_are_locked_to_canonical():
+    verify_module = _load_verify_module()
+
+    assert set(verify_module.DIGEST_FIELDS) == set(canonical.DIGEST_FIELDS)
+    assert verify_module.INT_FIELDS == canonical.INT_FIELDS
+
+
+def test_invalid_prev_hash_exits_cleanly_with_malformed_hash(db_file, blobs_root, export_dir):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, text="one", captured_at=1723000000)
+    export_evidence_package(conn, blobs_root=blobs_root, out_dir=export_dir)
+    manifest = _load_manifest(export_dir)
+    manifest["records"][0]["prev_hash"] = "not-a-hash"
+    (export_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(export_dir / "verify.py"), "--dir", str(export_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "malformed hash" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_invalid_chain_hash_exits_cleanly_without_traceback(db_file, blobs_root, export_dir):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, text="one", captured_at=1723000000)
+    export_evidence_package(conn, blobs_root=blobs_root, out_dir=export_dir)
+    manifest = _load_manifest(export_dir)
+    manifest["records"][0]["chain_hash"] = "中文"
+    (export_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(export_dir / "verify.py"), "--dir", str(export_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+
+
+def test_float_seq_exits_cleanly_without_traceback(db_file, blobs_root, export_dir):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, text="one", captured_at=1723000000)
+    export_evidence_package(conn, blobs_root=blobs_root, out_dir=export_dir)
+    manifest = _load_manifest(export_dir)
+    manifest["records"][0]["seq"] = 1.0
+    (export_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(export_dir / "verify.py"), "--dir", str(export_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Traceback" not in result.stderr
+
+
+def test_export_raises_when_repo_verify_path_missing(db_file, blobs_root, export_dir, monkeypatch):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, text="one", captured_at=1723000000)
+    missing_path = export_dir / "missing-verify.py"
+
+    monkeypatch.setattr(export_module, "_repo_verify_path", lambda: missing_path)
+
+    with pytest.raises(FileNotFoundError, match="verify.py not found at"):
+        export_evidence_package(conn, blobs_root=blobs_root, out_dir=export_dir)
