@@ -12,10 +12,11 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
+from urllib.parse import quote
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm
@@ -32,6 +33,7 @@ from app.sandbox import (
     save_glossary,
     save_self_names,
 )
+from evidence_core import chain
 from evidence_core.db import init_db
 from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
@@ -39,6 +41,10 @@ from scripts.seed_demo import seed_demo_data
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
+MAX_TEXT_LENGTH = 20_000
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def _format_datetime(value: int | None, fmt: str) -> str | None:
@@ -95,6 +101,163 @@ def _start_of_current_day_ms() -> int:
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def _extract_filename(raw_text: str | None) -> str | None:
+    if not raw_text or not raw_text.startswith("[文件] "):
+        return None
+    return raw_text[5:]
+
+
+def _is_upload_value(value: Any) -> bool:
+    return bool(value) and hasattr(value, "filename") and callable(getattr(value, "read", None))
+
+
+def _looks_like_text(data: bytes) -> bool:
+    if b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _detect_upload_type(upload: UploadFile, data: bytes) -> tuple[str, str]:
+    content_type = (upload.content_type or "").lower().strip()
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        if content_type and content_type != "image/png":
+            raise HTTPException(status_code=400, detail="文件类型与内容不一致")
+        return "image", "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        if content_type and content_type != "image/jpeg":
+            raise HTTPException(status_code=400, detail="文件类型与内容不一致")
+        return "image", "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        if content_type and content_type != "image/gif":
+            raise HTTPException(status_code=400, detail="文件类型与内容不一致")
+        return "image", "image/gif"
+    if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        if content_type and content_type != "image/webp":
+            raise HTTPException(status_code=400, detail="文件类型与内容不一致")
+        return "image", "image/webp"
+    if data.startswith(b"%PDF-"):
+        if content_type and content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="文件类型与内容不一致")
+        return "file", "application/pdf"
+    if content_type == "text/plain" and _looks_like_text(data):
+        return "file", "text/plain"
+    if content_type == DOCX_MIME and data.startswith(b"PK\x03\x04"):
+        return "file", DOCX_MIME
+    raise HTTPException(status_code=400, detail="暂不支持这种文件类型")
+
+
+def _detect_blob_content_type(blob_bytes: bytes, filename: str | None) -> str:
+    if blob_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if blob_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if blob_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(blob_bytes) >= 12 and blob_bytes.startswith(b"RIFF") and blob_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if blob_bytes.startswith(b"%PDF-"):
+        return "application/pdf"
+    if _looks_like_text(blob_bytes):
+        return "text/plain; charset=utf-8"
+    if filename and filename.lower().endswith(".docx") and blob_bytes.startswith(b"PK\x03\x04"):
+        return DOCX_MIME
+    return "application/octet-stream"
+
+
+def _current_upload_storage_bytes(conn: sqlite3.Connection, blobs_root: Path) -> int:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT blob_path
+        FROM evidence
+        WHERE evidence_id NOT LIKE 'ev_demo_%'
+          AND media_type IN ('image', 'file')
+          AND blob_path IS NOT NULL
+        """
+    ).fetchall()
+    total = 0
+    for row in rows:
+        blob_path = blobs_root / row["blob_path"]
+        if blob_path.exists():
+            total += blob_path.stat().st_size
+    return total
+
+
+def _ensure_upload_budget(conn: sqlite3.Connection, blobs_root: Path, blob_bytes: bytes) -> None:
+    content_hash = chain.compute_content_hash(blob_bytes)
+    blob_path = blobs_root / content_hash[:2] / f"{content_hash}.bin"
+    additional_bytes = 0 if blob_path.exists() else len(blob_bytes)
+    current_total = _current_upload_storage_bytes(conn, blobs_root)
+    if current_total + additional_bytes > MAX_SANDBOX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="这个沙箱累计上传已超过 50 MB")
+
+
+def _build_file_label(filename: str | None) -> str:
+    clean_name = (filename or "未命名文件").strip() or "未命名文件"
+    return f"[文件] {clean_name}"
+
+
+def _build_content_disposition(disposition: str, filename: str | None) -> str:
+    if not filename:
+        return disposition
+    fallback = filename.encode("ascii", "ignore").decode("ascii") or "file"
+    fallback = fallback.replace("\\", "_").replace('"', "_").replace("\r", "_").replace("\n", "_")
+    return f'{disposition}; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename, safe="")}'
+
+
+def _unsupported_detail(media_type: str) -> str:
+    return f"这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。"
+
+
+async def _parse_evidence_input(request: Request) -> dict[str, Any]:
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        file_value = form.get("file")
+        upload = file_value if _is_upload_value(file_value) else None
+        file_bytes = None
+        detected_media_type = None
+        detected_content_type = None
+        if upload is not None and upload.filename:
+            file_bytes = await upload.read()
+            if len(file_bytes) > MAX_FILE_BYTES:
+                raise HTTPException(status_code=400, detail="单个文件不能超过 8 MB")
+            detected_media_type, detected_content_type = _detect_upload_type(upload, file_bytes)
+        return {
+            "text": str(form.get("text", "")).strip(),
+            "source": str(form.get("source", "")).strip(),
+            "source_detail": str(form.get("source_detail", "")).strip() or None,
+            "counterpart": str(form.get("counterpart", "")).strip() or None,
+            "upload": upload,
+            "file_bytes": file_bytes,
+            "media_type": detected_media_type,
+            "file_content_type": detected_content_type,
+        }
+
+    payload = await request.json()
+    return {
+        "text": str(payload.get("text", "")).strip(),
+        "source": str(payload.get("source", "")).strip(),
+        "source_detail": None if payload.get("source_detail") is None else str(payload.get("source_detail")).strip() or None,
+        "counterpart": None if payload.get("counterpart") is None else str(payload.get("counterpart")).strip() or None,
+        "upload": None,
+        "file_bytes": None,
+        "media_type": None,
+        "file_content_type": None,
+    }
 
 
 def _safe_diag_detail(message: str, api_key: str) -> str:
@@ -406,9 +569,10 @@ def _prepare_reference_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
+def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, Any]:
     platform, scene = source_label(row["source_hint"])
     raw_text = row["raw_text"] or ""
+    filename = _extract_filename(raw_text)
     return {
         "evidence_id": row["evidence_id"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
@@ -425,6 +589,11 @@ def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
         "caveats": _decode_json_array(row["caveats"]),
         "is_verified": bool(row["is_verified"]),
+        "media_type": row["media_type"],
+        "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
+        "filename": filename,
+        "is_image": row["media_type"] == "image",
+        "is_file": row["media_type"] == "file",
     }
 
 
@@ -610,7 +779,7 @@ def _prepare_timeline_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
+def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict[str, Any]:
     thread_rows = conn.execute(
         """
         SELECT
@@ -642,7 +811,7 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
     ).fetchall()
     recent_rows = conn.execute(
         """
-        SELECT evidence_id, occurred_at, source_hint, raw_text,
+        SELECT evidence_id, occurred_at, source_hint, raw_text, media_type,
                plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats
         FROM evidence
         WHERE evidence_id NOT LIKE 'ev_demo_%'
@@ -663,7 +832,7 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
     return {
         "threads": [_prepare_thread_card(row) for row in thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
-        "recent_records": [_prepare_recent_row(row) for row in decorated_recent_rows],
+        "recent_records": [_prepare_recent_row(row, sandbox) for row in decorated_recent_rows],
     }
 
 
@@ -723,7 +892,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         SELECT
             evidence_id, seq, occurred_at, captured_at, source_hint, raw_text,
             plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats,
-            content_hash, slots_filled, kind, slot_direction
+            content_hash, slots_filled, kind, slot_direction, media_type, blob_path
         FROM evidence
         WHERE evidence_id = ?
         """,
@@ -733,6 +902,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         return None
 
     platform, scene = source_label(row["source_hint"])
+    filename = _extract_filename(row["raw_text"])
     return {
         "evidence_id": row["evidence_id"],
         "seq": row["seq"],
@@ -751,6 +921,12 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "slots_filled": row["slots_filled"],
         "kind": row["kind"],
         "slot_direction": row["slot_direction"] or "none",
+        "media_type": row["media_type"],
+        "blob_path": row["blob_path"],
+        "filename": filename,
+        "is_image": row["media_type"] == "image",
+        "is_file": row["media_type"] == "file",
+        "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
     }
 
 
@@ -859,7 +1035,7 @@ def create_app() -> FastAPI:
             row = conn.execute(
                 """
                 SELECT slots_filled, plain_summary, slot_deliverable,
-                       slot_due, slot_due_raw, caveats
+                       slot_due, slot_due_raw, caveats, media_type
                 FROM evidence
                 WHERE evidence_id = ?
                 """,
@@ -877,6 +1053,7 @@ def create_app() -> FastAPI:
                 "caveats": _decode_json_array(row["caveats"]),
                 "detail": _get_parse_detail(conn, evidence_id),
                 "is_verified": _is_verified(conn, evidence_id),
+                "media_type": row["media_type"],
             }
         finally:
             conn.close()
@@ -1028,7 +1205,7 @@ def create_app() -> FastAPI:
         sandbox: SandboxContext = Depends(get_sandbox),
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> HTMLResponse:
-        context = _fetch_index_data(conn)
+        context = _fetch_index_data(conn, sandbox)
         response = TEMPLATES.TemplateResponse(
             request,
             "index.html",
@@ -1078,31 +1255,64 @@ def create_app() -> FastAPI:
         apply_sandbox_cookie(response, sandbox)
         return response
 
+    @app.get("/blob/{evidence_id}")
+    def blob_detail(
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> Response:
+        row = conn.execute(
+            """
+            SELECT evidence_id, media_type, blob_path, raw_text
+            FROM evidence
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        if row is None or row["blob_path"] is None:
+            raise HTTPException(status_code=404, detail="blob not found")
+
+        blob_path = sandbox.blobs_root / row["blob_path"]
+        if not blob_path.exists():
+            raise HTTPException(status_code=404, detail="blob not found")
+
+        blob_bytes = blob_path.read_bytes()
+        filename = _extract_filename(row["raw_text"])
+        content_type = _detect_blob_content_type(blob_bytes, filename)
+        disposition = "inline" if row["media_type"] == "image" else "attachment"
+        disposition = _build_content_disposition(disposition, filename)
+
+        response = Response(content=blob_bytes, media_type=content_type)
+        response.headers["Content-Disposition"] = disposition
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
     @app.post("/api/evidence")
     async def create_evidence(
         request: Request,
         background_tasks: BackgroundTasks,
         sandbox: SandboxContext = Depends(get_sandbox),
     ) -> JSONResponse:
-        payload = await request.json()
-        text = str(payload.get("text", "")).strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="请输入要存证的内容")
-        if len(text) > 20000:
+        payload = await _parse_evidence_input(request)
+        text = payload["text"]
+        upload = payload["upload"]
+        file_bytes = payload["file_bytes"]
+        upload_media_type = payload["media_type"]
+        if not text and file_bytes is None:
+            raise HTTPException(status_code=400, detail="请输入内容或选择一个文件")
+        if len(text) > MAX_TEXT_LENGTH:
             raise HTTPException(status_code=400, detail="内容过长,请控制在 20000 字以内")
 
-        source = str(payload.get("source", "")).strip()
+        source = payload["source"]
         if not source:
             raise HTTPException(status_code=400, detail="请选择或填写来源")
         if source not in SOURCE_PRESETS and len(source) > 20:
             raise HTTPException(status_code=400, detail="自定义来源不能超过 20 个字")
 
-        source_detail_raw = payload.get("source_detail")
-        source_detail = None if source_detail_raw is None else str(source_detail_raw).strip()
+        source_detail = payload["source_detail"]
         source_hint = source if not source_detail else f"{source}-{source_detail}"
-        counterpart_raw = payload.get("counterpart")
-        counterpart = None if counterpart_raw is None else str(counterpart_raw).strip()
-        counterpart = counterpart or None
+        counterpart = payload["counterpart"] or None
 
         conn = _open_write_connection(sandbox.db_path)
         try:
@@ -1118,36 +1328,58 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=429, detail="你今天已经存了 50 条,明天再来继续")
 
             now_ms = int(time.time() * 1000)
+            media_type = "text"
+            append_payload: bytes | str = text
+            raw_text_override = None
+            parse_status = "pending"
+            parse_detail = ""
+            if file_bytes is not None and upload_media_type is not None:
+                _ensure_upload_budget(conn, sandbox.blobs_root, file_bytes)
+                media_type = upload_media_type
+                append_payload = file_bytes
+                raw_text_override = _build_file_label(upload.filename if upload is not None else None)
+                parse_status = "unsupported"
+                parse_detail = _unsupported_detail(media_type)
+
             row = append_evidence(
                 conn,
                 blobs_root=sandbox.blobs_root,
-                media_type="text",
-                payload=text,
+                media_type=media_type,
+                payload=append_payload,
                 captured_at=now_ms,
                 occurred_at=now_ms,
                 source_hint=source_hint,
                 kind="reference",
             )
-            _set_parse_status(conn, row["evidence_id"], "pending")
-            _set_parse_detail(conn, row["evidence_id"], "")
+            if raw_text_override is not None:
+                conn.execute(
+                    "UPDATE evidence SET raw_text = ?, plain_summary = ? WHERE evidence_id = ?",
+                    (raw_text_override, text or None, row["evidence_id"]),
+                )
+                row = conn.execute("SELECT * FROM evidence WHERE evidence_id = ?", (row["evidence_id"],)).fetchone()
+                row = dict(row)
+            _set_parse_status(conn, row["evidence_id"], parse_status)
+            _set_parse_detail(conn, row["evidence_id"], parse_detail)
         finally:
             conn.close()
 
-        background_tasks.add_task(
-            _run_parse_pipeline,
-            sandbox.db_path,
-            request.app.state.global_meta_db_path,
-            row["evidence_id"],
-            text,
-            counterpart,
-        )
+        if file_bytes is None:
+            background_tasks.add_task(
+                _run_parse_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                row["evidence_id"],
+                text,
+                counterpart,
+            )
 
         response = JSONResponse(
             {
                 "evidence_id": row["evidence_id"],
                 "seq": row["seq"],
                 "occurred_at": row["occurred_at"],
-                "parse_status": "pending",
+                "parse_status": parse_status,
+                "media_type": row["media_type"],
             }
         )
         apply_sandbox_cookie(response, sandbox)

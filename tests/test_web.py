@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import re
 import sqlite3
 import threading
@@ -15,6 +16,11 @@ from evidence_core.db import init_db
 from evidence_core.store import verify_chain
 
 
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ioAAAAASUVORK5CYII="
+)
+
+
 def _make_client(tmp_path, monkeypatch):
     demo_dir = tmp_path / "web_demo_data"
     sandbox_root = tmp_path / "sandboxes"
@@ -28,6 +34,25 @@ def _sandbox_db_path(client: TestClient, sandbox_root: Path) -> Path:
     sandbox_id = client.cookies.get("wc_sid")
     assert sandbox_id is not None
     return sandbox_root / sandbox_id / "workchain.db"
+
+
+def _upload_png(
+    client: TestClient,
+    *,
+    filename: str = "demo.png",
+    text: str = "",
+    source: str = "飞书",
+    source_detail: str = "项目复盘群",
+):
+    return client.post(
+        "/api/evidence",
+        data={
+            "text": text,
+            "source": source,
+            "source_detail": source_detail,
+        },
+        files={"file": (filename, PNG_BYTES, "image/png")},
+    )
 
 
 def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
@@ -481,6 +506,205 @@ def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
         response = client_b.get(f"/evidence/{evidence_id}")
 
     assert response.status_code == 404
+
+
+def test_upload_png_returns_image_media_type_and_verify_chain_passes(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _upload_png(client, filename="screen.png")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["media_type"] == "image"
+    assert payload["parse_status"] == "unsupported"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT media_type, raw_text FROM evidence WHERE evidence_id = ?",
+            (payload["evidence_id"],),
+        ).fetchone()
+        assert row["media_type"] == "image"
+        assert row["raw_text"] == "[文件] screen.png"
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_same_image_upload_twice_reuses_blob_but_creates_two_evidence_rows(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        first = _upload_png(client, filename="same.png")
+        second = _upload_png(client, filename="same-again.png")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT evidence_id, content_hash, blob_path
+            FROM evidence
+            WHERE evidence_id IN (?, ?)
+            ORDER BY seq ASC
+            """,
+            (first.json()["evidence_id"], second.json()["evidence_id"]),
+        ).fetchall()
+        assert len(rows) == 2
+        assert len({row["evidence_id"] for row in rows}) == 2
+        assert len({row["content_hash"] for row in rows}) == 1
+        assert len({row["blob_path"] for row in rows}) == 1
+        blob_path = db_path.parent / "blobs" / rows[0]["blob_path"]
+        assert blob_path.exists()
+    finally:
+        conn.close()
+
+
+def test_fake_png_text_file_is_rejected_by_magic_bytes(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.post(
+            "/api/evidence",
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            files={"file": ("fake.png", b"just plain text", "image/png")},
+        )
+
+    assert response.status_code == 400
+
+
+def test_file_larger_than_8mb_is_rejected(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    oversized_pdf = b"%PDF-" + (b"0" * (8 * 1024 * 1024 + 1))
+
+    with client:
+        response = client.post(
+            "/api/evidence",
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            files={"file": ("too-large.pdf", oversized_pdf, "application/pdf")},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "单个文件不能超过 8 MB"
+
+
+def test_unsupported_file_type_is_rejected(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.post(
+            "/api/evidence",
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            files={"file": ("demo.exe", b"MZnot-supported", "application/octet-stream")},
+        )
+
+    assert response.status_code == 400
+
+
+def test_blob_route_returns_content_type_and_nosniff_header(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = _upload_png(client, filename="preview.png")
+        evidence_id = create_response.json()["evidence_id"]
+        blob_response = client.get(f"/blob/{evidence_id}")
+
+    assert blob_response.status_code == 200
+    assert blob_response.headers["content-type"] == "image/png"
+    assert blob_response.headers["x-content-type-options"] == "nosniff"
+    assert blob_response.headers["content-disposition"].startswith("inline")
+    assert blob_response.content == PNG_BYTES
+
+
+def test_blob_route_returns_404_across_sandboxes(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        create_response = _upload_png(client_a, filename="only-a.png")
+        evidence_id = create_response.json()["evidence_id"]
+        blob_response = client_b.get(f"/blob/{evidence_id}")
+
+    assert blob_response.status_code == 404
+
+
+def test_image_upload_sets_unsupported_and_does_not_call_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.llm.extract_slots") as mock_extract:
+        with client:
+            create_response = _upload_png(client, filename="no-llm.png")
+            evidence_id = create_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert create_response.status_code == 200
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    mock_extract.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT media_type FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["media_type"] == "image"
+    finally:
+        conn.close()
+
+
+def test_image_upload_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _upload_png(client, filename="quota.png")
+
+    assert response.status_code == 200
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        parse_counter = conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'parse_count:%'"
+        ).fetchone()
+        assert parse_counter is None
+    finally:
+        conn.close()
+
+
+def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _upload_png(client, filename="annotated.png", text="这是我补充的说明")
+
+    assert response.status_code == 200
+    evidence_id = response.json()["evidence_id"]
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT raw_text, plain_summary, media_type FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["media_type"] == "image"
+        assert row["raw_text"] == "[文件] annotated.png"
+        assert row["plain_summary"] == "这是我补充的说明"
+    finally:
+        conn.close()
 
 
 def test_patch_slots_updates_fields_and_recomputes_slots_filled(tmp_path, monkeypatch):
