@@ -298,7 +298,7 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 | 日期 | 变更 | 原因 |
 |---|---|---|
 | 2026-08-07 | v1.0 初始版本 | — |
-| 2026-08-07 | 修复 slot_direction CHECK 失效;新增 §9 | CHECK 中 OR NULL 导致约束被绕过 |
+| 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 
 ---
 
