@@ -310,6 +310,7 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 | 2026-08-07 | v1.0 初始版本 | — |
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 | 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |
+| 2026-08-07 | 新增 export.py 与独立 verify.py | 阶段一收尾 |
 
 ---
 
@@ -335,3 +336,6 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
   风险低:digest 的 7 个键均为 ASCII 字面量。
 - 最近一次 checkpoint 之后的记录若被整体删除,当前无法检测;
   需 TSA 时间戳封堵,见 §4.6。
+- checkpoints 表本身若被一并删除,verify_chain 无法检测。
+  自持有数据无法自我封堵此风险;缓解方式是举证包一经导出交付,
+  对方持有的 manifest 即成为外部锚点。彻底方案为 TSA 时间戳。

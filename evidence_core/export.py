@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import json
+import shutil
+import time
+from pathlib import Path
+
+from evidence_core import chain
+from evidence_core.store import make_checkpoint
+
+
+MANIFEST_RECORD_FIELDS = (
+    "evidence_id",
+    "seq",
+    "content_hash",
+    "occurred_at",
+    "captured_at",
+    "media_type",
+    "source_hint",
+    "record_digest",
+    "prev_hash",
+    "chain_hash",
+)
+
+
+def _blob_relative_path(content_hash: str) -> Path:
+    return Path(content_hash[:2]) / f"{content_hash}.bin"
+
+
+def export_evidence_package(conn, *, blobs_root: Path, out_dir: Path) -> Path:
+    blobs_root = Path(blobs_root)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "blobs").mkdir(parents=True, exist_ok=True)
+
+    make_checkpoint(conn)
+
+    rows = conn.execute("SELECT * FROM evidence ORDER BY seq ASC").fetchall()
+    checkpoints = conn.execute(
+        "SELECT at_seq, chain_hash, created_at FROM checkpoints ORDER BY at_seq ASC, created_at ASC"
+    ).fetchall()
+
+    records = []
+    seen_hashes: set[str] = set()
+    for row in rows:
+        record = dict(row)
+        content_hash = record["content_hash"]
+        record_export = {
+            "evidence_id": record["evidence_id"],
+            "seq": record["seq"],
+            "content_hash": content_hash,
+            "occurred_at": record["occurred_at"],
+            "captured_at": record["captured_at"],
+            "media_type": record["media_type"],
+            "source_hint": record["source_hint"],
+            "record_digest": chain.compute_record_digest(record),
+            "prev_hash": record["prev_hash"],
+            "chain_hash": record["chain_hash"],
+        }
+        records.append(record_export)
+
+        if content_hash not in seen_hashes:
+            seen_hashes.add(content_hash)
+            relative_blob_path = _blob_relative_path(content_hash)
+            source_blob_path = blobs_root / relative_blob_path
+            target_blob_path = out_dir / "blobs" / relative_blob_path
+            target_blob_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_blob_path, target_blob_path)
+
+    manifest = {
+        "version": 1,
+        "generated_at": int(time.time() * 1000),
+        "records": records,
+        "checkpoints": [dict(checkpoint) for checkpoint in checkpoints],
+    }
+    manifest_path = out_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    repo_verify_path = Path(__file__).resolve().parents[1] / "verify.py"
+    shutil.copyfile(repo_verify_path, out_dir / "verify.py")
+
+    return out_dir
