@@ -104,13 +104,13 @@ def _threads() -> list[dict]:
         {
             "thread_id": "thr_apidoc",
             "title": "接口文档补充",
-            "status": "delivered",
+            "status": "open",
             "owner_actor_id": "act_self",
             "requester_actor_id": "act_wang",
             "current_deliverable": "接口文档",
             "current_due": _ts("2026-03-13T18:00:00"),
             "version": 1,
-            "risk_flags": [],
+            "risk_flags": ["due_missing"],
             "first_seen_at": _ts("2026-03-12T15:30:00"),
             "last_activity_at": _ts("2026-03-12T15:30:00"),
         },
@@ -162,7 +162,7 @@ def _story_records() -> list[dict]:
             "occurred_at": _ts("2026-03-05T12:30:00"),
             "captured_at": _ts("2026-03-05T12:31:00"),
             "source_hint": "飞书-项目复盘群",
-            "thread_id": "thr_channel",
+            "thread_id": None,
             "payload": "李娜:昨天楼下咖啡店又涨价了，行政是不是又换供应商了？",
             "slots": None,
         },
@@ -228,7 +228,7 @@ def _story_records() -> list[dict]:
             "occurred_at": _ts("2026-03-10T11:00:00"),
             "captured_at": _ts("2026-03-10T11:01:00"),
             "source_hint": "飞书-项目复盘群",
-            "thread_id": "thr_channel",
+            "thread_id": None,
             "payload": "行政:本周五下午公司统一放假半天，晚上的团建请大家自行安排返程。",
             "slots": None,
         },
@@ -244,11 +244,9 @@ def _story_records() -> list[dict]:
                 "slot_requester": "act_zhang",
                 "slot_owner": "act_self",
                 "slot_deliverable": "按季度拆分的渠道复盘数据",
-                "slot_due": _ts("2026-03-11T18:00:00"),
-                "slot_due_raw": "周三前",
                 "slot_direction": "i_owe",
                 "plain_summary": "你询问渠道复盘是否顺延到周三前，但没有收到明确确认。",
-                "caveats": ["顺延时间由你提出,对方未明确回复"],
+                "caveats": ["对方未回复,交付时限处于未确认状态"],
             },
         },
         {
@@ -300,8 +298,6 @@ def _story_records() -> list[dict]:
                 "slot_requester": "act_zhang",
                 "slot_owner": "act_self",
                 "slot_deliverable": "可直接用于周会的渠道复盘材料",
-                "slot_due": _ts("2026-03-19T18:00:00"),
-                "slot_due_raw": "尽快",
                 "slot_direction": "i_owe",
                 "plain_summary": "张总否认当前交付符合预期，要求改成可直接上会的渠道复盘材料。",
             },
@@ -312,7 +308,7 @@ def _story_records() -> list[dict]:
             "occurred_at": _ts("2026-03-19T12:00:00"),
             "captured_at": _ts("2026-03-19T12:01:00"),
             "source_hint": "飞书-项目复盘群",
-            "thread_id": "thr_channel",
+            "thread_id": None,
             "payload": "王强:中午点什么外卖？昨天那家黄焖鸡还行，就是米饭太硬了。",
             "slots": None,
         },
@@ -395,7 +391,7 @@ def _story_records() -> list[dict]:
             "occurred_at": _ts("2026-04-03T09:00:00"),
             "captured_at": _ts("2026-04-03T09:01:00"),
             "source_hint": "飞书-项目复盘群",
-            "thread_id": "thr_channel",
+            "thread_id": None,
             "payload": "HR:下周一开始工位调整，大家中午前把桌面收一下，电脑外设别落在原位。",
             "slots": None,
         },
@@ -504,11 +500,12 @@ def seed_demo_data(out_dir: Path) -> dict:
             if record["slots"] is not None:
                 update_slots(conn, appended["evidence_id"], **record["slots"])
 
-            conn.execute(
-                "UPDATE evidence SET thread_id = ? WHERE evidence_id = ?",
-                (record["thread_id"], appended["evidence_id"]),
-            )
-            conn.commit()
+            if record["thread_id"] is not None:
+                conn.execute(
+                    "UPDATE evidence SET thread_id = ? WHERE evidence_id = ?",
+                    (record["thread_id"], appended["evidence_id"]),
+                )
+                conn.commit()
 
         verify_result = verify_chain(conn, blobs_root=blobs_root)
         if verify_result != (True, None, None):

@@ -130,16 +130,64 @@ def test_seed_demo_creates_three_threads_and_channel_version_four(tmp_path):
         conn.close()
 
 
-def test_every_evidence_has_thread_id(tmp_path):
+def test_reference_records_have_null_thread_id(tmp_path):
     out_dir = tmp_path / "demo_data"
     _run_seed(out_dir)
 
     conn = _connect(out_dir / "workchain.db")
     try:
-        missing = conn.execute(
-            "SELECT COUNT(*) AS count FROM evidence WHERE thread_id IS NULL"
+        rows = conn.execute(
+            "SELECT thread_id FROM evidence WHERE kind = 'reference' ORDER BY seq"
+        ).fetchall()
+        assert len(rows) == 4
+        assert all(row["thread_id"] is None for row in rows)
+    finally:
+        conn.close()
+
+
+def test_non_reference_records_have_non_null_thread_id(tmp_path):
+    out_dir = tmp_path / "demo_data"
+    _run_seed(out_dir)
+
+    conn = _connect(out_dir / "workchain.db")
+    try:
+        rows = conn.execute(
+            "SELECT thread_id FROM evidence WHERE kind != 'reference' ORDER BY seq"
+        ).fetchall()
+        assert len(rows) == 14
+        assert all(row["thread_id"] is not None for row in rows)
+    finally:
+        conn.close()
+
+
+def test_slots_filled_distribution_matches_story_design(tmp_path):
+    out_dir = tmp_path / "demo_data"
+    _run_seed(out_dir)
+
+    conn = _connect(out_dir / "workchain.db")
+    try:
+        count_three = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE slots_filled = 3"
         ).fetchone()["count"]
-        assert missing == 0
+        count_four = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE slots_filled = 4"
+        ).fetchone()["count"]
+        assert count_three == 2
+        assert count_four == 12
+    finally:
+        conn.close()
+
+
+def test_thr_apidoc_status_is_open(tmp_path):
+    out_dir = tmp_path / "demo_data"
+    _run_seed(out_dir)
+
+    conn = _connect(out_dir / "workchain.db")
+    try:
+        status = conn.execute(
+            "SELECT status FROM threads WHERE thread_id = 'thr_apidoc'"
+        ).fetchone()["status"]
+        assert status == "open"
     finally:
         conn.close()
 
