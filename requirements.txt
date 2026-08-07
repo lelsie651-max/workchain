@@ -1,1 +1,4 @@
+fastapi
+jinja2
 pytest
+uvicorn[standard]

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="mb-10">
+    <div class="mb-5 flex items-end justify-between gap-4">
+        <div>
+            <h2 class="text-xl font-semibold text-white">事项线总览</h2>
+            <p class="mt-1 text-sm text-slate-400">演示数据按事项线聚合展示,便于快速看清需求、变更和争议。</p>
+        </div>
+    </div>
+
+    <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        {% for thread in threads %}
+        <a
+            href="/thread/{{ thread.thread_id }}"
+            class="block rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
+            data-testid="thread-card"
+        >
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
+                    <p class="mt-2 text-sm text-slate-400">{{ thread.status_label }} · 第 {{ thread.version }} 版</p>
+                </div>
+                <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">
+                    {{ thread.evidence_count }} 条证据
+                </span>
+            </div>
+
+            <div class="mt-4 flex flex-wrap gap-2">
+                {% for label in thread.risk_labels %}
+                <span class="rounded-full bg-amber-400/15 px-3 py-1 text-xs text-amber-200">{{ label }}</span>
+                {% endfor %}
+            </div>
+
+            <p class="mt-4 text-sm text-slate-400">最后活动时间：{{ thread.last_activity_text }}</p>
+        </a>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+    <details open>
+        <summary class="cursor-pointer list-none text-lg font-semibold text-white">
+            参考信息
+            <span class="ml-2 text-sm font-normal text-slate-400">已识别为参考信息,未计入待办</span>
+        </summary>
+
+        <div class="mt-5 space-y-4">
+            {% for ref in references %}
+            <article class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                    <span>#{{ ref.seq }}</span>
+                    <span>{{ ref.occurred_at_text }}</span>
+                    <span>{{ ref.source_hint }}</span>
+                </div>
+                <p class="text-sm leading-6 text-slate-200">{{ ref.raw_text }}</p>
+            </article>
+            {% endfor %}
+        </div>
+    </details>
+</section>
+{% endblock %}
