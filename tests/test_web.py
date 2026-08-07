@@ -109,6 +109,7 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert "保存" in html
     assert "存证" not in html
     assert "谁答应了谁什么" in html
+    assert "还没告诉系统你在对话里叫什么" in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -601,3 +602,120 @@ def test_parse_limit_marks_21st_record_failed(tmp_path, monkeypatch):
     assert last_response.status_code == 200
     assert status_response.json()["parse_status"] == "failed"
     assert status_response.json()["detail"] == "今日解析次数已用完,记录仍已保存"
+
+
+def test_parse_pipeline_passes_context_from_settings_and_counterpart(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_extract(text, today, context=None):
+        captured["context"] = context
+        return {
+            "requester_name": "活爹",
+            "owner_name": "我",
+            "deliverable": "复盘",
+            "due_raw": None,
+            "due_date": None,
+            "direction": "none",
+            "kind": "request",
+            "plain_summary": "先记一下。",
+            "caveats": [],
+        }
+
+    with client:
+        client.post(
+            "/api/settings",
+            json={
+                "self_names": ["热心市民小李"],
+                "glossary": [{"term": "活爹", "kind": "person", "meaning": "张伟"}],
+            },
+        )
+        with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+            response = client.post(
+                "/api/evidence",
+                json={
+                    "text": "活爹说先记一下。",
+                    "source": "飞书",
+                    "source_detail": "项目复盘群",
+                    "counterpart": "冯云生(师父)",
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["context"]["self_names"] == ["热心市民小李"]
+    assert captured["context"]["glossary"] == [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
+    assert captured["context"]["counterpart"] == "冯云生(师父)"
+
+
+def test_settings_save_and_read_self_names(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        save_response = client.post(
+            "/api/settings",
+            json={"self_names": ["热心市民小李", "小李"], "glossary": []},
+        )
+        get_response = client.get("/api/settings")
+
+    assert save_response.status_code == 200
+    assert get_response.status_code == 200
+    assert get_response.json()["self_names"] == ["热心市民小李", "小李"]
+    assert get_response.json()["has_self_names"] is True
+
+
+def test_settings_reject_more_than_five_self_names(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.post(
+            "/api/settings",
+            json={"self_names": ["1", "2", "3", "4", "5", "6"], "glossary": []},
+        )
+
+    assert response.status_code == 400
+
+
+def test_settings_glossary_save_and_limit(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    glossary = [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
+
+    with client:
+        save_response = client.post(
+            "/api/settings",
+            json={"self_names": [], "glossary": glossary},
+        )
+        get_response = client.get("/api/settings")
+        limit_response = client.post(
+            "/api/settings",
+            json={
+                "self_names": [],
+                "glossary": [{"term": str(i), "kind": "phrase", "meaning": "x"} for i in range(51)],
+            },
+        )
+
+    assert save_response.status_code == 200
+    assert get_response.json()["glossary"] == glossary
+    assert limit_response.status_code == 400
+
+
+def test_settings_are_isolated_between_sandboxes(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        client_a.post(
+            "/api/settings",
+            json={"self_names": ["小李"], "glossary": [{"term": "活爹", "kind": "person", "meaning": "张伟"}]},
+        )
+        response_a = client_a.get("/api/settings")
+        response_b = client_b.get("/api/settings")
+
+    assert response_a.json()["self_names"] == ["小李"]
+    assert response_b.json()["self_names"] == []
+    assert response_b.json()["glossary"] == []

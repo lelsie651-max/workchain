@@ -14,7 +14,7 @@ import httpx
 ALLOWED_DIRECTIONS = {"i_owe", "owed_to_me", "none"}
 ALLOWED_KINDS = {"request", "confirm", "change", "deliver", "dispute", "reference"}
 
-SYSTEM_PROMPT = """你从一段职场聊天记录中抽取“谁要求谁做什么、什么时候要”。
+SYSTEM_PROMPT = """你从一段聊天记录中抽取“谁答应了谁什么、什么时候”。场景不限于工作,私人约定同样算数。
 只输出 JSON,不要解释,不要 markdown 代码块。
 字段:
 - requester_name: 提出方姓名或称呼,无法判断填 null
@@ -28,6 +28,8 @@ SYSTEM_PROMPT = """你从一段职场聊天记录中抽取“谁要求谁做什�
 - caveats: 字符串数组,记录歧义处,无则空数组
 若这段话不构成任何请求或承诺(闲聊、通知、八卦),除 kind="reference" 与 plain_summary 外其余字段一律 null。
 today 参数为当前日期,用于推算相对时间。"""
+
+CONTEXT_SUFFIX = "词汇对照仅供参考。若某个词在原文中明显是感叹、玩笑或另有所指,以原文语境为准,不要机械套用对照。"
 
 
 def _default_slots() -> dict[str, Any]:
@@ -120,10 +122,60 @@ def parse_llm_json(raw: str) -> dict[str, Any] | None:
     return None
 
 
-def extract_slots(text: str, today: str) -> dict[str, Any] | None:
+def build_context_block(context: dict[str, Any] | None) -> str:
+    if not context:
+        return ""
+
+    self_names = [
+        item.strip()
+        for item in (context.get("self_names") or [])
+        if isinstance(item, str) and item.strip()
+    ]
+    glossary = [
+        item
+        for item in (context.get("glossary") or [])
+        if isinstance(item, dict)
+        and isinstance(item.get("term"), str)
+        and item.get("term", "").strip()
+        and isinstance(item.get("meaning"), str)
+        and item.get("meaning", "").strip()
+        and item.get("kind") in {"person", "phrase"}
+    ]
+    counterpart = context.get("counterpart")
+    counterpart_text = counterpart.strip() if isinstance(counterpart, str) else ""
+
+    if not self_names and not glossary and not counterpart_text:
+        return ""
+
+    lines = ["【已知信息】"]
+    if self_names:
+        lines.append(f"用户本人在对话中的称呼:{'、'.join(self_names)}")
+    if counterpart_text:
+        lines.append(f"对话另一方:{counterpart_text}")
+    if glossary:
+        lines.append("词汇对照:")
+        for item in glossary:
+            label = "指人" if item["kind"] == "person" else "说法"
+            lines.append(f"- {item['term'].strip()} → {item['meaning'].strip()}({label})")
+    lines.append(CONTEXT_SUFFIX)
+    return "\n".join(lines)
+
+
+def extract_slots(text: str, today: str, context: dict[str, Any] | None = None) -> dict[str, Any] | None:
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         return None
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    context_block = build_context_block(context)
+    if context_block:
+        messages.append({"role": "system", "content": context_block})
+    messages.append(
+        {
+            "role": "user",
+            "content": f"today={today}\ntext={text}",
+        }
+    )
 
     try:
         response = httpx.post(
@@ -135,13 +187,7 @@ def extract_slots(text: str, today: str) -> dict[str, Any] | None:
             json={
                 "model": "deepseek-chat",
                 "temperature": 0,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"today={today}\ntext={text}",
-                    },
-                ],
+                "messages": messages,
             },
             timeout=20.0,
         )
@@ -198,6 +244,39 @@ def resolve_actor(conn: sqlite3.Connection, name: str | None) -> str | None:
             int(time.time() * 1000),
         ),
     )
+    return actor_id
+
+
+def resolve_actor_with_glossary(conn: sqlite3.Connection, name: str | None, glossary: list[dict] | None = None) -> str | None:
+    glossary = glossary or []
+    if name is None:
+        return None
+
+    matched_entry = next(
+        (
+            item for item in glossary
+            if item.get("kind") == "person" and item.get("term") == name and isinstance(item.get("meaning"), str)
+        ),
+        None,
+    )
+    if matched_entry is None:
+        return resolve_actor(conn, name)
+
+    actor_id = resolve_actor(conn, matched_entry["meaning"])
+    if actor_id is None:
+        return None
+
+    row = conn.execute(
+        "SELECT aliases FROM actors WHERE actor_id = ?",
+        (actor_id,),
+    ).fetchone()
+    aliases = json.loads(row["aliases"]) if row and row["aliases"] else []
+    if name not in aliases:
+        aliases.append(name)
+        conn.execute(
+            "UPDATE actors SET aliases = ? WHERE actor_id = ?",
+            (json.dumps(aliases, ensure_ascii=False, separators=(",", ":")), actor_id),
+        )
     return actor_id
 
 

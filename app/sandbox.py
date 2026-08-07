@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
@@ -9,9 +11,13 @@ from pathlib import Path
 
 from fastapi import Request, Response
 
+from evidence_core.db import init_db
+
 
 COOKIE_NAME = "wc_sid"
 COOKIE_MAX_AGE_SECONDS = 24 * 60 * 60
+SELF_NAMES_KEY = "settings:self_names"
+GLOSSARY_KEY = "settings:glossary"
 
 
 @dataclass(frozen=True)
@@ -98,3 +104,95 @@ def cleanup_expired(sandbox_root: Path | None = None, max_age_hours: int = 24) -
             continue
         if child.stat().st_mtime < cutoff:
             shutil.rmtree(child, ignore_errors=True)
+
+
+def _load_json_value(conn: sqlite3.Connection, key: str, default):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    try:
+        return json.loads(row["value"])
+    except json.JSONDecodeError:
+        return default
+
+
+def _save_json_value(conn: sqlite3.Connection, key: str, value) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, json.dumps(value, ensure_ascii=False, separators=(",", ":"))),
+    )
+    conn.commit()
+
+
+def get_self_names(db_path: Path) -> list[str]:
+    conn = init_db(db_path)
+    try:
+        value = _load_json_value(conn, SELF_NAMES_KEY, [])
+        return value if isinstance(value, list) else []
+    finally:
+        conn.close()
+
+
+def save_self_names(db_path: Path, self_names: list[str]) -> list[str]:
+    if len(self_names) > 5:
+        raise ValueError("self_names cannot exceed 5 items")
+    normalized = []
+    for item in self_names:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if text and text not in normalized:
+            normalized.append(text)
+
+    conn = init_db(db_path)
+    try:
+        _save_json_value(conn, SELF_NAMES_KEY, normalized)
+        return normalized
+    finally:
+        conn.close()
+
+
+def get_glossary(db_path: Path) -> list[dict]:
+    conn = init_db(db_path)
+    try:
+        value = _load_json_value(conn, GLOSSARY_KEY, [])
+        return value if isinstance(value, list) else []
+    finally:
+        conn.close()
+
+
+def save_glossary(db_path: Path, glossary: list[dict]) -> list[dict]:
+    if len(glossary) > 50:
+        raise ValueError("glossary cannot exceed 50 items")
+
+    normalized: list[dict] = []
+    for item in glossary:
+        if not isinstance(item, dict):
+            continue
+        term = str(item.get("term", "")).strip()
+        kind = str(item.get("kind", "")).strip()
+        meaning = str(item.get("meaning", "")).strip()
+        if not term and not meaning and not kind:
+            continue
+        if kind not in {"person", "phrase"}:
+            continue
+        if not term or not meaning:
+            continue
+        normalized.append({"term": term, "kind": kind, "meaning": meaning})
+
+    conn = init_db(db_path)
+    try:
+        _save_json_value(conn, GLOSSARY_KEY, normalized)
+        return normalized
+    finally:
+        conn.close()
+
+
+def get_settings(db_path: Path) -> dict:
+    return {
+        "self_names": get_self_names(db_path),
+        "glossary": get_glossary(db_path),
+    }

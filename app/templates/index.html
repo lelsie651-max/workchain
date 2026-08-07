@@ -8,6 +8,83 @@
         role="status"
         aria-live="polite"
     ></div>
+    <details class="mb-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-4" id="settings-panel">
+        <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">让它更懂你</summary>
+        <div class="mt-4 space-y-5">
+            <div>
+                <label class="block text-sm font-medium text-slate-200">你在对话里叫什么</label>
+                <p class="mt-1 text-xs text-slate-500">填了之后,系统才知道哪句话是你说的</p>
+                <div id="self-names-tags" class="mt-3 flex flex-wrap gap-2">
+                    {% for item in settings.self_names %}
+                    <button
+                        type="button"
+                        class="inline-flex min-h-11 items-center gap-2 rounded-full border border-slate-700 px-3 py-2 text-sm text-slate-200"
+                        data-self-name="{{ item }}"
+                    >
+                        <span>{{ item }}</span>
+                        <span class="text-slate-500">×</span>
+                    </button>
+                    {% endfor %}
+                </div>
+                <div class="mt-3 flex flex-wrap gap-3">
+                    <input
+                        id="self-name-input"
+                        type="text"
+                        class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                        placeholder="如:小李"
+                    >
+                    <button
+                        id="add-self-name"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        添加称呼
+                    </button>
+                </div>
+            </div>
+
+            <div>
+                <label class="block text-sm font-medium text-slate-200">我的词典</label>
+                <div class="mt-3 space-y-3" id="glossary-rows">
+                    {% for item in settings.glossary %}
+                    <div class="grid gap-3 md:grid-cols-[1fr_140px_1fr_auto]">
+                        <input type="text" value="{{ item.term }}" data-glossary-term class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                        <select data-glossary-kind class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                            <option value="person" {% if item.kind == "person" %}selected{% endif %}>人物</option>
+                            <option value="phrase" {% if item.kind == "phrase" %}selected{% endif %}>说法</option>
+                        </select>
+                        <input type="text" value="{{ item.meaning }}" data-glossary-meaning class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                        <button type="button" data-remove-glossary class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                    </div>
+                    {% endfor %}
+                </div>
+                <div class="mt-3 flex flex-wrap gap-3">
+                    <button
+                        id="add-glossary-row"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        新增词条
+                    </button>
+                    <button
+                        id="save-settings"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
+                    >
+                        保存设置
+                    </button>
+                </div>
+                <p class="mt-2 text-xs text-slate-500">如果这个词在某句话里是随口一说,系统会以原文为准</p>
+            </div>
+        </div>
+    </details>
+
+    <div
+        id="self-name-warning"
+        class="{% if settings.has_self_names %}hidden {% endif %}mb-4 rounded-2xl border border-yellow-400/30 bg-yellow-400/10 px-4 py-3 text-sm text-yellow-100"
+    >
+        还没告诉系统你在对话里叫什么,解析可能认不出哪句是你说的
+    </div>
     <form id="evidence-form" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
         <p class="mb-3 text-sm text-slate-400">把聊天记录粘进来,系统会读懂谁答应了谁什么、什么时候要</p>
         <label for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
@@ -51,6 +128,16 @@
                     name="source_detail"
                     type="text"
                     placeholder="如:项目复盘群"
+                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                >
+            </div>
+            <div>
+                <label for="counterpart-input" class="mb-2 block text-sm text-slate-300">这段对话里的另一方是谁</label>
+                <input
+                    id="counterpart-input"
+                    name="counterpart"
+                    type="text"
+                    placeholder="可留空"
                     class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
                 >
             </div>
@@ -215,11 +302,21 @@
         const sourceCustomWrap = document.getElementById("source-custom-wrap");
         const sourceCustom = document.getElementById("source-custom");
         const sourceDetail = document.getElementById("source-detail");
+        const counterpartInput = document.getElementById("counterpart-input");
         const message = document.getElementById("form-message");
         const flashBanner = document.getElementById("flash-banner");
         const submitButton = document.getElementById("submit-button");
+        const selfNameWarning = document.getElementById("self-name-warning");
+        const selfNamesTags = document.getElementById("self-names-tags");
+        const selfNameInput = document.getElementById("self-name-input");
+        const addSelfNameButton = document.getElementById("add-self-name");
+        const glossaryRows = document.getElementById("glossary-rows");
+        const addGlossaryRowButton = document.getElementById("add-glossary-row");
+        const saveSettingsButton = document.getElementById("save-settings");
         const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status='pending']")];
         const toggleButtons = [...document.querySelectorAll("[data-toggle-fulltext]")];
+        let selfNames = {{ settings.self_names|tojson }};
+        let glossary = {{ settings.glossary|tojson }};
 
         const syncCustomSource = () => {
             const isCustom = sourceSelect.value === "__custom__";
@@ -264,6 +361,7 @@
                 text: textarea.value,
                 source: selectedSource,
                 source_detail: sourceDetail.value.trim() || null,
+                counterpart: counterpartInput.value.trim() || null,
             };
 
             try {
@@ -284,6 +382,7 @@
                     return;
                 }
                 textarea.value = "";
+                counterpartInput.value = "";
                 sessionStorage.setItem("workchainFlash", JSON.stringify({ tone: "success", text: "已保存,正在解析…" }));
                 window.location.reload();
             } catch (error) {
@@ -342,6 +441,85 @@
             }, 2000);
         };
 
+        const syncSelfNameWarning = () => {
+            selfNameWarning.classList.toggle("hidden", selfNames.length > 0);
+        };
+
+        const renderSelfNames = () => {
+            selfNamesTags.innerHTML = "";
+            selfNames.forEach((item) => {
+                const button = document.createElement("button");
+                button.type = "button";
+                button.className = "inline-flex min-h-11 items-center gap-2 rounded-full border border-slate-700 px-3 py-2 text-sm text-slate-200";
+                button.dataset.selfName = item;
+                button.innerHTML = `<span>${item}</span><span class="text-slate-500">×</span>`;
+                button.addEventListener("click", () => {
+                    selfNames = selfNames.filter((name) => name !== item);
+                    renderSelfNames();
+                });
+                selfNamesTags.appendChild(button);
+            });
+            syncSelfNameWarning();
+        };
+
+        const createGlossaryRow = (item = { term: "", kind: "person", meaning: "" }) => {
+            const row = document.createElement("div");
+            row.className = "grid gap-3 md:grid-cols-[1fr_140px_1fr_auto]";
+            row.innerHTML = `
+                <input type="text" value="${item.term || ""}" data-glossary-term class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                <select data-glossary-kind class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                    <option value="person" ${item.kind === "person" ? "selected" : ""}>人物</option>
+                    <option value="phrase" ${item.kind === "phrase" ? "selected" : ""}>说法</option>
+                </select>
+                <input type="text" value="${item.meaning || ""}" data-glossary-meaning class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                <button type="button" data-remove-glossary class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+            `;
+            row.querySelector("[data-remove-glossary]").addEventListener("click", () => {
+                row.remove();
+            });
+            return row;
+        };
+
+        const renderGlossary = () => {
+            glossaryRows.innerHTML = "";
+            glossary.forEach((item) => {
+                glossaryRows.appendChild(createGlossaryRow(item));
+            });
+        };
+
+        const collectGlossary = () => {
+            return [...glossaryRows.children].map((row) => ({
+                term: row.querySelector("[data-glossary-term]").value.trim(),
+                kind: row.querySelector("[data-glossary-kind]").value,
+                meaning: row.querySelector("[data-glossary-meaning]").value.trim(),
+            }));
+        };
+
+        const saveSettings = async () => {
+            try {
+                const response = await fetch("/api/settings", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        self_names: selfNames,
+                        glossary: collectGlossary(),
+                    }),
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showBanner(data.detail || "保存设置失败", "error");
+                    return;
+                }
+                selfNames = data.self_names || [];
+                glossary = data.glossary || [];
+                renderSelfNames();
+                renderGlossary();
+                showBanner("设置已保存,马上生效", "success");
+            } catch (error) {
+                showBanner("保存设置失败,请稍后再试", "error");
+            }
+        };
+
         sourceSelect.addEventListener("change", syncCustomSource);
         syncCustomSource();
 
@@ -361,6 +539,26 @@
                 full.classList.toggle("hidden", isExpanded);
                 button.textContent = isExpanded ? "展开全文" : "收起";
             });
+        });
+
+        addSelfNameButton.addEventListener("click", () => {
+            const value = selfNameInput.value.trim();
+            if (!value) {
+                return;
+            }
+            if (!selfNames.includes(value)) {
+                selfNames.push(value);
+            }
+            selfNameInput.value = "";
+            renderSelfNames();
+        });
+
+        addGlossaryRowButton.addEventListener("click", () => {
+            glossaryRows.appendChild(createGlossaryRow());
+        });
+
+        saveSettingsButton.addEventListener("click", () => {
+            saveSettings();
         });
 
         form.addEventListener("submit", (event) => {
@@ -386,6 +584,8 @@
             }
         }
 
+        renderSelfNames();
+        renderGlossary();
         pendingCards.forEach((card) => pollParseStatus(card));
     })();
 </script>

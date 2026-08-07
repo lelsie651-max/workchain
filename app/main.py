@@ -19,7 +19,17 @@ from fastapi.templating import Jinja2Templates
 from app import llm
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
-from app.sandbox import SandboxContext, apply_sandbox_cookie, cleanup_expired, get_sandbox
+from app.sandbox import (
+    SandboxContext,
+    apply_sandbox_cookie,
+    cleanup_expired,
+    get_glossary,
+    get_sandbox,
+    get_self_names,
+    get_settings,
+    save_glossary,
+    save_self_names,
+)
 from evidence_core.db import init_db
 from evidence_core.store import append_evidence, update_slots
 from scripts.seed_demo import seed_demo_data
@@ -251,6 +261,7 @@ def _run_parse_pipeline(
     global_meta_db_path: Path,
     evidence_id: str,
     text: str,
+    counterpart: str | None,
 ) -> None:
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
@@ -272,8 +283,12 @@ def _run_parse_pipeline(
             conn.close()
         return
 
+    context = get_settings(sandbox_db_path)
+    if counterpart:
+        context["counterpart"] = counterpart
+
     try:
-        parsed = llm.extract_slots(text, _today_str())
+        parsed = llm.extract_slots(text, _today_str(), context=context)
     except Exception:
         parsed = None
     parsed = llm.normalize_slots(parsed)
@@ -288,8 +303,9 @@ def _run_parse_pipeline(
 
     conn = init_db(sandbox_db_path)
     try:
-        requester_id = llm.resolve_actor(conn, parsed.get("requester_name"))
-        owner_id = llm.resolve_actor(conn, parsed.get("owner_name"))
+        glossary = context.get("glossary", [])
+        requester_id = llm.resolve_actor_with_glossary(conn, parsed.get("requester_name"), glossary)
+        owner_id = llm.resolve_actor_with_glossary(conn, parsed.get("owner_name"), glossary)
         slot_due = llm.due_date_to_millis(parsed.get("due_date"))
 
         update_slots(
@@ -377,6 +393,15 @@ def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
         "deliverable": row["slot_deliverable"],
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
         "caveats": _decode_json_array(row["caveats"]),
+    }
+
+
+def _settings_payload(db_path: Path) -> dict[str, Any]:
+    settings = get_settings(db_path)
+    return {
+        "self_names": settings["self_names"],
+        "glossary": settings["glossary"],
+        "has_self_names": bool(settings["self_names"]),
     }
 
 
@@ -665,6 +690,40 @@ def create_app() -> FastAPI:
         finally:
             conn.close()
 
+    @app.get("/api/settings")
+    def settings_get(sandbox: SandboxContext = Depends(get_sandbox)) -> dict[str, Any]:
+        return _settings_payload(sandbox.db_path)
+
+    @app.post("/api/settings")
+    async def settings_save(
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        self_names = payload.get("self_names", [])
+        glossary = payload.get("glossary", [])
+
+        if isinstance(self_names, list) and len(self_names) > 5:
+            raise HTTPException(status_code=400, detail="你在对话里的称呼最多填 5 个")
+        if isinstance(glossary, list) and len(glossary) > 50:
+            raise HTTPException(status_code=400, detail="我的词典最多保留 50 条")
+
+        try:
+            saved_self_names = save_self_names(sandbox.db_path, self_names if isinstance(self_names, list) else [])
+            saved_glossary = save_glossary(sandbox.db_path, glossary if isinstance(glossary, list) else [])
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        response = JSONResponse(
+            {
+                "self_names": saved_self_names,
+                "glossary": saved_glossary,
+                "has_self_names": bool(saved_self_names),
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     def index(
         request: Request,
@@ -681,6 +740,7 @@ def create_app() -> FastAPI:
                 "references": context["references"],
                 "recent_records": context["recent_records"],
                 "source_presets": SOURCE_PRESETS,
+                "settings": _settings_payload(sandbox.db_path),
             },
         )
         apply_sandbox_cookie(response, sandbox)
@@ -738,6 +798,9 @@ def create_app() -> FastAPI:
         source_detail_raw = payload.get("source_detail")
         source_detail = None if source_detail_raw is None else str(source_detail_raw).strip()
         source_hint = source if not source_detail else f"{source}-{source_detail}"
+        counterpart_raw = payload.get("counterpart")
+        counterpart = None if counterpart_raw is None else str(counterpart_raw).strip()
+        counterpart = counterpart or None
 
         conn = _open_write_connection(sandbox.db_path)
         try:
@@ -774,6 +837,7 @@ def create_app() -> FastAPI:
             request.app.state.global_meta_db_path,
             row["evidence_id"],
             text,
+            counterpart,
         )
 
         response = JSONResponse(
