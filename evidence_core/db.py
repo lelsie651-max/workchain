@@ -64,10 +64,7 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             slot_deliverable TEXT,
             slot_due INTEGER,
             slot_due_raw TEXT,
-            slot_direction TEXT CHECK (
-                slot_direction IS NULL
-                OR slot_direction IN ('i_owe', 'owed_to_me', 'none')
-            ),
+            slot_direction TEXT CHECK (slot_direction IN ('i_owe', 'owed_to_me', 'none')),
             slots_filled INTEGER NOT NULL CHECK (slots_filled BETWEEN 0 AND 4),
             plain_summary TEXT,
             caveats TEXT,

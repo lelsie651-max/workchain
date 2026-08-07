@@ -51,10 +51,11 @@ def _insert_thread(
 def _insert_evidence(
     conn: sqlite3.Connection,
     evidence_id: str = "ev-1",
-    seq: int = 1,
+    seq: int | None = 1,
     thread_id: str | None = "thr-1",
     kind: str = "request",
     media_type: str = "text",
+    slot_direction: str | None = None,
     slots_filled: int = 0,
 ) -> None:
     conn.execute(
@@ -80,7 +81,7 @@ def _insert_evidence(
             None,
             None,
             None,
-            None,
+            slot_direction,
             slots_filled,
             None,
             "[]",
@@ -197,3 +198,67 @@ def test_evidence_slots_filled_rejects_out_of_range_value(db_file):
 
     with pytest.raises(sqlite3.IntegrityError):
         _insert_evidence(conn, slots_filled=5)
+
+
+@pytest.mark.parametrize("slot_direction", ["i_owe", "owed_to_me", "none"])
+def test_evidence_slot_direction_accepts_allowed_values(db_file, slot_direction: str):
+    conn = init_db(db_file)
+    _insert_thread(conn)
+
+    _insert_evidence(conn, slot_direction=slot_direction)
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT slot_direction FROM evidence WHERE evidence_id = ?",
+        ("ev-1",),
+    ).fetchone()
+
+    assert row["slot_direction"] == slot_direction
+
+
+def test_evidence_slot_direction_accepts_null(db_file):
+    conn = init_db(db_file)
+    _insert_thread(conn)
+
+    _insert_evidence(conn, slot_direction=None)
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT slot_direction FROM evidence WHERE evidence_id = ?",
+        ("ev-1",),
+    ).fetchone()
+
+    assert row["slot_direction"] is None
+
+
+def test_evidence_slot_direction_rejects_invalid_value(db_file):
+    conn = init_db(db_file)
+    _insert_thread(conn)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_evidence(conn, slot_direction="garbage")
+
+
+def test_evidence_seq_rejects_null(db_file):
+    conn = init_db(db_file)
+    _insert_thread(conn)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_evidence(conn, seq=None)
+
+
+def test_evidence_seq_still_rejects_duplicate_values(db_file):
+    conn = init_db(db_file)
+    _insert_thread(conn)
+    _insert_evidence(conn, evidence_id="ev-1", seq=1)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_evidence(conn, evidence_id="ev-2", seq=1)
+
+
+def test_file_database_uses_wal_journal_mode(db_file):
+    conn = init_db(db_file)
+
+    journal_mode = conn.execute("PRAGMA journal_mode").fetchone()
+
+    assert journal_mode[0].lower() == "wal"

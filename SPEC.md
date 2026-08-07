@@ -298,6 +298,7 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 | 日期 | 变更 | 原因 |
 |---|---|---|
 | 2026-08-07 | v1.0 初始版本 | — |
+| 2026-08-07 | 修复 slot_direction CHECK 失效;新增 §9 | CHECK 中 OR NULL 导致约束被绕过 |
 
 ---
 
@@ -312,3 +313,12 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 | **哈希链 Chain** | 每条记录的摘要包含前一条摘要,形成不可回溯篡改的序列 |
 | **校验点 Checkpoint** | 定期对当前链头打的可信时间戳锚点 |
 | **举证包 Export** | 可交给第三方独立验证的导出目录 |
+
+---
+
+## 9. 已知限制(已评估,暂不修复)
+- canonical.py:INT_FIELDS 字段若收到 dict/list 容器类型不会报错
+  (容器分支提前 return,未走到类型校验)。
+  风险低:store.py 以 dataclass 程序化构造记录,不会出现该输入。
+- canonical.py:NFC 归一化后的键若发生碰撞会静默覆盖,造成摘要歧义。
+  风险低:digest 的 7 个键均为 ASCII 字面量。
