@@ -256,6 +256,7 @@ def test_post_evidence_appends_reference_record(tmp_path, monkeypatch):
     assert data["seq"] == 19
     assert data["evidence_id"].startswith("ev_")
     assert data["occurred_at"] is not None
+    assert data["parse_status"] == "pending"
     assert _sandbox_db_path(client, sandbox_root).exists()
 
 
@@ -368,3 +369,181 @@ def test_same_sandbox_hits_daily_rate_limit_on_51st_post(tmp_path, monkeypatch):
 
     assert last_response is not None
     assert last_response.status_code == 429
+
+
+def test_post_evidence_without_api_key_marks_parse_failed(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "张总:先把结果留档。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert create_response.status_code == 200
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "failed"
+
+
+def test_parse_none_still_keeps_evidence_and_marks_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.llm.extract_slots", return_value=None):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "这是一条需要解析失败的记录。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert create_response.status_code == 200
+    assert status_response.status_code == 200
+    payload = status_response.json()
+    assert payload["parse_status"] == "failed"
+    assert payload["slots_filled"] == 0
+
+
+def test_successful_parse_writes_slots_and_chain_stays_valid(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "下周五",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "张总要求你下周五前给渠道复盘数据。",
+        "caveats": ["日期按 today 推算"],
+    }
+
+    with patch("app.main.llm.extract_slots", return_value=parsed):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "张总:下周五前把渠道复盘数据给我。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert create_response.status_code == 200
+    payload = status_response.json()
+    assert payload["parse_status"] == "done"
+    assert payload["slots_filled"] == 4
+    assert payload["plain_summary"] == "张总要求你下周五前给渠道复盘数据。"
+    assert payload["deliverable"] == "渠道复盘数据"
+    assert payload["caveats"] == ["日期按 today 推算"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT kind, slot_direction, slot_requester, slot_owner
+            FROM evidence WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert row["kind"] == "request"
+        assert row["slot_direction"] == "i_owe"
+        assert row["slot_requester"] == "act_zhang"
+        assert row["slot_owner"] == "act_self"
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_invalid_direction_falls_back_to_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": None,
+        "due_date": None,
+        "direction": "随便",
+        "kind": "request",
+        "plain_summary": "张总说要一个复盘。",
+        "caveats": [],
+    }
+
+    with patch("app.main.llm.extract_slots", return_value=parsed):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "张总:给我一个复盘。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT kind, slot_direction FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["slot_direction"] == "none"
+        assert row["kind"] == "reference"
+    finally:
+        conn.close()
+
+
+def test_parse_timeout_exception_marks_failed_without_breaking_post(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.llm.extract_slots", side_effect=httpx.TimeoutException("boom")):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "张总:把材料补一下。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert create_response.status_code == 200
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "failed"
+
+
+def test_parse_limit_marks_21st_record_failed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "张总要求你给渠道复盘数据。",
+        "caveats": [],
+    }
+
+    with patch("app.main.llm.extract_slots", return_value=parsed):
+        with client:
+            for idx in range(20):
+                response = client.post(
+                    "/api/evidence",
+                    json={"text": f"第 {idx + 1} 条要解析的记录", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                assert response.status_code == 200
+
+            last_response = client.post(
+                "/api/evidence",
+                json={"text": "第 21 条要解析的记录", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = last_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert last_response.status_code == 200
+    assert status_response.json()["parse_status"] == "failed"
+    assert status_response.json()["detail"] == "今日解析次数已用完,记录仍已保存"

@@ -5,21 +5,23 @@ import os
 import sqlite3
 import time
 import traceback
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
+from app import llm
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
 from app.sandbox import SandboxContext, apply_sandbox_cookie, cleanup_expired, get_sandbox
 from evidence_core.db import init_db
-from evidence_core.store import append_evidence
+from evidence_core.store import append_evidence, update_slots
 from scripts.seed_demo import seed_demo_data
 
 
@@ -79,11 +81,242 @@ def _start_of_current_day_ms() -> int:
     return int(day_start.timestamp() * 1000)
 
 
+def _today_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
 def _safe_diag_detail(message: str, api_key: str) -> str:
     detail = message.strip() or "unknown error"
     if api_key:
         detail = detail.replace(api_key, "[redacted]")
     return detail
+
+
+def _ensure_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.commit()
+
+
+def _open_meta_connection(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    _ensure_meta_table(conn)
+    return conn
+
+
+def _global_meta_db_path() -> Path:
+    return _get_sandbox_root() / "_global_meta.db"
+
+
+def _set_meta_value(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def _get_meta_value(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return None if row is None else row["value"]
+
+
+def _parse_status_key(evidence_id: str) -> str:
+    return f"parse_status:{evidence_id}"
+
+
+def _parse_detail_key(evidence_id: str) -> str:
+    return f"parse_detail:{evidence_id}"
+
+
+def _parse_count_key(today: str) -> str:
+    return f"parse_count:{today}"
+
+
+def _global_parse_count_key(today: str) -> str:
+    return f"global_parse_count:{today}"
+
+
+def _set_parse_status(conn: sqlite3.Connection, evidence_id: str, status: str) -> None:
+    _set_meta_value(conn, _parse_status_key(evidence_id), status)
+    conn.commit()
+
+
+def _set_parse_detail(conn: sqlite3.Connection, evidence_id: str, detail: str) -> None:
+    _set_meta_value(conn, _parse_detail_key(evidence_id), detail)
+    conn.commit()
+
+
+def _get_parse_status(conn: sqlite3.Connection, evidence_id: str) -> str:
+    return _get_meta_value(conn, _parse_status_key(evidence_id)) or "failed"
+
+
+def _get_parse_detail(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    return _get_meta_value(conn, _parse_detail_key(evidence_id))
+
+
+def _get_parse_status_map(conn: sqlite3.Connection, evidence_ids: Iterable[str]) -> dict[str, str]:
+    ids = [evidence_id for evidence_id in evidence_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    keys = [_parse_status_key(evidence_id) for evidence_id in ids]
+    rows = conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    result = {row["key"].split(":", 1)[1]: row["value"] for row in rows}
+    for evidence_id in ids:
+        result.setdefault(evidence_id, "failed")
+    return result
+
+
+def _get_parse_detail_map(conn: sqlite3.Connection, evidence_ids: Iterable[str]) -> dict[str, str | None]:
+    ids = [evidence_id for evidence_id in evidence_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    keys = [_parse_detail_key(evidence_id) for evidence_id in ids]
+    rows = conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    result = {row["key"].split(":", 1)[1]: row["value"] for row in rows}
+    for evidence_id in ids:
+        result.setdefault(evidence_id, None)
+    return result
+
+
+def _try_increment_meta_counter(conn: sqlite3.Connection, key: str, limit: int) -> bool:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current_raw = _get_meta_value(conn, key)
+        current = 0 if current_raw is None else int(current_raw)
+        if current >= limit:
+            conn.rollback()
+            return False
+        _set_meta_value(conn, key, str(current + 1))
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _consume_parse_budget(sandbox_db_path: Path, global_meta_db_path: Path) -> tuple[bool, str | None]:
+    today = _today_str()
+    sandbox_conn = init_db(sandbox_db_path)
+    try:
+        if not _try_increment_meta_counter(sandbox_conn, _parse_count_key(today), 20):
+            return False, "今日解析次数已用完,记录仍已保存"
+    finally:
+        sandbox_conn.close()
+
+    global_conn = _open_meta_connection(global_meta_db_path)
+    try:
+        if not _try_increment_meta_counter(global_conn, _global_parse_count_key(today), 300):
+            sandbox_rollback_conn = init_db(sandbox_db_path)
+            try:
+                sandbox_conn_value = _get_meta_value(sandbox_rollback_conn, _parse_count_key(today))
+                current = 0 if sandbox_conn_value is None else int(sandbox_conn_value)
+                _set_meta_value(
+                    sandbox_rollback_conn,
+                    _parse_count_key(today),
+                    str(max(0, current - 1)),
+                )
+                sandbox_rollback_conn.commit()
+            finally:
+                sandbox_rollback_conn.close()
+            return False, "今日解析次数已用完,记录仍已保存"
+    finally:
+        global_conn.close()
+
+    return True, None
+
+
+def _final_kind(parsed: dict[str, Any], slot_requester: str | None, slot_owner: str | None, slot_due: int | None) -> str:
+    filled = sum(
+        value is not None
+        for value in (slot_requester, slot_owner, parsed.get("deliverable"), slot_due)
+    )
+    if filled >= 3 and parsed.get("direction") != "none":
+        return parsed.get("kind", "reference")
+    return "reference"
+
+
+def _run_parse_pipeline(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    evidence_id: str,
+    text: str,
+) -> None:
+    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not api_key:
+        conn = init_db(sandbox_db_path)
+        try:
+            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    allowed, reason = _consume_parse_budget(sandbox_db_path, global_meta_db_path)
+    if not allowed:
+        conn = init_db(sandbox_db_path)
+        try:
+            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_detail(conn, evidence_id, reason or "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    try:
+        parsed = llm.extract_slots(text, _today_str())
+    except Exception:
+        parsed = None
+    parsed = llm.normalize_slots(parsed)
+    if parsed is None:
+        conn = init_db(sandbox_db_path)
+        try:
+            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    conn = init_db(sandbox_db_path)
+    try:
+        requester_id = llm.resolve_actor(conn, parsed.get("requester_name"))
+        owner_id = llm.resolve_actor(conn, parsed.get("owner_name"))
+        slot_due = llm.due_date_to_millis(parsed.get("due_date"))
+
+        update_slots(
+            conn,
+            evidence_id,
+            slot_requester=requester_id,
+            slot_owner=owner_id,
+            slot_deliverable=parsed.get("deliverable"),
+            slot_due=slot_due,
+            slot_due_raw=parsed.get("due_raw"),
+            slot_direction=parsed.get("direction"),
+            plain_summary=parsed.get("plain_summary"),
+            caveats=parsed.get("caveats", []),
+        )
+        conn.execute(
+            "UPDATE evidence SET kind = ? WHERE evidence_id = ?",
+            (_final_kind(parsed, requester_id, owner_id, slot_due), evidence_id),
+        )
+        _set_parse_status(conn, evidence_id, "done")
+        _set_parse_detail(conn, evidence_id, "")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        _set_parse_status(conn, evidence_id, "failed")
+        _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
+    finally:
+        conn.close()
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -135,6 +368,12 @@ def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
         "platform_class": source_badge_class(platform),
         "scene": scene,
         "raw_text_preview": _truncate_text(row["raw_text"] or ""),
+        "parse_status": row["parse_status"],
+        "parse_detail": row["parse_detail"],
+        "plain_summary": row["plain_summary"],
+        "deliverable": row["slot_deliverable"],
+        "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
+        "caveats": _decode_json_array(row["caveats"]),
     }
 
 
@@ -190,17 +429,26 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
     ).fetchall()
     recent_rows = conn.execute(
         """
-        SELECT evidence_id, occurred_at, source_hint, raw_text
+        SELECT evidence_id, occurred_at, source_hint, raw_text,
+               plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats
         FROM evidence
         WHERE evidence_id NOT LIKE 'ev_demo_%'
         ORDER BY seq DESC
         LIMIT 20
         """
     ).fetchall()
+    parse_status_map = _get_parse_status_map(conn, [row["evidence_id"] for row in recent_rows])
+    parse_detail_map = _get_parse_detail_map(conn, [row["evidence_id"] for row in recent_rows])
+    decorated_recent_rows = []
+    for row in recent_rows:
+        row_dict = dict(row)
+        row_dict["parse_status"] = parse_status_map.get(row["evidence_id"], "failed")
+        row_dict["parse_detail"] = parse_detail_map.get(row["evidence_id"])
+        decorated_recent_rows.append(row_dict)
     return {
         "threads": [_prepare_thread_card(row) for row in thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
-        "recent_records": [_prepare_recent_row(row) for row in recent_rows],
+        "recent_records": [_prepare_recent_row(row) for row in decorated_recent_rows],
     }
 
 
@@ -260,12 +508,16 @@ def create_app() -> FastAPI:
         print(f"starting workchain, port={os.environ.get('PORT')}, cwd={os.getcwd()}")
         demo_dir = _get_demo_dir()
         sandbox_root = _get_sandbox_root()
+        global_meta_db_path = _global_meta_db_path()
         db_path = demo_dir / "workchain.db"
         try:
             if not demo_dir.exists() or not db_path.exists():
                 seed_demo_data(demo_dir)
 
             cleanup_expired(sandbox_root)
+            global_meta_db_path.parent.mkdir(parents=True, exist_ok=True)
+            global_meta_conn = _open_meta_connection(global_meta_db_path)
+            global_meta_conn.close()
             conn = _open_readonly_connection(db_path)
             try:
                 evidence_count = conn.execute("SELECT COUNT(*) AS count FROM evidence").fetchone()["count"]
@@ -279,6 +531,7 @@ def create_app() -> FastAPI:
         app.state.demo_dir = demo_dir
         app.state.db_path = db_path
         app.state.sandbox_root = sandbox_root
+        app.state.global_meta_db_path = global_meta_db_path
         yield
 
     app = FastAPI(title="WorkChain", lifespan=lifespan)
@@ -344,6 +597,37 @@ def create_app() -> FastAPI:
                 "detail": _safe_diag_detail(detail, api_key),
             }
 
+    @app.get("/api/evidence/{evidence_id}/status")
+    def evidence_status(
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> dict[str, Any]:
+        conn = init_db(sandbox.db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT slots_filled, plain_summary, slot_deliverable,
+                       slot_due, slot_due_raw, caveats
+                FROM evidence
+                WHERE evidence_id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            parse_status = _get_parse_status(conn, evidence_id)
+            return {
+                "parse_status": parse_status,
+                "slots_filled": row["slots_filled"],
+                "plain_summary": row["plain_summary"],
+                "deliverable": row["slot_deliverable"],
+                "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
+                "caveats": _decode_json_array(row["caveats"]),
+                "detail": _get_parse_detail(conn, evidence_id),
+            }
+        finally:
+            conn.close()
+
     @app.get("/", response_class=HTMLResponse)
     def index(
         request: Request,
@@ -368,6 +652,7 @@ def create_app() -> FastAPI:
     @app.post("/api/evidence")
     async def create_evidence(
         request: Request,
+        background_tasks: BackgroundTasks,
         sandbox: SandboxContext = Depends(get_sandbox),
     ) -> JSONResponse:
         payload = await request.json()
@@ -411,14 +696,25 @@ def create_app() -> FastAPI:
                 source_hint=source_hint,
                 kind="reference",
             )
+            _set_parse_status(conn, row["evidence_id"], "pending")
+            _set_parse_detail(conn, row["evidence_id"], "")
         finally:
             conn.close()
+
+        background_tasks.add_task(
+            _run_parse_pipeline,
+            sandbox.db_path,
+            request.app.state.global_meta_db_path,
+            row["evidence_id"],
+            text,
+        )
 
         response = JSONResponse(
             {
                 "evidence_id": row["evidence_id"],
                 "seq": row["seq"],
                 "occurred_at": row["occurred_at"],
+                "parse_status": "pending",
             }
         )
         apply_sandbox_cookie(response, sandbox)
