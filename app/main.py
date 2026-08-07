@@ -3,17 +3,22 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
+from app.labels import SOURCE_PRESETS
+from app.sandbox import SandboxContext, apply_sandbox_cookie, cleanup_expired, get_sandbox
+from evidence_core.db import init_db
+from evidence_core.store import append_evidence
 from scripts.seed_demo import seed_demo_data
 
 
@@ -45,12 +50,32 @@ def _get_demo_dir() -> Path:
     return Path(os.getenv("WORKCHAIN_DEMO_DIR", "demo_data"))
 
 
-def get_conn(request: Request) -> Generator[sqlite3.Connection, None, None]:
-    conn = _open_readonly_connection(request.app.state.db_path)
+def _get_sandbox_root() -> Path:
+    return Path(os.getenv("WORKCHAIN_SANDBOX_ROOT", "sandboxes"))
+
+
+def get_conn(sandbox: SandboxContext = Depends(get_sandbox)) -> Generator[sqlite3.Connection, None, None]:
+    conn = _open_readonly_connection(sandbox.db_path)
     try:
         yield conn
     finally:
         conn.close()
+
+
+def _open_write_connection(db_path: Path) -> sqlite3.Connection:
+    return init_db(db_path)
+
+
+def _truncate_text(value: str, limit: int = 100) -> str:
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}..."
+
+
+def _start_of_current_day_ms() -> int:
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(day_start.timestamp() * 1000)
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -90,6 +115,18 @@ def _prepare_reference_row(row: sqlite3.Row) -> dict[str, Any]:
         "platform_class": source_badge_class(platform),
         "scene": scene,
         "raw_text": row["raw_text"],
+    }
+
+
+def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
+    platform, scene = source_label(row["source_hint"])
+    return {
+        "evidence_id": row["evidence_id"],
+        "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
+        "platform": platform,
+        "platform_class": source_badge_class(platform),
+        "scene": scene,
+        "raw_text_preview": _truncate_text(row["raw_text"] or ""),
     }
 
 
@@ -143,9 +180,19 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
         ORDER BY seq ASC
         """
     ).fetchall()
+    recent_rows = conn.execute(
+        """
+        SELECT evidence_id, occurred_at, source_hint, raw_text
+        FROM evidence
+        WHERE evidence_id NOT LIKE 'ev_demo_%'
+        ORDER BY seq DESC
+        LIMIT 20
+        """
+    ).fetchall()
     return {
         "threads": [_prepare_thread_card(row) for row in thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
+        "recent_records": [_prepare_recent_row(row) for row in recent_rows],
     }
 
 
@@ -204,11 +251,13 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         print(f"starting workchain, port={os.environ.get('PORT')}, cwd={os.getcwd()}")
         demo_dir = _get_demo_dir()
+        sandbox_root = _get_sandbox_root()
         db_path = demo_dir / "workchain.db"
         try:
             if not demo_dir.exists() or not db_path.exists():
                 seed_demo_data(demo_dir)
 
+            cleanup_expired(sandbox_root)
             conn = _open_readonly_connection(db_path)
             try:
                 evidence_count = conn.execute("SELECT COUNT(*) AS count FROM evidence").fetchone()["count"]
@@ -221,6 +270,7 @@ def create_app() -> FastAPI:
 
         app.state.demo_dir = demo_dir
         app.state.db_path = db_path
+        app.state.sandbox_root = sandbox_root
         yield
 
     app = FastAPI(title="WorkChain", lifespan=lifespan)
@@ -231,17 +281,84 @@ def create_app() -> FastAPI:
         return {"status": "ok", "evidence_count": evidence_count}
 
     @app.get("/", response_class=HTMLResponse)
-    def index(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> HTMLResponse:
+    def index(
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
         context = _fetch_index_data(conn)
-        return TEMPLATES.TemplateResponse(
+        response = TEMPLATES.TemplateResponse(
             request,
             "index.html",
             {
                 "page_title": "WorkChain",
                 "threads": context["threads"],
                 "references": context["references"],
+                "recent_records": context["recent_records"],
+                "source_presets": SOURCE_PRESETS,
             },
         )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/evidence")
+    async def create_evidence(
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        text = str(payload.get("text", "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="请输入要存证的内容")
+        if len(text) > 20000:
+            raise HTTPException(status_code=400, detail="内容过长,请控制在 20000 字以内")
+
+        source = str(payload.get("source", "")).strip()
+        if not source:
+            raise HTTPException(status_code=400, detail="请选择或填写来源")
+        if source not in SOURCE_PRESETS and len(source) > 20:
+            raise HTTPException(status_code=400, detail="自定义来源不能超过 20 个字")
+
+        source_detail_raw = payload.get("source_detail")
+        source_detail = None if source_detail_raw is None else str(source_detail_raw).strip()
+        source_hint = source if not source_detail else f"{source}-{source_detail}"
+
+        conn = _open_write_connection(sandbox.db_path)
+        try:
+            today_count = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM evidence
+                WHERE evidence_id NOT LIKE 'ev_demo_%' AND captured_at >= ?
+                """,
+                (_start_of_current_day_ms(),),
+            ).fetchone()["count"]
+            if today_count >= 50:
+                raise HTTPException(status_code=429, detail="你今天已经存了 50 条,明天再来继续")
+
+            now_ms = int(time.time() * 1000)
+            row = append_evidence(
+                conn,
+                blobs_root=sandbox.blobs_root,
+                media_type="text",
+                payload=text,
+                captured_at=now_ms,
+                occurred_at=now_ms,
+                source_hint=source_hint,
+                kind="reference",
+            )
+        finally:
+            conn.close()
+
+        response = JSONResponse(
+            {
+                "evidence_id": row["evidence_id"],
+                "seq": row["seq"],
+                "occurred_at": row["occurred_at"],
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     @app.get("/help", response_class=HTMLResponse)
     def help_page(request: Request) -> HTMLResponse:
@@ -257,12 +374,13 @@ def create_app() -> FastAPI:
     def thread_detail(
         request: Request,
         thread_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> HTMLResponse:
         context = _fetch_thread_detail(conn, thread_id)
         if context is None:
             raise HTTPException(status_code=404, detail="thread not found")
-        return TEMPLATES.TemplateResponse(
+        response = TEMPLATES.TemplateResponse(
             request,
             "thread.html",
             {
@@ -271,6 +389,8 @@ def create_app() -> FastAPI:
                 "entries": context["entries"],
             },
         )
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     return app
 

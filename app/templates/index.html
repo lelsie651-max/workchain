@@ -2,12 +2,64 @@
 
 {% block content %}
 <section class="mb-8 sm:mb-10">
-    <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
-        <div class="min-h-11 rounded-xl border border-dashed border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-400">
-            把聊天记录粘进来,或上传截图 / 文档
+    <form id="evidence-form" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
+        <label for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
+        <textarea
+            id="evidence-text"
+            name="text"
+            rows="6"
+            maxlength="20000"
+            placeholder="把聊天记录粘进来,或上传截图 / 文档"
+            class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+        ></textarea>
+
+        <div class="mt-4 grid gap-3 md:grid-cols-3">
+            <div>
+                <label for="source-select" class="mb-2 block text-sm text-slate-300">来源</label>
+                <select
+                    id="source-select"
+                    name="source"
+                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                >
+                    {% for source in source_presets %}
+                    <option value="{{ source }}">{{ source }}</option>
+                    {% endfor %}
+                    <option value="__custom__">自定义…</option>
+                </select>
+            </div>
+            <div id="source-custom-wrap" class="hidden">
+                <label for="source-custom" class="mb-2 block text-sm text-slate-300">自定义来源</label>
+                <input
+                    id="source-custom"
+                    name="source_custom"
+                    type="text"
+                    maxlength="20"
+                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                >
+            </div>
+            <div>
+                <label for="source-detail" class="mb-2 block text-sm text-slate-300">具体位置</label>
+                <input
+                    id="source-detail"
+                    name="source_detail"
+                    type="text"
+                    placeholder="如:项目复盘群"
+                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                >
+            </div>
         </div>
-        <p class="mt-2 text-xs text-slate-500">即将开放</p>
-    </div>
+
+        <div class="mt-4 flex flex-wrap items-center gap-3">
+            <button
+                type="submit"
+                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+            >
+                存证
+            </button>
+            <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
+        </div>
+        <p id="form-message" class="mt-3 text-sm text-slate-400"></p>
+    </form>
 </section>
 
 <section class="mb-10">
@@ -46,6 +98,30 @@
     </div>
 </section>
 
+{% if recent_records %}
+<section class="mb-10 rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+    <div class="mb-4">
+        <h2 class="text-xl font-semibold text-white">我刚存的</h2>
+        <p class="mt-1 text-sm text-slate-400">这些记录只属于你,24 小时后自动清除,不会影响其他访客看到的演示数据。</p>
+    </div>
+
+    <div class="space-y-3">
+        {% for item in recent_records %}
+        <article class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+            <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                <span>{{ item.occurred_at_text }}</span>
+                <span class="rounded-full border px-2.5 py-1 {{ item.platform_class }}">{{ item.platform }}</span>
+                {% if item.scene %}
+                <span>{{ item.scene }}</span>
+                {% endif %}
+            </div>
+            <p class="text-sm leading-6 text-slate-200">{{ item.raw_text_preview }}</p>
+        </article>
+        {% endfor %}
+    </div>
+</section>
+{% endif %}
+
 <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
     <details open>
         <summary class="cursor-pointer list-none text-lg font-semibold text-white">
@@ -70,4 +146,63 @@
         </div>
     </details>
 </section>
+
+<script>
+    (() => {
+        const form = document.getElementById("evidence-form");
+        const textarea = document.getElementById("evidence-text");
+        const sourceSelect = document.getElementById("source-select");
+        const sourceCustomWrap = document.getElementById("source-custom-wrap");
+        const sourceCustom = document.getElementById("source-custom");
+        const sourceDetail = document.getElementById("source-detail");
+        const message = document.getElementById("form-message");
+
+        const syncCustomSource = () => {
+            const isCustom = sourceSelect.value === "__custom__";
+            sourceCustomWrap.classList.toggle("hidden", !isCustom);
+            if (!isCustom) {
+                sourceCustom.value = "";
+            }
+        };
+
+        const submitForm = async () => {
+            message.textContent = "正在存证...";
+            const selectedSource = sourceSelect.value === "__custom__" ? sourceCustom.value.trim() : sourceSelect.value;
+            const payload = {
+                text: textarea.value,
+                source: selectedSource,
+                source_detail: sourceDetail.value.trim() || null,
+            };
+
+            const response = await fetch("/api/evidence", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify(payload),
+            });
+            const data = await response.json();
+            if (!response.ok) {
+                message.textContent = data.detail || "存证失败,请稍后再试";
+                return;
+            }
+            window.location.reload();
+        };
+
+        sourceSelect.addEventListener("change", syncCustomSource);
+        syncCustomSource();
+
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            submitForm();
+        });
+
+        textarea.addEventListener("keydown", (event) => {
+            if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                event.preventDefault();
+                form.requestSubmit();
+            }
+        });
+    })();
+</script>
 {% endblock %}
