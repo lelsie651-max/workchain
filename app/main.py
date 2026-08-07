@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import sqlite3
 import time
 import traceback
@@ -435,6 +437,159 @@ def _settings_payload(db_path: Path) -> dict[str, Any]:
     }
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
+def _parse_date_start(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+def _parse_date_end(value: str | None) -> int | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000) + 86_399_999
+
+
+def _source_platform_expr(column: str = "e.source_hint") -> str:
+    return (
+        f"CASE WHEN instr({column}, '-') > 0 "
+        f"THEN substr({column}, 1, instr({column}, '-') - 1) "
+        f"ELSE {column} END"
+    )
+
+
+def _highlight_text(text: str | None, query: str) -> str:
+    text = text or ""
+    if not query:
+        return html.escape(text)
+
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    parts: list[str] = []
+    last_index = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        parts.append(html.escape(text[last_index:start]))
+        parts.append(f"<mark>{html.escape(text[start:end])}</mark>")
+        last_index = end
+    parts.append(html.escape(text[last_index:]))
+    return "".join(parts)
+
+
+def _search_evidence(
+    conn: sqlite3.Connection,
+    *,
+    q: str,
+    source: str | None,
+    kind: str | None,
+    start: str | None,
+    end: str | None,
+) -> list[dict[str, Any]]:
+    trimmed_q = q.strip()[:100]
+    if not trimmed_q:
+        return []
+
+    like_pattern = f"%{_escape_like(trimmed_q)}%"
+    actor_rows = conn.execute(
+        """
+        SELECT actor_id
+        FROM actors
+        WHERE canonical_name LIKE ? ESCAPE '!'
+           OR aliases LIKE ? ESCAPE '!'
+        """,
+        (like_pattern, like_pattern),
+    ).fetchall()
+    actor_ids = [row["actor_id"] for row in actor_rows]
+
+    text_match_clauses = [
+        "e.raw_text LIKE ? ESCAPE '!'",
+        "e.plain_summary LIKE ? ESCAPE '!'",
+        "e.slot_deliverable LIKE ? ESCAPE '!'",
+        "e.source_hint LIKE ? ESCAPE '!'",
+        "sr.canonical_name LIKE ? ESCAPE '!'",
+        "sr.aliases LIKE ? ESCAPE '!'",
+        "so.canonical_name LIKE ? ESCAPE '!'",
+        "so.aliases LIKE ? ESCAPE '!'",
+    ]
+    params: list[Any] = [like_pattern] * 8
+
+    if actor_ids:
+        placeholders = ",".join("?" for _ in actor_ids)
+        text_match_clauses.append(f"e.slot_requester IN ({placeholders})")
+        text_match_clauses.append(f"e.slot_owner IN ({placeholders})")
+        params.extend(actor_ids)
+        params.extend(actor_ids)
+
+    filters = [f"({' OR '.join(text_match_clauses)})"]
+
+    if source:
+        filters.append(f"{_source_platform_expr()} = ?")
+        params.append(source)
+    if kind and kind in KIND:
+        filters.append("e.kind = ?")
+        params.append(kind)
+
+    start_ms = _parse_date_start(start)
+    end_ms = _parse_date_end(end)
+    if start_ms is not None:
+        filters.append("e.occurred_at >= ?")
+        params.append(start_ms)
+    if end_ms is not None:
+        filters.append("e.occurred_at <= ?")
+        params.append(end_ms)
+
+    rows = conn.execute(
+        f"""
+        SELECT
+            e.evidence_id,
+            e.occurred_at,
+            e.raw_text,
+            e.plain_summary,
+            e.source_hint,
+            e.kind,
+            t.title AS thread_title
+        FROM evidence AS e
+        LEFT JOIN threads AS t ON t.thread_id = e.thread_id
+        LEFT JOIN actors AS sr ON sr.actor_id = e.slot_requester
+        LEFT JOIN actors AS so ON so.actor_id = e.slot_owner
+        WHERE {' AND '.join(filters)}
+        ORDER BY e.occurred_at DESC, e.seq DESC
+        LIMIT 100
+        """,
+        params,
+    ).fetchall()
+
+    results = []
+    for row in rows:
+        platform, scene = source_label(row["source_hint"])
+        results.append(
+            {
+                "evidence_id": row["evidence_id"],
+                "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
+                "occurred_date": _format_datetime(row["occurred_at"], "%Y-%m-%d"),
+                "platform": platform,
+                "platform_class": source_badge_class(platform),
+                "scene": scene,
+                "kind": row["kind"],
+                "kind_label": KIND[row["kind"]],
+                "raw_text_html": _highlight_text(row["raw_text"], trimmed_q),
+                "plain_summary": row["plain_summary"],
+                "thread_title": row["thread_title"],
+            }
+        )
+    return results
+
+
 def _prepare_timeline_row(row: sqlite3.Row) -> dict[str, Any]:
     caveats = _decode_json_array(row["caveats"])
     platform, scene = source_label(row["source_hint"])
@@ -834,6 +989,39 @@ def create_app() -> FastAPI:
         apply_sandbox_cookie(response, sandbox)
         return response
 
+    @app.get("/search", response_class=HTMLResponse)
+    def search_page(
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        q = str(request.query_params.get("q", "")).strip()[:100]
+        source = str(request.query_params.get("source", "")).strip() or None
+        kind = str(request.query_params.get("kind", "")).strip() or None
+        start = str(request.query_params.get("start", "")).strip() or None
+        end = str(request.query_params.get("end", "")).strip() or None
+        results = _search_evidence(conn, q=q, source=source, kind=kind, start=start, end=end) if q else []
+
+        response = TEMPLATES.TemplateResponse(
+            request,
+            "search.html",
+            {
+                "page_title": "搜索",
+                "current_search_q": q,
+                "query": q,
+                "selected_source": source or "",
+                "selected_kind": kind or "",
+                "selected_start": start or "",
+                "selected_end": end or "",
+                "results": results,
+                "result_count": len(results),
+                "source_presets": SOURCE_PRESETS,
+                "kind_options": KIND,
+            },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     def index(
         request: Request,
@@ -851,6 +1039,7 @@ def create_app() -> FastAPI:
                 "recent_records": context["recent_records"],
                 "source_presets": SOURCE_PRESETS,
                 "settings": _settings_payload(sandbox.db_path),
+                "current_search_q": "",
             },
         )
         apply_sandbox_cookie(response, sandbox)
@@ -883,6 +1072,7 @@ def create_app() -> FastAPI:
                 "parse_status": parse_status,
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
+                "current_search_q": "",
             },
         )
         apply_sandbox_cookie(response, sandbox)
@@ -970,6 +1160,7 @@ def create_app() -> FastAPI:
             "help.html",
             {
                 "page_title": "使用说明",
+                "current_search_q": "",
             },
         )
 
@@ -990,6 +1181,7 @@ def create_app() -> FastAPI:
                 "page_title": context["thread"]["title"],
                 "thread": context["thread"],
                 "entries": context["entries"],
+                "current_search_q": "",
             },
         )
         apply_sandbox_cookie(response, sandbox)

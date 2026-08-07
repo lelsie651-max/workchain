@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="space-y-6">
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 sm:p-6">
+        {% if query %}
+        <h2 class="text-2xl font-semibold text-white">找到 {{ result_count }} 条与「{{ query }}」相关的记录</h2>
+        {% else %}
+        <h2 class="text-2xl font-semibold text-white">输入关键词开始搜索</h2>
+        {% endif %}
+
+        <form action="/search" method="get" class="mt-5 grid gap-3 md:grid-cols-5">
+            <input
+                type="text"
+                name="q"
+                value="{{ query }}"
+                placeholder="输入关键词"
+                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
+            >
+            <select
+                name="source"
+                onchange="this.form.requestSubmit()"
+                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+            >
+                <option value="">全部来源</option>
+                {% for source in source_presets %}
+                <option value="{{ source }}" {% if selected_source == source %}selected{% endif %}>{{ source }}</option>
+                {% endfor %}
+            </select>
+            <select
+                name="kind"
+                onchange="this.form.requestSubmit()"
+                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+            >
+                <option value="">全部类型</option>
+                {% for kind_key, kind_label in kind_options.items() %}
+                <option value="{{ kind_key }}" {% if selected_kind == kind_key %}selected{% endif %}>{{ kind_label }}</option>
+                {% endfor %}
+            </select>
+            <input
+                type="date"
+                name="start"
+                value="{{ selected_start }}"
+                onchange="this.form.requestSubmit()"
+                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+            >
+            <input
+                type="date"
+                name="end"
+                value="{{ selected_end }}"
+                onchange="this.form.requestSubmit()"
+                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+            >
+        </form>
+    </article>
+
+    {% if not query %}
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 text-sm text-slate-400">
+        输入关键词开始搜索
+    </article>
+    {% elif not results %}
+    <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+        <p class="text-lg font-medium text-white">没有找到相关记录</p>
+        <p class="mt-2 text-sm text-slate-400">换个词试试，或者放宽来源、类型和日期范围。</p>
+    </article>
+    {% else %}
+    <div class="space-y-4">
+        {% for item in results %}
+        <article
+            class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5"
+            data-result-platform="{{ item.platform }}"
+            data-result-kind="{{ item.kind }}"
+            data-result-date="{{ item.occurred_date }}"
+        >
+            <div class="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+                <span>{{ item.occurred_at_text }}</span>
+                <span class="rounded-full border px-2.5 py-1 {{ item.platform_class }}">{{ item.platform }}</span>
+                <span class="rounded-full bg-slate-800 px-2.5 py-1 text-slate-200">{{ item.kind_label }}</span>
+                {% if item.scene %}
+                <span>{{ item.scene }}</span>
+                {% endif %}
+            </div>
+
+            <p class="mt-4 whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ item.raw_text_html | safe }}</p>
+
+            {% if item.plain_summary %}
+            <p class="mt-4 text-sm leading-7 text-slate-300">{{ item.plain_summary }}</p>
+            {% endif %}
+
+            <div class="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-400">
+                <span>{% if item.thread_title %}所属事项：{{ item.thread_title }}{% else %}未归到某件事{% endif %}</span>
+                <a
+                    href="/evidence/{{ item.evidence_id }}"
+                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                >
+                    详情
+                </a>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+    {% endif %}
+</section>
+{% endblock %}

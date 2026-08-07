@@ -24,13 +24,43 @@
                         <p class="mt-1 text-sm leading-6 text-slate-400">「这不是我要的」? —— 自动留证 · 不可篡改 · 可第三方验证</p>
                     </div>
                 </a>
-                <a
-                    href="/help"
-                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                >
-                    使用说明
-                </a>
+                <div class="flex items-center gap-3">
+                    <form action="/search" method="get" class="hidden items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 lg:flex">
+                        <span class="text-slate-500">🔎</span>
+                        <input
+                            type="text"
+                            name="q"
+                            value="{{ current_search_q|default('') }}"
+                            placeholder="搜索记录"
+                            class="w-48 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                        >
+                    </form>
+                    <button
+                        id="mobile-search-toggle"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
+                        aria-label="打开搜索"
+                    >
+                        🔎
+                    </button>
+                    <a
+                        href="/help"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        使用说明
+                    </a>
+                </div>
             </div>
+            <form id="mobile-search-form" action="/search" method="get" class="mt-4 hidden items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 lg:hidden">
+                <span class="text-slate-500">🔎</span>
+                <input
+                    type="text"
+                    name="q"
+                    value="{{ current_search_q|default('') }}"
+                    placeholder="搜索记录"
+                    class="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                >
+            </form>
         </header>
 
         <main>
@@ -54,5 +84,21 @@
             </div>
         </footer>
     </div>
+    <script>
+        (() => {
+            const mobileToggle = document.getElementById("mobile-search-toggle");
+            const mobileForm = document.getElementById("mobile-search-form");
+            if (!mobileToggle || !mobileForm) {
+                return;
+            }
+            mobileToggle.addEventListener("click", () => {
+                mobileForm.classList.toggle("hidden");
+                const input = mobileForm.querySelector("input[name='q']");
+                if (input && !mobileForm.classList.contains("hidden")) {
+                    input.focus();
+                }
+            });
+        })();
+    </script>
 </body>
 </html>

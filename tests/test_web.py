@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 import time
@@ -172,6 +173,154 @@ def test_index_does_not_expose_hash_fields(tmp_path, monkeypatch):
     assert "content_hash" not in html
     assert "prev_hash" not in html
     assert 'href="/help"' in html
+
+
+def test_search_returns_channel_records(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "渠道复盘"})
+
+    assert response.status_code == 200
+    assert "找到" in response.text
+    assert "渠道复盘" in response.text
+
+
+def test_search_actor_name_returns_actor_related_records(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    unique_text = "这条原文里没有那个名字，但和接口文档有关。"
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": unique_text, "source": "Jira", "source_detail": "WORK-238"},
+        )
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            """
+            UPDATE evidence
+            SET slot_requester = ?, slot_owner = ?, plain_summary = ?
+            WHERE evidence_id = ?
+            """,
+            ("act_wang", "act_self", "继续跟进接口文档。", create_response.json()["evidence_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get("/search", params={"q": "王强"})
+
+    assert response.status_code == 200
+    assert unique_text in response.text
+
+
+def test_search_missing_term_returns_empty_state(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "根本不存在的词条123456"})
+
+    assert response.status_code == 200
+    assert "没有找到相关记录" in response.text
+
+
+def test_search_source_filter_works(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "复盘", "source": "飞书"})
+
+    assert response.status_code == 200
+    platforms = re.findall(r'data-result-platform="([^"]+)"', response.text)
+    assert platforms
+    assert set(platforms) == {"飞书"}
+
+
+def test_search_kind_filter_works(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "复盘", "kind": "change"})
+
+    assert response.status_code == 200
+    kinds = re.findall(r'data-result-kind="([^"]+)"', response.text)
+    assert kinds
+    assert set(kinds) == {"change"}
+
+
+def test_search_date_range_filter_works(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get(
+            "/search",
+            params={"q": "渠道复盘", "start": "2026-03-05", "end": "2026-03-10"},
+        )
+
+    assert response.status_code == 200
+    dates = re.findall(r'data-result-date="([^"]+)"', response.text)
+    assert dates
+    assert all("2026-03-05" <= item <= "2026-03-10" for item in dates)
+
+
+def test_search_escapes_like_wildcards(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        percent_response = client.get("/search", params={"q": "%"})
+        underscore_response = client.get("/search", params={"q": "_"})
+
+    assert percent_response.status_code == 200
+    assert underscore_response.status_code == 200
+    assert "找到 0 条与「%」相关的记录" in percent_response.text
+    assert "找到 0 条与「_」相关的记录" in underscore_response.text
+
+
+def test_search_escapes_script_query(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "<script>"})
+
+    assert response.status_code == 200
+    assert "&lt;script&gt;" in response.text
+
+
+def test_search_results_are_isolated_between_sandboxes(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        client_a.post(
+            "/api/evidence",
+            json={"text": "只在 A 的搜索里出现的独有文本。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        response_a = client_a.get("/search", params={"q": "独有文本"})
+        response_b = client_b.get("/search", params={"q": "独有文本"})
+
+    assert "没有找到相关记录" not in response_a.text
+    assert "只在 A 的搜索里出现的" in response_a.text
+    assert "<mark>独有文本</mark>" in response_a.text
+    assert "没有找到相关记录" in response_b.text
+
+
+def test_search_with_empty_query_shows_prompt(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/search", params={"q": "   "})
+
+    assert response.status_code == 200
+    assert "输入关键词开始搜索" in response.text
 
 
 def test_help_page_returns_200_and_contains_review_notes(tmp_path, monkeypatch):
