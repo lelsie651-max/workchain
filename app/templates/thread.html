@@ -12,7 +12,29 @@
             <p class="mt-1 text-sm text-slate-400">现在说的时间：{{ thread.current_due_text or "未明确" }}</p>
             <p class="mt-1 text-sm text-slate-400">最后一条记录：{{ thread.last_activity_text }}</p>
         </div>
-        <div class="flex flex-wrap gap-2">
+        <div class="flex flex-wrap items-start justify-end gap-2">
+            <form method="get" action="/export/pdf" data-export-form>
+                <input type="hidden" name="thread_id" value="{{ thread.thread_id }}">
+                <button
+                    type="submit"
+                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    data-export-button
+                    data-loading-text="生成中…"
+                >
+                    导出 PDF
+                </button>
+            </form>
+            <form method="get" action="/export/package" data-export-form>
+                <input type="hidden" name="thread_id" value="{{ thread.thread_id }}">
+                <button
+                    type="submit"
+                    class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
+                    data-export-button
+                    data-loading-text="生成中…"
+                >
+                    导出完整举证包
+                </button>
+            </form>
             {% for label in thread.risk_labels %}
             <span class="rounded-full bg-amber-400/15 px-3 py-1 text-xs text-amber-200">{{ label }}</span>
             {% endfor %}
@@ -80,4 +102,21 @@
         {% endfor %}
     </div>
 </section>
+
+<script>
+    (() => {
+        const exportForms = [...document.querySelectorAll("[data-export-form]")];
+        exportForms.forEach((form) => {
+            form.addEventListener("submit", () => {
+                const button = form.querySelector("[data-export-button]");
+                if (!button) {
+                    return;
+                }
+                button.disabled = true;
+                button.textContent = button.dataset.loadingText || "生成中…";
+                button.classList.add("opacity-60", "cursor-not-allowed");
+            });
+        });
+    })();
+</script>
 {% endblock %}

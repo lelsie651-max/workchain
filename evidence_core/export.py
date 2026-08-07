@@ -6,7 +6,6 @@ import time
 from pathlib import Path
 
 from evidence_core import chain
-from evidence_core.store import make_checkpoint
 
 
 MANIFEST_RECORD_FIELDS = (
@@ -31,18 +30,54 @@ def _repo_verify_path() -> Path:
     return Path(__file__).resolve().parents[1] / "verify.py"
 
 
-def export_evidence_package(conn, *, blobs_root: Path, out_dir: Path) -> Path:
+def _resolve_export_rows(conn, *, thread_id: str | None, evidence_ids: list[str] | None):
+    if thread_id and evidence_ids:
+        raise ValueError("thread_id and evidence_ids are mutually exclusive")
+
+    if thread_id:
+        return conn.execute(
+            "SELECT * FROM evidence WHERE thread_id = ? ORDER BY seq ASC",
+            (thread_id,),
+        ).fetchall()
+
+    if evidence_ids is not None:
+        if not evidence_ids:
+            return []
+        placeholders = ",".join("?" for _ in evidence_ids)
+        rows = conn.execute(
+            f"SELECT * FROM evidence WHERE evidence_id IN ({placeholders}) ORDER BY seq ASC",
+            evidence_ids,
+        ).fetchall()
+        order_map = {evidence_id: index for index, evidence_id in enumerate(evidence_ids)}
+        return sorted(rows, key=lambda row: (order_map[row["evidence_id"]], row["seq"]))
+
+    return conn.execute("SELECT * FROM evidence ORDER BY seq ASC").fetchall()
+
+
+def export_evidence_package(
+    conn,
+    *,
+    blobs_root: Path,
+    out_dir: Path,
+    thread_id: str | None = None,
+    evidence_ids: list[str] | None = None,
+) -> Path:
     blobs_root = Path(blobs_root)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "blobs").mkdir(parents=True, exist_ok=True)
 
-    make_checkpoint(conn)
-
-    rows = conn.execute("SELECT * FROM evidence ORDER BY seq ASC").fetchall()
-    checkpoints = conn.execute(
-        "SELECT at_seq, chain_hash, created_at FROM checkpoints ORDER BY at_seq ASC, created_at ASC"
-    ).fetchall()
+    rows = _resolve_export_rows(conn, thread_id=thread_id, evidence_ids=evidence_ids)
+    if not rows:
+        raise ValueError("no evidence selected for export")
+    exported_seqs = {row["seq"] for row in rows}
+    checkpoints = [
+        dict(checkpoint)
+        for checkpoint in conn.execute(
+            "SELECT at_seq, chain_hash, created_at FROM checkpoints ORDER BY at_seq ASC, created_at ASC"
+        ).fetchall()
+        if checkpoint["at_seq"] in exported_seqs
+    ]
 
     records = []
     seen_hashes: set[str] = set()
@@ -75,7 +110,7 @@ def export_evidence_package(conn, *, blobs_root: Path, out_dir: Path) -> Path:
         "version": 1,
         "generated_at": int(time.time() * 1000),
         "records": records,
-        "checkpoints": [dict(checkpoint) for checkpoint in checkpoints],
+        "checkpoints": checkpoints,
     }
     manifest_path = out_dir / "manifest.json"
     manifest_path.write_text(

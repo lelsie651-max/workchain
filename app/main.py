@@ -4,9 +4,12 @@ import html
 import json
 import os
 import re
+import shutil
 import sqlite3
+import tempfile
 import time
 import traceback
+import zipfile
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,13 +18,15 @@ from typing import Any, Generator
 from urllib.parse import quote
 
 import httpx
+from starlette.background import BackgroundTask
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
+from app.pdf_report import PDF_FILENAME_PREFIX, build_evidence_pdf
 from app.sandbox import (
     SandboxContext,
     apply_sandbox_cookie,
@@ -35,6 +40,7 @@ from app.sandbox import (
 )
 from evidence_core import chain
 from evidence_core.db import init_db
+from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
 
@@ -45,6 +51,13 @@ MAX_TEXT_LENGTH = 20_000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PACKAGE_README_TEXT = (
+    "这个文件夹里的记录不能被偷偷修改。\n"
+    "如果你想自己确认,在装有 Python 的电脑上,\n"
+    "在本文件夹内运行:python verify.py --dir .\n"
+    "显示 OK 表示所有记录都和当初保存时一模一样。\n"
+    "显示 FAIL 表示有记录被改过,并会指出是第几条。\n"
+)
 
 
 def _format_datetime(value: int | None, fmt: str) -> str | None:
@@ -220,6 +233,42 @@ def _build_content_disposition(disposition: str, filename: str | None) -> str:
 
 def _unsupported_detail(media_type: str) -> str:
     return f"这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。"
+
+
+def _export_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M")
+
+
+def _pdf_download_name() -> str:
+    return f"{PDF_FILENAME_PREFIX}-{_export_timestamp()}.pdf"
+
+
+def _package_download_name() -> str:
+    return f"{PDF_FILENAME_PREFIX}-{_export_timestamp()}.zip"
+
+
+def _cleanup_temp_dir(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _mine_evidence_ids(conn: sqlite3.Connection) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT evidence_id
+        FROM evidence
+        WHERE evidence_id NOT LIKE 'ev_demo_%'
+        ORDER BY occurred_at ASC, seq ASC
+        """
+    ).fetchall()
+    return [row["evidence_id"] for row in rows]
+
+
+def _thread_exists(conn: sqlite3.Connection, thread_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM threads WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchone()
+    return row is not None
 
 
 async def _parse_evidence_input(request: Request) -> dict[str, Any]:
@@ -1287,6 +1336,92 @@ def create_app() -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         apply_sandbox_cookie(response, sandbox)
         return response
+
+    @app.get("/export/pdf")
+    def export_pdf(
+        thread_id: str | None = None,
+        scope: str | None = None,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> FileResponse:
+        evidence_ids = None
+        if thread_id:
+            if not _thread_exists(conn, thread_id):
+                raise HTTPException(status_code=404, detail="thread not found")
+        elif scope == "mine":
+            evidence_ids = _mine_evidence_ids(conn)
+            if not evidence_ids:
+                raise HTTPException(status_code=404, detail="no evidence to export")
+        else:
+            raise HTTPException(status_code=400, detail="请指定 thread_id 或 scope=mine")
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="workchain-pdf-"))
+        pdf_name = _pdf_download_name()
+        pdf_path = temp_dir / pdf_name
+        build_evidence_pdf(
+            conn,
+            blobs_root=sandbox.blobs_root,
+            thread_id=thread_id,
+            evidence_ids=evidence_ids,
+            out_path=pdf_path,
+        )
+        return FileResponse(
+            path=pdf_path,
+            media_type="application/pdf",
+            filename=pdf_name,
+            background=BackgroundTask(_cleanup_temp_dir, temp_dir),
+        )
+
+    @app.get("/export/package")
+    def export_package(
+        thread_id: str | None = None,
+        scope: str | None = None,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> FileResponse:
+        evidence_ids = None
+        if thread_id:
+            if not _thread_exists(conn, thread_id):
+                raise HTTPException(status_code=404, detail="thread not found")
+        elif scope == "mine":
+            evidence_ids = _mine_evidence_ids(conn)
+            if not evidence_ids:
+                raise HTTPException(status_code=404, detail="no evidence to export")
+        else:
+            raise HTTPException(status_code=400, detail="请指定 thread_id 或 scope=mine")
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="workchain-package-"))
+        package_dir = temp_dir / "package"
+        package_dir.mkdir(parents=True, exist_ok=True)
+        pdf_name = _pdf_download_name()
+        build_evidence_pdf(
+            conn,
+            blobs_root=sandbox.blobs_root,
+            thread_id=thread_id,
+            evidence_ids=evidence_ids,
+            out_path=package_dir / pdf_name,
+        )
+        export_evidence_package(
+            conn,
+            blobs_root=sandbox.blobs_root,
+            out_dir=package_dir,
+            thread_id=thread_id,
+            evidence_ids=evidence_ids,
+        )
+        (package_dir / "怎么验证这份材料.txt").write_text(PACKAGE_README_TEXT, encoding="utf-8")
+
+        zip_name = _package_download_name()
+        zip_path = temp_dir / zip_name
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for file_path in package_dir.rglob("*"):
+                if file_path.is_file():
+                    archive.write(file_path, file_path.relative_to(package_dir))
+        return FileResponse(
+            path=zip_path,
+            media_type="application/zip",
+            filename=zip_name,
+            background=BackgroundTask(_cleanup_temp_dir, temp_dir),
+        )
 
     @app.post("/api/evidence")
     async def create_evidence(

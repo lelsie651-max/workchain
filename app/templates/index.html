@@ -268,9 +268,22 @@
 
         {% if recent_records %}
         <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <div class="mb-4">
-                <h2 class="text-xl font-semibold text-white">我刚存的</h2>
-                <p class="mt-1 text-sm text-slate-400">这些记录只属于你,24 小时后自动清除,不会影响其他访客看到的演示数据。</p>
+            <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                    <h2 class="text-xl font-semibold text-white">我刚存的</h2>
+                    <p class="mt-1 text-sm text-slate-400">这些记录只属于你,24 小时后自动清除,不会影响其他访客看到的演示数据。</p>
+                </div>
+                <form method="get" action="/export/pdf" data-export-form>
+                    <input type="hidden" name="scope" value="mine">
+                    <button
+                        type="submit"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        data-export-button
+                        data-loading-text="生成中…"
+                    >
+                        导出我的记录
+                    </button>
+                </form>
             </div>
 
             <div class="space-y-3">
@@ -951,6 +964,18 @@
         toggleGlossaryButton.addEventListener("click", () => {
             glossarySection.classList.toggle("hidden");
             syncGlossaryMobileState();
+        });
+
+        [...document.querySelectorAll("[data-export-form]")].forEach((exportForm) => {
+            exportForm.addEventListener("submit", () => {
+                const button = exportForm.querySelector("[data-export-button]");
+                if (!button) {
+                    return;
+                }
+                button.disabled = true;
+                button.textContent = button.dataset.loadingText || "生成中…";
+                button.classList.add("opacity-60", "cursor-not-allowed");
+            });
         });
 
         form.addEventListener("submit", (event) => {
