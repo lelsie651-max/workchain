@@ -11,6 +11,7 @@ from evidence_core import chain
 
 
 ALLOWED_MEDIA_TYPES = {"image", "text", "file"}
+ALLOWED_KINDS = {"request", "confirm", "change", "deliver", "dispute", "reference"}
 UPDATABLE_SLOT_FIELDS = {
     "slot_requester",
     "slot_owner",
@@ -82,6 +83,8 @@ def append_evidence(
         raise ValueError("captured_at must not be None")
     if media_type is None:
         raise ValueError("media_type must not be None")
+    if kind not in ALLOWED_KINDS:
+        raise ValueError("kind must be one of request, confirm, change, deliver, dispute, reference")
 
     blob_bytes, raw_text = _normalize_payload(media_type, payload)
     blobs_root = Path(blobs_root)
@@ -168,6 +171,8 @@ def append_evidence(
                 chain_hash,
             ),
         )
+        if seq % 100 == 0:
+            _insert_checkpoint(conn)
         row = conn.execute(
             "SELECT * FROM evidence WHERE evidence_id = ?",
             (generated_evidence_id,),
@@ -232,7 +237,7 @@ def update_slots(conn, evidence_id: str, **slots) -> dict:
     return _row_to_dict(row)
 
 
-def make_checkpoint(conn) -> dict:
+def _insert_checkpoint(conn) -> dict:
     latest = conn.execute(
         "SELECT seq, chain_hash FROM evidence ORDER BY seq DESC LIMIT 1"
     ).fetchone()
@@ -253,8 +258,13 @@ def make_checkpoint(conn) -> dict:
         "SELECT * FROM checkpoints WHERE checkpoint_id = ?",
         (checkpoint_id,),
     ).fetchone()
-    conn.commit()
     return _row_to_dict(row)
+
+
+def make_checkpoint(conn) -> dict:
+    row = _insert_checkpoint(conn)
+    conn.commit()
+    return row
 
 
 def verify_chain(conn, blobs_root: Path | None = None) -> tuple[bool, int | None, str | None]:
@@ -262,6 +272,7 @@ def verify_chain(conn, blobs_root: Path | None = None) -> tuple[bool, int | None
     expected_seq = 1
     previous_chain_hash = chain.ZERO_HASH
     blobs_root = None if blobs_root is None else Path(blobs_root)
+    chain_hashes_by_seq: dict[int, str] = {}
 
     for row in rows:
         record = dict(row)
@@ -291,6 +302,18 @@ def verify_chain(conn, blobs_root: Path | None = None) -> tuple[bool, int | None
                 return False, seq, "content_hash mismatch"
 
         previous_chain_hash = record["chain_hash"]
+        chain_hashes_by_seq[seq] = record["chain_hash"]
         expected_seq += 1
+
+    checkpoints = conn.execute(
+        "SELECT at_seq, chain_hash FROM checkpoints ORDER BY at_seq ASC"
+    ).fetchall()
+    max_seq = rows[-1]["seq"] if rows else 0
+    for checkpoint in checkpoints:
+        at_seq = checkpoint["at_seq"]
+        if at_seq > max_seq:
+            return False, at_seq, "chain truncated"
+        if chain_hashes_by_seq.get(at_seq) != checkpoint["chain_hash"]:
+            return False, at_seq, "checkpoint mismatch"
 
     return True, None, None

@@ -240,6 +240,16 @@ export/
 
 > verify.py 是给评委当场跑的东西,优先级最高。
 
+### 4.6 链尾截断与校验点
+verify_chain 逐条遍历现有记录,无法自行发现链尾被截断
+(删除末尾若干条后 seq 仍连续、哈希仍自洽)。
+checkpoints 表用于封堵此漏洞:每 100 条自动打点,
+记录当时的最大 seq 与 chain_hash。
+verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致。
+
+**残余风险**:最近一次 checkpoint 之后写入的记录若被整体删除,
+仍无法检测。彻底封堵需可信时间戳(tsa_token),属阶段四范围。
+
 ---
 
 ## 5. 技术栈
@@ -299,6 +309,7 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 |---|---|---|
 | 2026-08-07 | v1.0 初始版本 | — |
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
+| 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |
 
 ---
 
@@ -322,3 +333,5 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
   风险低:store.py 以 dataclass 程序化构造记录,不会出现该输入。
 - canonical.py:NFC 归一化后的键若发生碰撞会静默覆盖,造成摘要歧义。
   风险低:digest 的 7 个键均为 ASCII 字面量。
+- 最近一次 checkpoint 之后的记录若被整体删除,当前无法检测;
+  需 TSA 时间戳封堵,见 §4.6。

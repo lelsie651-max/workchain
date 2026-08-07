@@ -45,6 +45,12 @@ def _all_seqs(conn) -> list[int]:
     return [row["seq"] for row in rows]
 
 
+def _checkpoint_rows(conn):
+    return conn.execute(
+        "SELECT at_seq, chain_hash FROM checkpoints ORDER BY at_seq"
+    ).fetchall()
+
+
 def _append_text(conn, blobs_root: Path, *, text: str, captured_at: int, **kwargs):
     return append_evidence(
         conn,
@@ -277,3 +283,100 @@ def test_make_checkpoint_rejects_empty_database(db_file):
 
     with pytest.raises(ValueError):
         make_checkpoint(conn)
+
+
+def test_append_evidence_auto_creates_checkpoint_at_100(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    latest = None
+    for index in range(100):
+        latest = _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    checkpoints = _checkpoint_rows(conn)
+
+    assert latest is not None
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["at_seq"] == 100
+    assert checkpoints[0]["chain_hash"] == latest["chain_hash"]
+
+
+def test_append_evidence_auto_creates_checkpoints_every_100_records(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(250):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    checkpoints = _checkpoint_rows(conn)
+
+    assert [row["at_seq"] for row in checkpoints] == [100, 200]
+
+
+def test_verify_chain_detects_truncation_past_checkpoint(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(100):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    conn.execute("DELETE FROM evidence WHERE seq BETWEEN 95 AND 100")
+    conn.commit()
+
+    assert verify_chain(conn) == (False, 100, "chain truncated")
+
+
+def test_verify_chain_reports_chain_hash_mismatch_before_checkpoint_check(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(100):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    conn.execute("UPDATE evidence SET chain_hash = ? WHERE seq = 100", ("f" * 64,))
+    conn.commit()
+
+    assert verify_chain(conn) == (False, 100, "chain_hash mismatch")
+
+
+def test_verify_chain_detects_manual_checkpoint_truncation(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(50):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+    make_checkpoint(conn)
+
+    conn.execute("DELETE FROM evidence WHERE seq = 50")
+    conn.commit()
+
+    assert verify_chain(conn) == (False, 50, "chain truncated")
+
+
+def test_verify_chain_detects_empty_evidence_with_remaining_checkpoint(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(100):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    conn.execute("DELETE FROM evidence")
+    conn.commit()
+
+    assert verify_chain(conn) == (False, 100, "chain truncated")
+
+
+def test_append_evidence_rejects_invalid_kind_before_db_insert(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    with pytest.raises(ValueError):
+        _append_text(
+            conn,
+            blobs_root,
+            text="payload",
+            captured_at=1723000000,
+            kind="gossip",
+        )
+
+
+def test_verify_chain_still_passes_after_100_writes_with_auto_checkpoint(db_file, blobs_root):
+    conn = init_db(db_file)
+
+    for index in range(100):
+        _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
+
+    assert verify_chain(conn) == (True, None, None)
