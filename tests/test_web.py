@@ -34,9 +34,16 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     html = response.text
+    assert "这不是我要的" in html
+    assert "你手上的事" in html
+    assert "事项线" not in html
     assert "渠道复盘数据" in html
     assert "用户明细导出" in html
     assert "接口文档补充" in html
+    assert "需求改了 3 次,你一次都没等到确认" in html
+    assert "即将开放" in html
+    assert "飞书" in html
+    assert "企业微信" in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -62,6 +69,8 @@ def test_thread_channel_page_contains_10_evidence_cards(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.text.count('data-testid="timeline-card"') == 10
+    assert "⚠️ 需求在这里发生了变更" in response.text
+    assert "10 条记录" in response.text
 
 
 def test_thread_userlist_page_contains_3_evidence_cards(tmp_path, monkeypatch):

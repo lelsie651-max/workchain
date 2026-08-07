@@ -13,7 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from app.labels import KIND, RISK, STATUS
+from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from scripts.seed_demo import seed_demo_data
 
 
@@ -55,34 +55,55 @@ def get_conn(request: Request) -> Generator[sqlite3.Connection, None, None]:
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
     risk_flags = _decode_json_array(row["risk_flags"])
+    source_platforms = []
+    if row["source_platforms"]:
+        source_platforms = [
+            {"platform": platform, "platform_class": source_badge_class(platform)}
+            for platform in row["source_platforms"].split(",")
+            if platform
+        ]
+    thread = {
+        "thread_id": row["thread_id"],
+        "title": row["title"],
+        "status": row["status"],
+        "risk_flags": risk_flags,
+    }
     return {
         "thread_id": row["thread_id"],
         "title": row["title"],
         "status_label": STATUS[row["status"]],
         "version": row["version"],
+        "headline": thread_headline(thread),
         "risk_labels": [RISK.get(flag, flag) for flag in risk_flags],
+        "source_platforms": source_platforms,
         "evidence_count": row["evidence_count"],
-        "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d %H:%M"),
+        "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d"),
     }
 
 
 def _prepare_reference_row(row: sqlite3.Row) -> dict[str, Any]:
+    platform, scene = source_label(row["source_hint"])
     return {
         "seq": row["seq"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
-        "source_hint": row["source_hint"],
+        "platform": platform,
+        "platform_class": source_badge_class(platform),
+        "scene": scene,
         "raw_text": row["raw_text"],
     }
 
 
 def _prepare_timeline_row(row: sqlite3.Row) -> dict[str, Any]:
     caveats = _decode_json_array(row["caveats"])
+    platform, scene = source_label(row["source_hint"])
     return {
         "seq": row["seq"],
         "kind": row["kind"],
         "kind_label": KIND[row["kind"]],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
-        "source_hint": row["source_hint"],
+        "platform": platform,
+        "platform_class": source_badge_class(platform),
+        "scene": scene,
         "raw_text": row["raw_text"],
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
@@ -102,7 +123,11 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
             t.version,
             t.risk_flags,
             t.last_activity_at,
-            COUNT(e.evidence_id) AS evidence_count
+            COUNT(e.evidence_id) AS evidence_count,
+            GROUP_CONCAT(DISTINCT CASE
+                WHEN instr(e.source_hint, '-') > 0 THEN substr(e.source_hint, 1, instr(e.source_hint, '-') - 1)
+                ELSE e.source_hint
+            END) AS source_platforms
         FROM threads AS t
         LEFT JOIN evidence AS e ON e.thread_id = t.thread_id
         GROUP BY
@@ -149,17 +174,26 @@ def _fetch_thread_detail(conn: sqlite3.Connection, thread_id: str) -> dict[str, 
         """,
         (thread_id,),
     ).fetchall()
+    occurred_values = [row["occurred_at"] for row in evidence_rows if row["occurred_at"] is not None]
+    change_count = sum(1 for row in evidence_rows if row["kind"] == "change")
     return {
         "thread": {
             "thread_id": thread_row["thread_id"],
             "title": thread_row["title"],
             "status_label": STATUS[thread_row["status"]],
             "version": thread_row["version"],
+            "headline": thread_headline(
+                {"status": thread_row["status"], "risk_flags": _decode_json_array(thread_row["risk_flags"])}
+            ),
             "risk_labels": [RISK.get(flag, flag) for flag in _decode_json_array(thread_row["risk_flags"])],
             "current_deliverable": thread_row["current_deliverable"],
             "current_due_text": _format_datetime(thread_row["current_due"], "%m-%d %H:%M"),
             "last_activity_text": _format_datetime(thread_row["last_activity_at"], "%m-%d %H:%M"),
             "evidence_count": len(evidence_rows),
+            "summary_text": (
+                f"这件事从 {_format_datetime(min(occurred_values), '%m-%d')} 到 "
+                f"{_format_datetime(max(occurred_values), '%m-%d')},共 {len(evidence_rows)} 条记录,期间需求变更 {change_count} 次"
+            ),
         },
         "entries": [_prepare_timeline_row(row) for row in evidence_rows],
     }

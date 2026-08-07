@@ -1,11 +1,25 @@
 {% extends "base.html" %}
 
 {% block content %}
+<section class="mb-8 sm:mb-10">
+    <div class="mb-6">
+        <h1 class="text-4xl font-semibold leading-tight tracking-tight text-white sm:text-5xl">「这不是我要的」?</h1>
+        <p class="mt-3 text-base text-slate-300 sm:text-lg">自动留证 · 不可篡改 · 可第三方验证</p>
+    </div>
+
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
+        <div class="min-h-11 rounded-xl border border-dashed border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-400">
+            把聊天记录粘进来,或上传截图 / 文档
+        </div>
+        <p class="mt-2 text-xs text-slate-500">即将开放</p>
+    </div>
+</section>
+
 <section class="mb-10">
-    <div class="mb-5 flex items-end justify-between gap-4">
+    <div class="mb-5">
         <div>
-            <h2 class="text-xl font-semibold text-white">事项线总览</h2>
-            <p class="mt-1 text-sm text-slate-400">演示数据按事项线聚合展示,便于快速看清需求、变更和争议。</p>
+            <h2 class="text-xl font-semibold text-white sm:text-2xl">你手上的事</h2>
+            <p class="mt-1 text-sm text-slate-400">每一件事的来龙去脉,自动串成一条时间线。</p>
         </div>
     </div>
 
@@ -13,17 +27,16 @@
         {% for thread in threads %}
         <a
             href="/thread/{{ thread.thread_id }}"
-            class="block rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
+            class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
             data-testid="thread-card"
         >
-            <div class="flex items-start justify-between gap-3">
-                <div>
-                    <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
-                    <p class="mt-2 text-sm text-slate-400">{{ thread.status_label }} · 第 {{ thread.version }} 版</p>
-                </div>
-                <span class="rounded-full border border-slate-700 px-3 py-1 text-xs text-slate-300">
-                    {{ thread.evidence_count }} 条证据
-                </span>
+            <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
+            <p class="mt-3 text-xl font-semibold leading-8 text-orange-300 sm:text-2xl sm:leading-9">{{ thread.headline }}</p>
+
+            <div class="mt-4 flex flex-wrap gap-2">
+                {% for source in thread.source_platforms %}
+                <span class="rounded-full border px-2.5 py-1 text-xs {{ source.platform_class }}">{{ source.platform }}</span>
+                {% endfor %}
             </div>
 
             <div class="mt-4 flex flex-wrap gap-2">
@@ -32,7 +45,7 @@
                 {% endfor %}
             </div>
 
-            <p class="mt-4 text-sm text-slate-400">最后活动时间：{{ thread.last_activity_text }}</p>
+            <p class="mt-5 text-sm text-slate-400">{{ thread.evidence_count }} 条记录 · 最后活动 {{ thread.last_activity_text }}</p>
         </a>
         {% endfor %}
     </div>
@@ -51,7 +64,10 @@
                 <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
                     <span>#{{ ref.seq }}</span>
                     <span>{{ ref.occurred_at_text }}</span>
-                    <span>{{ ref.source_hint }}</span>
+                    <span class="rounded-full border px-2.5 py-1 {{ ref.platform_class }}">{{ ref.platform }}</span>
+                    {% if ref.scene %}
+                    <span>{{ ref.scene }}</span>
+                    {% endif %}
                 </div>
                 <p class="text-sm leading-6 text-slate-200">{{ ref.raw_text }}</p>
             </article>

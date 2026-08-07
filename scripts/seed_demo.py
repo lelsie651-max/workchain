@@ -171,7 +171,7 @@ def _story_records() -> list[dict]:
             "kind": "request",
             "occurred_at": _ts("2026-03-06T10:00:00"),
             "captured_at": _ts("2026-03-06T10:01:00"),
-            "source_hint": "飞书-私聊-李娜",
+            "source_hint": "企业微信-私聊-李娜",
             "thread_id": "thr_userlist",
             "payload": "李娜:你这边顺手帮我导一份用户明细吧，我下午要给销售核对名单。",
             "slots": {
@@ -190,7 +190,7 @@ def _story_records() -> list[dict]:
             "kind": "deliver",
             "occurred_at": _ts("2026-03-06T17:40:00"),
             "captured_at": _ts("2026-03-06T17:41:00"),
-            "source_hint": "飞书-项目复盘群",
+            "source_hint": "钉钉-公司通知",
             "thread_id": "thr_channel",
             "payload": "我:渠道复盘 v1 我先发你，先按周维度拆了渠道成本、转化和留存，附件表我也放共享盘了。",
             "slots": {
@@ -254,7 +254,7 @@ def _story_records() -> list[dict]:
             "kind": "request",
             "occurred_at": _ts("2026-03-12T15:30:00"),
             "captured_at": _ts("2026-03-12T15:31:00"),
-            "source_hint": "飞书-私聊-王强",
+            "source_hint": "Jira-WORK-238",
             "thread_id": "thr_apidoc",
             "payload": "王强:接口联调用的那份文档你也给我一份吧，最好今天下班前，我这边要给前端同步字段说明。",
             "slots": {
@@ -335,7 +335,7 @@ def _story_records() -> list[dict]:
             "kind": "request",
             "occurred_at": _ts("2026-03-26T10:15:00"),
             "captured_at": _ts("2026-03-26T10:16:00"),
-            "source_hint": "飞书-私聊-李娜",
+            "source_hint": "企业微信-私聊-李娜",
             "thread_id": "thr_userlist",
             "payload": "李娜:上次那份用户明细你还没给我呢，今天能不能先把近三个月新增用户导出来？",
             "slots": {
@@ -354,7 +354,7 @@ def _story_records() -> list[dict]:
             "kind": "confirm",
             "occurred_at": _ts("2026-03-26T10:22:00"),
             "captured_at": _ts("2026-03-26T10:23:00"),
-            "source_hint": "飞书-私聊-李娜",
+            "source_hint": "企业微信-私聊-李娜",
             "thread_id": "thr_userlist",
             "payload": "我:收到，这周我给你补上，先把渠道复盘这边收个尾，最晚周五前给你。",
             "slots": {
@@ -372,7 +372,7 @@ def _story_records() -> list[dict]:
             "kind": "change",
             "occurred_at": _ts("2026-04-02T14:05:00"),
             "captured_at": _ts("2026-04-02T14:06:00"),
-            "source_hint": "飞书-项目复盘群",
+            "source_hint": "钉钉-公司通知",
             "thread_id": "thr_channel",
             "payload": "张总:先别做全渠道了，范围收窄到信息流和搜索两块，重点把异常波动原因讲清楚，下周三给我。",
             "slots": {

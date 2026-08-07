@@ -192,6 +192,19 @@ def test_thr_apidoc_status_is_open(tmp_path):
         conn.close()
 
 
+def test_source_hint_covers_at_least_four_platform_prefixes(tmp_path):
+    out_dir = tmp_path / "demo_data"
+    _run_seed(out_dir)
+
+    conn = _connect(out_dir / "workchain.db")
+    try:
+        rows = conn.execute("SELECT source_hint FROM evidence ORDER BY seq").fetchall()
+        prefixes = {row["source_hint"].split("-", 1)[0] for row in rows}
+        assert len(prefixes) >= 4
+    finally:
+        conn.close()
+
+
 def test_seed_demo_is_repeatable_across_two_runs(tmp_path):
     out_dir = tmp_path / "demo_data"
 
