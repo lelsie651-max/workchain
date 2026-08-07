@@ -1,19 +1,36 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="mb-8 sm:mb-10">
-    <div
-        id="flash-banner"
-        class="mb-4 hidden rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500"
-        role="status"
-        aria-live="polite"
-    ></div>
-    <details class="mb-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-4" id="settings-panel">
-        <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">让它更懂你</summary>
-        <div class="mt-4 space-y-5">
-            <div>
-                <label class="block text-sm font-medium text-slate-200">你在对话里叫什么</label>
-                <p class="mt-1 text-xs text-slate-500">填了之后,系统才知道哪句话是你说的</p>
+<div class="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)] lg:items-start">
+    <aside class="space-y-6 lg:sticky lg:top-6">
+        <div
+            id="flash-banner"
+            class="hidden rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500"
+            role="status"
+            aria-live="polite"
+        ></div>
+
+        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="mb-4">
+                <h2 class="text-xl font-semibold text-white">让它更懂你</h2>
+            </div>
+
+            <div
+                id="self-name-panel"
+                class="{% if settings.has_self_names %}border-slate-800 bg-slate-950/40{% else %}border-yellow-400/30 bg-yellow-400/5{% endif %} rounded-2xl border p-4"
+            >
+                <div class="flex items-start justify-between gap-3">
+                    <div>
+                        <h3 class="text-sm font-medium text-slate-200">你在对话里叫什么</h3>
+                        <p class="mt-1 text-xs text-slate-500">填了之后,系统才知道哪句话是你说的</p>
+                    </div>
+                    <p
+                        id="self-name-suggestion"
+                        class="{% if settings.has_self_names %}hidden {% endif %}text-xs text-yellow-200"
+                    >
+                        建议先填一下
+                    </p>
+                </div>
                 <div id="self-names-tags" class="mt-3 flex flex-wrap gap-2">
                     {% for item in settings.self_names %}
                     <button
@@ -43,279 +60,307 @@
                 </div>
             </div>
 
-            <div>
-                <label class="block text-sm font-medium text-slate-200">我的词典</label>
-                <div class="mt-3 space-y-3" id="glossary-rows">
-                    {% for item in settings.glossary %}
-                    <div class="grid gap-3 md:grid-cols-[1fr_140px_1fr_auto]">
-                        <input type="text" value="{{ item.term }}" data-glossary-term class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                        <select data-glossary-kind class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                            <option value="person" {% if item.kind == "person" %}selected{% endif %}>人物</option>
-                            <option value="phrase" {% if item.kind == "phrase" %}selected{% endif %}>说法</option>
-                        </select>
-                        <input type="text" value="{{ item.meaning }}" data-glossary-meaning class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                        <button type="button" data-remove-glossary class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+            <div class="mt-5 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+                <div class="flex items-center justify-between gap-3">
+                    <div>
+                        <h3 class="text-sm font-medium text-slate-200">我的词典</h3>
+                        <p class="mt-1 text-xs text-slate-500">如果这个词在某句话里是随口一说,系统会以原文为准</p>
                     </div>
-                    {% endfor %}
-                </div>
-                <div class="mt-3 flex flex-wrap gap-3">
                     <button
-                        id="add-glossary-row"
+                        id="toggle-glossary"
                         type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
                     >
-                        新增词条
-                    </button>
-                    <button
-                        id="save-settings"
-                        type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
-                    >
-                        保存设置
+                        <span id="toggle-glossary-text">展开词典</span>
+                        <span class="ml-2 text-slate-500" id="glossary-count-mobile">{{ settings.glossary|length }}</span>
                     </button>
                 </div>
-                <p class="mt-2 text-xs text-slate-500">如果这个词在某句话里是随口一说,系统会以原文为准</p>
+
+                <div id="glossary-section" class="mt-4 hidden space-y-4 lg:block">
+                    <div id="glossary-list" class="space-y-3">
+                        {% for item in settings.glossary %}
+                        <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div>
+                                    <p class="text-sm text-slate-100">{{ item.term }}</p>
+                                    <p class="mt-1 text-xs text-slate-500">{{ "人物" if item.kind == "person" else "说法" }} · {{ item.meaning }}</p>
+                                </div>
+                                <button type="button" data-remove-glossary="{{ item.term }}" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+
+                    <div class="flex flex-wrap gap-3">
+                        <button
+                            id="add-glossary-row"
+                            type="button"
+                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            新增词条
+                        </button>
+                        <button
+                            id="save-settings"
+                            type="button"
+                            class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
+                        >
+                            保存设置
+                        </button>
+                    </div>
+
+                    <div id="new-glossary-form" class="hidden rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                        <div class="grid gap-3">
+                            <input id="new-glossary-term" type="text" placeholder="词" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                            <select id="new-glossary-kind" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                                <option value="person">人物</option>
+                                <option value="phrase">说法</option>
+                            </select>
+                            <input id="new-glossary-meaning" type="text" placeholder="指的是什么" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                            <div class="flex flex-wrap gap-3">
+                                <button id="confirm-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-400/20">加入词典</button>
+                                <button id="cancel-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">取消</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
             </div>
-        </div>
-    </details>
+        </section>
+    </aside>
 
-    <div
-        id="self-name-warning"
-        class="{% if settings.has_self_names %}hidden {% endif %}mb-4 rounded-2xl border border-yellow-400/30 bg-yellow-400/10 px-4 py-3 text-sm text-yellow-100"
-    >
-        还没告诉系统你在对话里叫什么,解析可能认不出哪句是你说的
-    </div>
-    <form id="evidence-form" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
-        <p class="mb-3 text-sm text-slate-400">把聊天记录粘进来,系统会读懂谁答应了谁什么、什么时候要</p>
-        <label for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
-        <textarea
-            id="evidence-text"
-            name="text"
-            rows="6"
-            maxlength="20000"
-            placeholder="把聊天记录粘进来,或上传截图 / 文档"
-            class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-        ></textarea>
+    <div class="space-y-8">
+        <section>
+            <form id="evidence-form" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
+                <p class="mb-3 text-sm text-slate-400">把聊天记录粘进来,系统会读懂谁答应了谁什么、什么时候要</p>
+                <label for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
+                <textarea
+                    id="evidence-text"
+                    name="text"
+                    rows="6"
+                    maxlength="20000"
+                    placeholder="把聊天记录粘进来,或上传截图 / 文档"
+                    class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                ></textarea>
 
-        <div class="mt-4 grid gap-3 md:grid-cols-3">
-            <div>
-                <label for="source-select" class="mb-2 block text-sm text-slate-300">来源</label>
-                <select
-                    id="source-select"
-                    name="source"
-                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                >
-                    {% for source in source_presets %}
-                    <option value="{{ source }}">{{ source }}</option>
-                    {% endfor %}
-                    <option value="__custom__">自定义…</option>
-                </select>
-            </div>
-            <div id="source-custom-wrap" class="hidden">
-                <label for="source-custom" class="mb-2 block text-sm text-slate-300">自定义来源</label>
-                <input
-                    id="source-custom"
-                    name="source_custom"
-                    type="text"
-                    maxlength="20"
-                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                >
-            </div>
-            <div>
-                <label for="source-detail" class="mb-2 block text-sm text-slate-300">具体位置</label>
-                <input
-                    id="source-detail"
-                    name="source_detail"
-                    type="text"
-                    placeholder="如:项目复盘群"
-                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                >
-            </div>
-            <div>
-                <label for="counterpart-input" class="mb-2 block text-sm text-slate-300">这段对话里的另一方是谁</label>
-                <input
-                    id="counterpart-input"
-                    name="counterpart"
-                    type="text"
-                    placeholder="可留空"
-                    class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                >
-            </div>
-        </div>
+                <div class="mt-4 grid gap-3 md:grid-cols-4">
+                    <select
+                        id="source-select"
+                        name="source"
+                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                    >
+                        {% for source in source_presets %}
+                        <option value="{{ source }}">{{ source }}</option>
+                        {% endfor %}
+                        <option value="__custom__">自定义…</option>
+                    </select>
+                    <input
+                        id="source-custom"
+                        name="source_custom"
+                        type="text"
+                        maxlength="20"
+                        placeholder="自定义来源"
+                        class="hidden min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    >
+                    <input
+                        id="source-detail"
+                        name="source_detail"
+                        type="text"
+                        placeholder="具体位置(可选)"
+                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    >
+                    <input
+                        id="counterpart-input"
+                        name="counterpart"
+                        type="text"
+                        placeholder="这段对话里的另一方(可选)"
+                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
+                    >
+                </div>
 
-        <div class="mt-4 flex flex-wrap items-center gap-3">
-            <button
-                id="submit-button"
-                type="submit"
-                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-            >
-                保存
-            </button>
-            <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
-        </div>
-        <p id="form-message" class="mt-3 text-sm text-slate-400"></p>
-    </form>
-</section>
+                <div class="mt-4 flex flex-wrap items-center gap-3">
+                    <button
+                        id="submit-button"
+                        type="submit"
+                        class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                    >
+                        保存
+                    </button>
+                    <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
+                </div>
+                <p id="form-message" class="mt-3 text-sm text-slate-400"></p>
+            </form>
+        </section>
 
-<section class="mb-10">
-    <div class="mb-5">
-        <div>
-            <h2 class="text-xl font-semibold text-white sm:text-2xl">你手上的事</h2>
-            <p class="mt-1 text-sm text-slate-400">每一件事的来龙去脉,自动串成一条时间线。</p>
-        </div>
-    </div>
-
-    <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {% for thread in threads %}
-        <a
-            href="/thread/{{ thread.thread_id }}"
-            class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
-            data-testid="thread-card"
-        >
-            <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
-            <p class="mt-3 text-xl font-semibold leading-8 text-orange-300 sm:text-2xl sm:leading-9">{{ thread.headline }}</p>
-
-            <div class="mt-4 flex flex-wrap gap-2">
-                {% for source in thread.source_platforms %}
-                <span class="rounded-full border px-2.5 py-1 text-xs {{ source.platform_class }}">{{ source.platform }}</span>
-                {% endfor %}
+        <section>
+            <div class="mb-5">
+                <div>
+                    <h2 class="text-xl font-semibold text-white sm:text-2xl">你手上的事</h2>
+                    <p class="mt-1 text-sm text-slate-400">每一件事的来龙去脉,自动串成一条时间线。</p>
+                </div>
             </div>
 
-            <div class="mt-4 flex flex-wrap gap-2">
-                {% for label in thread.risk_labels %}
-                <span class="rounded-full bg-amber-400/15 px-3 py-1 text-xs text-amber-200">{{ label }}</span>
-                {% endfor %}
-            </div>
-
-            <p class="mt-5 text-sm text-slate-400">{{ thread.evidence_count }} 条记录 · 最后活动 {{ thread.last_activity_text }}</p>
-        </a>
-        {% endfor %}
-    </div>
-</section>
-
-{% if recent_records %}
-<section class="mb-10 rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-    <div class="mb-4">
-        <h2 class="text-xl font-semibold text-white">我刚存的</h2>
-        <p class="mt-1 text-sm text-slate-400">这些记录只属于你,24 小时后自动清除,不会影响其他访客看到的演示数据。</p>
-    </div>
-
-    <div class="space-y-3">
-        {% for item in recent_records %}
-        <article
-            class="rounded-xl border border-slate-800 bg-slate-950/70 p-4"
-            data-evidence-id="{{ item.evidence_id }}"
-            data-parse-status="{{ item.parse_status }}"
-        >
-            <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                <span>{{ item.occurred_at_text }}</span>
-                <span class="rounded-full border px-2.5 py-1 {{ item.platform_class }}">{{ item.platform }}</span>
-                {% if item.is_verified %}
-                <span class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">已确认</span>
-                {% endif %}
-                {% if item.scene %}
-                <span>{{ item.scene }}</span>
-                {% endif %}
-            </div>
-            <div class="text-sm leading-6 text-slate-200">
-                <p
-                    data-raw-preview
-                    class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
-                >{{ item.raw_text_preview }}</p>
-                <div
-                    data-raw-full
-                    class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
-                >{{ item.raw_text }}</div>
-            </div>
-            <div class="mt-3 flex flex-wrap items-center gap-3">
-                {% if item.is_long_text %}
-                <button
-                    type="button"
-                    data-toggle-fulltext
-                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                >
-                    展开全文
-                </button>
-                {% endif %}
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {% for thread in threads %}
                 <a
-                    href="/evidence/{{ item.evidence_id }}"
-                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    href="/thread/{{ thread.thread_id }}"
+                    class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
+                    data-testid="thread-card"
                 >
-                    详情
+                    <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
+                    <p class="mt-3 text-xl font-semibold leading-8 text-orange-300 sm:text-2xl sm:leading-9">{{ thread.headline }}</p>
+
+                    <div class="mt-4 flex flex-wrap gap-2">
+                        {% for source in thread.source_platforms %}
+                        <span class="rounded-full border px-2.5 py-1 text-xs {{ source.platform_class }}">{{ source.platform }}</span>
+                        {% endfor %}
+                    </div>
+
+                    <div class="mt-4 flex flex-wrap gap-2">
+                        {% for label in thread.risk_labels %}
+                        <span class="rounded-full bg-amber-400/15 px-3 py-1 text-xs text-amber-200">{{ label }}</span>
+                        {% endfor %}
+                    </div>
+
+                    <p class="mt-5 text-sm text-slate-400">{{ thread.evidence_count }} 条记录 · 最后活动 {{ thread.last_activity_text }}</p>
                 </a>
+                {% endfor %}
             </div>
-            <div class="mt-3 text-sm text-slate-300" data-parse-body>
-                {% if item.parse_status == "pending" %}
-                <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>解析中…</p>
-                {% elif item.parse_status == "done" %}
-                {% if item.plain_summary %}
-                <p class="text-slate-200">{{ item.plain_summary }}</p>
-                {% endif %}
-                <div class="mt-2 space-y-1 text-slate-400">
-                    {% if item.deliverable %}
-                    <p>交付物：{{ item.deliverable }}</p>
-                    {% endif %}
-                    {% if item.due_text %}
-                    <p>时限：{{ item.due_text }}</p>
-                    {% endif %}
-                    {% for caveat in item.caveats %}
-                    <p class="text-yellow-200">{{ caveat }}</p>
+        </section>
+
+        {% if recent_records %}
+        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="mb-4">
+                <h2 class="text-xl font-semibold text-white">我刚存的</h2>
+                <p class="mt-1 text-sm text-slate-400">这些记录只属于你,24 小时后自动清除,不会影响其他访客看到的演示数据。</p>
+            </div>
+
+            <div class="space-y-3">
+                {% for item in recent_records %}
+                <article
+                    class="rounded-xl border border-slate-800 bg-slate-950/70 p-4"
+                    data-evidence-id="{{ item.evidence_id }}"
+                    data-parse-status="{{ item.parse_status }}"
+                >
+                    <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                        <span>{{ item.occurred_at_text }}</span>
+                        <span class="rounded-full border px-2.5 py-1 {{ item.platform_class }}">{{ item.platform }}</span>
+                        {% if item.is_verified %}
+                        <span class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">已确认</span>
+                        {% endif %}
+                        {% if item.scene %}
+                        <span>{{ item.scene }}</span>
+                        {% endif %}
+                    </div>
+                    <div class="text-sm leading-6 text-slate-200">
+                        <p
+                            data-raw-preview
+                            class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
+                        >{{ item.raw_text_preview }}</p>
+                        <div
+                            data-raw-full
+                            class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
+                        >{{ item.raw_text }}</div>
+                    </div>
+                    <div class="mt-3 flex flex-wrap items-center gap-3">
+                        {% if item.is_long_text %}
+                        <button
+                            type="button"
+                            data-toggle-fulltext
+                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            展开全文
+                        </button>
+                        {% endif %}
+                        <a
+                            href="/evidence/{{ item.evidence_id }}"
+                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            详情
+                        </a>
+                    </div>
+                    <div class="mt-3 text-sm text-slate-300" data-parse-body>
+                        {% if item.parse_status == "pending" %}
+                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>解析中…</p>
+                        {% elif item.parse_status == "done" %}
+                        {% if item.plain_summary %}
+                        <p class="text-slate-200">{{ item.plain_summary }}</p>
+                        {% endif %}
+                        <div class="mt-2 space-y-1 text-slate-400">
+                            {% if item.deliverable %}
+                            <p>交付物：{{ item.deliverable }}</p>
+                            {% endif %}
+                            {% if item.due_text %}
+                            <p>时限：{{ item.due_text }}</p>
+                            {% endif %}
+                            {% for caveat in item.caveats %}
+                            <p class="text-yellow-200">{{ caveat }}</p>
+                            {% endfor %}
+                        </div>
+                        {% else %}
+                        <p class="text-slate-400">{{ item.parse_detail or "解析暂不可用,记录已完整保存" }}</p>
+                        {% endif %}
+                    </div>
+                </article>
+                {% endfor %}
+            </div>
+        </section>
+        {% endif %}
+
+        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+            <details open>
+                <summary class="cursor-pointer list-none text-lg font-semibold text-white">
+                    参考信息
+                    <span class="ml-2 text-sm font-normal text-slate-400">已识别为参考信息,未计入待办</span>
+                </summary>
+
+                <div class="mt-5 space-y-4">
+                    {% for ref in references %}
+                    <article class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
+                        <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
+                            <span>#{{ ref.seq }}</span>
+                            <span>{{ ref.occurred_at_text }}</span>
+                            <span class="rounded-full border px-2.5 py-1 {{ ref.platform_class }}">{{ ref.platform }}</span>
+                            {% if ref.scene %}
+                            <span>{{ ref.scene }}</span>
+                            {% endif %}
+                        </div>
+                        <p class="text-sm leading-6 text-slate-200">{{ ref.raw_text }}</p>
+                    </article>
                     {% endfor %}
                 </div>
-                {% else %}
-                <p class="text-slate-400">{{ item.parse_detail or "解析暂不可用,记录已完整保存" }}</p>
-                {% endif %}
-            </div>
-        </article>
-        {% endfor %}
+            </details>
+        </section>
     </div>
-</section>
-{% endif %}
-
-<section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-    <details open>
-        <summary class="cursor-pointer list-none text-lg font-semibold text-white">
-            参考信息
-            <span class="ml-2 text-sm font-normal text-slate-400">已识别为参考信息,未计入待办</span>
-        </summary>
-
-        <div class="mt-5 space-y-4">
-            {% for ref in references %}
-            <article class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-                <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                    <span>#{{ ref.seq }}</span>
-                    <span>{{ ref.occurred_at_text }}</span>
-                    <span class="rounded-full border px-2.5 py-1 {{ ref.platform_class }}">{{ ref.platform }}</span>
-                    {% if ref.scene %}
-                    <span>{{ ref.scene }}</span>
-                    {% endif %}
-                </div>
-                <p class="text-sm leading-6 text-slate-200">{{ ref.raw_text }}</p>
-            </article>
-            {% endfor %}
-        </div>
-    </details>
-</section>
+</div>
 
 <script>
     (() => {
         const form = document.getElementById("evidence-form");
         const textarea = document.getElementById("evidence-text");
         const sourceSelect = document.getElementById("source-select");
-        const sourceCustomWrap = document.getElementById("source-custom-wrap");
         const sourceCustom = document.getElementById("source-custom");
         const sourceDetail = document.getElementById("source-detail");
         const counterpartInput = document.getElementById("counterpart-input");
         const message = document.getElementById("form-message");
         const flashBanner = document.getElementById("flash-banner");
         const submitButton = document.getElementById("submit-button");
-        const selfNameWarning = document.getElementById("self-name-warning");
+        const selfNamePanel = document.getElementById("self-name-panel");
+        const selfNameSuggestion = document.getElementById("self-name-suggestion");
         const selfNamesTags = document.getElementById("self-names-tags");
         const selfNameInput = document.getElementById("self-name-input");
         const addSelfNameButton = document.getElementById("add-self-name");
-        const glossaryRows = document.getElementById("glossary-rows");
+        const glossaryList = document.getElementById("glossary-list");
+        const glossarySection = document.getElementById("glossary-section");
+        const toggleGlossaryButton = document.getElementById("toggle-glossary");
+        const toggleGlossaryText = document.getElementById("toggle-glossary-text");
+        const glossaryCountMobile = document.getElementById("glossary-count-mobile");
         const addGlossaryRowButton = document.getElementById("add-glossary-row");
         const saveSettingsButton = document.getElementById("save-settings");
+        const newGlossaryForm = document.getElementById("new-glossary-form");
+        const newGlossaryTerm = document.getElementById("new-glossary-term");
+        const newGlossaryKind = document.getElementById("new-glossary-kind");
+        const newGlossaryMeaning = document.getElementById("new-glossary-meaning");
+        const confirmAddGlossary = document.getElementById("confirm-add-glossary");
+        const cancelAddGlossary = document.getElementById("cancel-add-glossary");
         const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status='pending']")];
         const toggleButtons = [...document.querySelectorAll("[data-toggle-fulltext]")];
         let selfNames = {{ settings.self_names|tojson }};
@@ -323,7 +368,7 @@
 
         const syncCustomSource = () => {
             const isCustom = sourceSelect.value === "__custom__";
-            sourceCustomWrap.classList.toggle("hidden", !isCustom);
+            sourceCustom.classList.toggle("hidden", !isCustom);
             if (!isCustom) {
                 sourceCustom.value = "";
             }
@@ -444,8 +489,19 @@
             }, 2000);
         };
 
-        const syncSelfNameWarning = () => {
-            selfNameWarning.classList.toggle("hidden", selfNames.length > 0);
+        const syncSelfNameHighlight = () => {
+            const hasSelfNames = selfNames.length > 0;
+            selfNameSuggestion.classList.toggle("hidden", hasSelfNames);
+            selfNamePanel.classList.toggle("border-yellow-400/30", !hasSelfNames);
+            selfNamePanel.classList.toggle("bg-yellow-400/5", !hasSelfNames);
+            selfNamePanel.classList.toggle("border-slate-800", hasSelfNames);
+            selfNamePanel.classList.toggle("bg-slate-950/40", hasSelfNames);
+        };
+
+        const syncGlossaryMobileState = () => {
+            glossaryCountMobile.textContent = glossary.length;
+            const expanded = !glossarySection.classList.contains("hidden");
+            toggleGlossaryText.textContent = expanded ? "收起词典" : "展开词典";
         };
 
         const renderSelfNames = () => {
@@ -462,40 +518,30 @@
                 });
                 selfNamesTags.appendChild(button);
             });
-            syncSelfNameWarning();
-        };
-
-        const createGlossaryRow = (item = { term: "", kind: "person", meaning: "" }) => {
-            const row = document.createElement("div");
-            row.className = "grid gap-3 md:grid-cols-[1fr_140px_1fr_auto]";
-            row.innerHTML = `
-                <input type="text" value="${item.term || ""}" data-glossary-term class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                <select data-glossary-kind class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                    <option value="person" ${item.kind === "person" ? "selected" : ""}>人物</option>
-                    <option value="phrase" ${item.kind === "phrase" ? "selected" : ""}>说法</option>
-                </select>
-                <input type="text" value="${item.meaning || ""}" data-glossary-meaning class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                <button type="button" data-remove-glossary class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
-            `;
-            row.querySelector("[data-remove-glossary]").addEventListener("click", () => {
-                row.remove();
-            });
-            return row;
+            syncSelfNameHighlight();
         };
 
         const renderGlossary = () => {
-            glossaryRows.innerHTML = "";
+            glossaryList.innerHTML = "";
             glossary.forEach((item) => {
-                glossaryRows.appendChild(createGlossaryRow(item));
+                const row = document.createElement("div");
+                row.className = "rounded-xl border border-slate-800 bg-slate-900/70 p-3";
+                row.innerHTML = `
+                    <div class="flex items-start justify-between gap-3">
+                        <div>
+                            <p class="text-sm text-slate-100">${item.term}</p>
+                            <p class="mt-1 text-xs text-slate-500">${item.kind === "person" ? "人物" : "说法"} · ${item.meaning}</p>
+                        </div>
+                        <button type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                    </div>
+                `;
+                row.querySelector("button").addEventListener("click", () => {
+                    glossary = glossary.filter((entry) => !(entry.term === item.term && entry.kind === item.kind && entry.meaning === item.meaning));
+                    renderGlossary();
+                });
+                glossaryList.appendChild(row);
             });
-        };
-
-        const collectGlossary = () => {
-            return [...glossaryRows.children].map((row) => ({
-                term: row.querySelector("[data-glossary-term]").value.trim(),
-                kind: row.querySelector("[data-glossary-kind]").value,
-                meaning: row.querySelector("[data-glossary-meaning]").value.trim(),
-            }));
+            syncGlossaryMobileState();
         };
 
         const saveSettings = async () => {
@@ -505,7 +551,7 @@
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         self_names: selfNames,
-                        glossary: collectGlossary(),
+                        glossary: glossary,
                     }),
                 });
                 const data = await response.json();
@@ -517,6 +563,7 @@
                 glossary = data.glossary || [];
                 renderSelfNames();
                 renderGlossary();
+                newGlossaryForm.classList.add("hidden");
                 showBanner("设置已保存,马上生效", "success");
             } catch (error) {
                 showBanner("保存设置失败,请稍后再试", "error");
@@ -557,11 +604,35 @@
         });
 
         addGlossaryRowButton.addEventListener("click", () => {
-            glossaryRows.appendChild(createGlossaryRow());
+            newGlossaryForm.classList.toggle("hidden");
         });
 
         saveSettingsButton.addEventListener("click", () => {
             saveSettings();
+        });
+
+        confirmAddGlossary.addEventListener("click", () => {
+            const term = newGlossaryTerm.value.trim();
+            const kind = newGlossaryKind.value;
+            const meaning = newGlossaryMeaning.value.trim();
+            if (!term || !meaning) {
+                return;
+            }
+            glossary.push({ term, kind, meaning });
+            newGlossaryTerm.value = "";
+            newGlossaryMeaning.value = "";
+            newGlossaryKind.value = "person";
+            newGlossaryForm.classList.add("hidden");
+            renderGlossary();
+        });
+
+        cancelAddGlossary.addEventListener("click", () => {
+            newGlossaryForm.classList.add("hidden");
+        });
+
+        toggleGlossaryButton.addEventListener("click", () => {
+            glossarySection.classList.toggle("hidden");
+            syncGlossaryMobileState();
         });
 
         form.addEventListener("submit", (event) => {
@@ -589,6 +660,7 @@
 
         renderSelfNames();
         renderGlossary();
+        syncGlossaryMobileState();
         pendingCards.forEach((card) => pollParseStatus(card));
     })();
 </script>

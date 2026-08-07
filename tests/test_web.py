@@ -109,7 +109,9 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert "保存" in html
     assert "存证" not in html
     assert "谁答应了谁什么" in html
-    assert "还没告诉系统你在对话里叫什么" in html
+    assert 'id="self-name-input"' in html
+    assert "新增词条" in html
+    assert "还没告诉系统你在对话里叫什么" not in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -816,6 +818,41 @@ def test_parse_pipeline_passes_context_from_settings_and_counterpart(tmp_path, m
     assert captured["context"]["self_names"] == ["热心市民小李"]
     assert captured["context"]["glossary"] == [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
     assert captured["context"]["counterpart"] == "冯云生(师父)"
+
+
+def test_parse_pipeline_passes_empty_self_names_without_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_extract(text, today, context=None):
+        captured["context"] = context
+        return {
+            "requester_name": None,
+            "owner_name": None,
+            "deliverable": None,
+            "due_raw": None,
+            "due_date": None,
+            "direction": "none",
+            "kind": "reference",
+            "plain_summary": "只是留档。",
+            "caveats": [],
+        }
+
+    with client:
+        with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+            response = client.post(
+                "/api/evidence",
+                json={
+                    "text": "先留个底。",
+                    "source": "飞书",
+                    "source_detail": "项目复盘群",
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["context"]["self_names"] == []
+    assert captured["context"]["glossary"] == []
 
 
 def test_settings_save_and_read_self_names(tmp_path, monkeypatch):

@@ -166,6 +166,16 @@ def extract_slots(text: str, today: str, context: dict[str, Any] | None = None) 
     if not api_key:
         return None
 
+    self_names = context.get("self_names") if isinstance(context, dict) else []
+    glossary = context.get("glossary") if isinstance(context, dict) else []
+    counterpart = context.get("counterpart") if isinstance(context, dict) else None
+    self_name_count = len(self_names) if isinstance(self_names, list) else 0
+    glossary_count = len(glossary) if isinstance(glossary, list) else 0
+    print(
+        f"[llm] context: self_names={self_name_count}, "
+        f"glossary={glossary_count}, counterpart={bool(counterpart)}"
+    )
+
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     context_block = build_context_block(context)
     if context_block:
