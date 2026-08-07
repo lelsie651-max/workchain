@@ -4,8 +4,10 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+import httpx
 
 from app.main import create_app
 from evidence_core.db import init_db
@@ -35,6 +37,54 @@ def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "evidence_count": 18}
+
+
+def test_diag_llm_without_api_key_returns_configured_false(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/api/diag/llm")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "configured": False,
+        "reachable": None,
+        "detail": "DEEPSEEK_API_KEY not set",
+    }
+
+
+def test_diag_llm_with_connection_error_returns_reachable_false(tmp_path, monkeypatch):
+    fake_key = "sk-test-visible-key"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", fake_key)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.httpx.post", side_effect=httpx.ConnectError(f"boom {fake_key}")):
+        with client:
+            response = client.get("/api/diag/llm")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["configured"] is True
+    assert payload["reachable"] is False
+    assert payload["status_code"] is None
+    assert payload["detail"]
+    assert fake_key not in response.text
+    assert fake_key not in payload["detail"]
+
+
+def test_diag_llm_response_never_contains_api_key(tmp_path, monkeypatch):
+    fake_key = "sk-very-obvious-secret"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", fake_key)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    mock_response = Mock(status_code=401)
+
+    with patch("app.main.httpx.post", return_value=mock_response):
+        with client:
+            response = client.get("/api/diag/llm")
+
+    assert response.status_code == 200
+    assert fake_key not in response.text
 
 
 def test_index_contains_three_thread_titles(tmp_path, monkeypatch):

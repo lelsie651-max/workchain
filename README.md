@@ -19,3 +19,7 @@ workchain/
 pip install -r requirements.txt
 python -m app.main
 ```
+
+## 环境变量
+
+- `DEEPSEEK_API_KEY=`: 仅用于 `/api/diag/llm` 连通性自检，帮助确认部署环境能否访问 DeepSeek API。绝不要提交真实 key。

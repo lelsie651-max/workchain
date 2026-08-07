@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -76,6 +77,13 @@ def _start_of_current_day_ms() -> int:
     now = datetime.now(timezone.utc)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(day_start.timestamp() * 1000)
+
+
+def _safe_diag_detail(message: str, api_key: str) -> str:
+    detail = message.strip() or "unknown error"
+    if api_key:
+        detail = detail.replace(api_key, "[redacted]")
+    return detail
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -279,6 +287,62 @@ def create_app() -> FastAPI:
     def healthz(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
         evidence_count = conn.execute("SELECT COUNT(*) AS count FROM evidence").fetchone()["count"]
         return {"status": "ok", "evidence_count": evidence_count}
+
+    @app.get("/api/diag/llm")
+    def diag_llm() -> dict[str, Any]:
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not api_key:
+            return {
+                "configured": False,
+                "reachable": None,
+                "detail": "DEEPSEEK_API_KEY not set",
+            }
+
+        url = "https://api.deepseek.com/chat/completions"
+        start = time.perf_counter()
+        try:
+            response = httpx.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "deepseek-chat",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                },
+                timeout=10.0,
+            )
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            reachable = response.status_code == 200
+            if reachable:
+                detail = "DeepSeek API reachable; this probe consumed a very small number of tokens"
+            else:
+                detail = (
+                    f"HTTP {response.status_code} from DeepSeek API; "
+                    "this probe consumed a very small number of tokens"
+                )
+            return {
+                "configured": True,
+                "reachable": reachable,
+                "status_code": response.status_code,
+                "latency_ms": latency_ms,
+                "detail": _safe_diag_detail(detail, api_key),
+            }
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            detail = (
+                f"{type(exc).__name__}: {exc}; "
+                "this probe consumed a very small number of tokens"
+            )
+            return {
+                "configured": True,
+                "reachable": False,
+                "status_code": None,
+                "latency_ms": latency_ms,
+                "detail": _safe_diag_detail(detail, api_key),
+            }
 
     @app.get("/", response_class=HTMLResponse)
     def index(
