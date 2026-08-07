@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -114,3 +115,39 @@ def test_startup_auto_generates_demo_data_when_directory_missing(tmp_path, monke
         conn.close()
 
     assert count == 18
+
+
+def test_concurrent_requests_all_return_200(tmp_path, monkeypatch):
+    client, _ = _make_client(tmp_path, monkeypatch)
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            for _ in range(5):
+                index_response = client.get("/")
+                thread_response = client.get("/thread/thr_channel")
+                assert index_response.status_code == 200
+                assert thread_response.status_code == 200
+        except Exception as exc:  # pragma: no cover - only used on failure
+            with lock:
+                errors.append(str(exc))
+
+    with client:
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert errors == []
+
+
+def test_healthz_is_stable_across_20_requests(tmp_path, monkeypatch):
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        for _ in range(20):
+            response = client.get("/healthz")
+            assert response.status_code == 200
+            assert response.json() == {"status": "ok", "evidence_count": 18}

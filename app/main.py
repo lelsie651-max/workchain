@@ -6,9 +6,9 @@ import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -42,6 +42,14 @@ def _open_readonly_connection(db_path: Path) -> sqlite3.Connection:
 
 def _get_demo_dir() -> Path:
     return Path(os.getenv("WORKCHAIN_DEMO_DIR", "demo_data"))
+
+
+def get_conn(request: Request) -> Generator[sqlite3.Connection, None, None]:
+    conn = _open_readonly_connection(request.app.state.db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -164,25 +172,20 @@ def create_app() -> FastAPI:
         if not demo_dir.exists() or not db_path.exists():
             seed_demo_data(demo_dir)
 
-        conn = _open_readonly_connection(db_path)
         app.state.demo_dir = demo_dir
-        app.state.db = conn
-        try:
-            yield
-        finally:
-            conn.close()
+        app.state.db_path = db_path
+        yield
 
     app = FastAPI(title="WorkChain", lifespan=lifespan)
 
     @app.get("/healthz")
-    def healthz(request: Request) -> dict[str, Any]:
-        conn = request.app.state.db
+    def healthz(conn: sqlite3.Connection = Depends(get_conn)) -> dict[str, Any]:
         evidence_count = conn.execute("SELECT COUNT(*) AS count FROM evidence").fetchone()["count"]
         return {"status": "ok", "evidence_count": evidence_count}
 
     @app.get("/", response_class=HTMLResponse)
-    def index(request: Request) -> HTMLResponse:
-        context = _fetch_index_data(request.app.state.db)
+    def index(request: Request, conn: sqlite3.Connection = Depends(get_conn)) -> HTMLResponse:
+        context = _fetch_index_data(conn)
         return TEMPLATES.TemplateResponse(
             request,
             "index.html",
@@ -194,8 +197,12 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/thread/{thread_id}", response_class=HTMLResponse)
-    def thread_detail(request: Request, thread_id: str) -> HTMLResponse:
-        context = _fetch_thread_detail(request.app.state.db, thread_id)
+    def thread_detail(
+        request: Request,
+        thread_id: str,
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        context = _fetch_thread_detail(conn, thread_id)
         if context is None:
             raise HTTPException(status_code=404, detail="thread not found")
         return TEMPLATES.TemplateResponse(
