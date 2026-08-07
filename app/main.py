@@ -31,7 +31,7 @@ from app.sandbox import (
     save_self_names,
 )
 from evidence_core.db import init_db
-from evidence_core.store import append_evidence, update_slots
+from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
 
 
@@ -141,6 +141,10 @@ def _parse_detail_key(evidence_id: str) -> str:
     return f"parse_detail:{evidence_id}"
 
 
+def _verified_key(evidence_id: str) -> str:
+    return f"verified:{evidence_id}"
+
+
 def _parse_count_key(today: str) -> str:
     return f"parse_count:{today}"
 
@@ -165,6 +169,31 @@ def _get_parse_status(conn: sqlite3.Connection, evidence_id: str) -> str:
 
 def _get_parse_detail(conn: sqlite3.Connection, evidence_id: str) -> str | None:
     return _get_meta_value(conn, _parse_detail_key(evidence_id))
+
+
+def _set_verified(conn: sqlite3.Connection, evidence_id: str) -> None:
+    _set_meta_value(conn, _verified_key(evidence_id), "1")
+    conn.commit()
+
+
+def _is_verified(conn: sqlite3.Connection, evidence_id: str) -> bool:
+    return _get_meta_value(conn, _verified_key(evidence_id)) == "1"
+
+
+def _get_verified_map(conn: sqlite3.Connection, evidence_ids: Iterable[str]) -> dict[str, bool]:
+    ids = [evidence_id for evidence_id in evidence_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    keys = [_verified_key(evidence_id) for evidence_id in ids]
+    rows = conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    result = {row["key"].split(":", 1)[1]: row["value"] == "1" for row in rows}
+    for evidence_id in ids:
+        result.setdefault(evidence_id, False)
+    return result
 
 
 def _get_parse_status_map(conn: sqlite3.Connection, evidence_ids: Iterable[str]) -> dict[str, str]:
@@ -393,6 +422,7 @@ def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
         "deliverable": row["slot_deliverable"],
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
         "caveats": _decode_json_array(row["caveats"]),
+        "is_verified": bool(row["is_verified"]),
     }
 
 
@@ -467,11 +497,13 @@ def _fetch_index_data(conn: sqlite3.Connection) -> dict[str, Any]:
     ).fetchall()
     parse_status_map = _get_parse_status_map(conn, [row["evidence_id"] for row in recent_rows])
     parse_detail_map = _get_parse_detail_map(conn, [row["evidence_id"] for row in recent_rows])
+    verified_map = _get_verified_map(conn, [row["evidence_id"] for row in recent_rows])
     decorated_recent_rows = []
     for row in recent_rows:
         row_dict = dict(row)
         row_dict["parse_status"] = parse_status_map.get(row["evidence_id"], "failed")
         row_dict["parse_detail"] = parse_detail_map.get(row["evidence_id"])
+        row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
         decorated_recent_rows.append(row_dict)
     return {
         "threads": [_prepare_thread_card(row) for row in thread_rows],
@@ -536,7 +568,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         SELECT
             evidence_id, seq, occurred_at, captured_at, source_hint, raw_text,
             plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats,
-            content_hash, slots_filled
+            content_hash, slots_filled, kind, slot_direction
         FROM evidence
         WHERE evidence_id = ?
         """,
@@ -557,10 +589,13 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "raw_text": row["raw_text"] or "",
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
+        "due_date_value": _format_datetime(row["slot_due"], "%Y-%m-%d"),
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
         "caveats": _decode_json_array(row["caveats"]),
         "content_hash_prefix": (row["content_hash"] or "")[:12],
         "slots_filled": row["slots_filled"],
+        "kind": row["kind"],
+        "slot_direction": row["slot_direction"] or "none",
     }
 
 
@@ -686,7 +721,82 @@ def create_app() -> FastAPI:
                 "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
                 "caveats": _decode_json_array(row["caveats"]),
                 "detail": _get_parse_detail(conn, evidence_id),
+                "is_verified": _is_verified(conn, evidence_id),
             }
+        finally:
+            conn.close()
+
+    @app.patch("/api/evidence/{evidence_id}/slots")
+    async def patch_evidence_slots(
+        evidence_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        allowed_fields = {
+            "slot_deliverable",
+            "slot_due_raw",
+            "slot_due_date",
+            "slot_direction",
+            "kind",
+            "plain_summary",
+            "caveats",
+        }
+        unknown_fields = set(payload) - allowed_fields
+        if unknown_fields:
+            raise HTTPException(status_code=400, detail="包含不允许修改的字段")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT evidence_id, raw_text, source_hint, seq, content_hash, chain_hash,
+                       prev_hash, occurred_at, captured_at, media_type
+                FROM evidence
+                WHERE evidence_id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if evidence_id.startswith("ev_demo_"):
+                raise HTTPException(status_code=403, detail="演示记录不可修改")
+
+            slot_due_value = payload.get("slot_due_date")
+            slot_due = None
+            if slot_due_value:
+                slot_due = llm.due_date_to_millis(str(slot_due_value))
+
+            caveats = payload.get("caveats", [])
+            if not isinstance(caveats, list):
+                caveats = []
+            caveats = [str(item).strip() for item in caveats if str(item).strip()]
+
+            slot_direction = payload.get("slot_direction")
+            if slot_direction not in {"i_owe", "owed_to_me", "none"}:
+                slot_direction = "none"
+
+            kind = payload.get("kind")
+            if kind not in {"request", "confirm", "change", "deliver", "dispute", "reference"}:
+                kind = "reference"
+
+            updated = update_slots(
+                conn,
+                evidence_id,
+                slot_deliverable=str(payload.get("slot_deliverable", "")).strip() or None,
+                slot_due=slot_due,
+                slot_due_raw=str(payload.get("slot_due_raw", "")).strip() or None,
+                slot_direction=slot_direction,
+                plain_summary=str(payload.get("plain_summary", "")).strip() or None,
+                caveats=caveats,
+            )
+            conn.execute("UPDATE evidence SET kind = ? WHERE evidence_id = ?", (kind, evidence_id))
+            _set_verified(conn, evidence_id)
+            updated = conn.execute("SELECT * FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+            conn.commit()
+            response = JSONResponse(dict(updated))
+            apply_sandbox_cookie(response, sandbox)
+            return response
         finally:
             conn.close()
 
@@ -760,6 +870,7 @@ def create_app() -> FastAPI:
         try:
             parse_status = _get_parse_status(status_conn, evidence_id)
             parse_detail = _get_parse_detail(status_conn, evidence_id)
+            is_verified = _is_verified(status_conn, evidence_id)
         finally:
             status_conn.close()
 
@@ -771,6 +882,7 @@ def create_app() -> FastAPI:
                 "evidence": context,
                 "parse_status": parse_status,
                 "parse_detail": parse_detail,
+                "is_verified": is_verified,
             },
         )
         apply_sandbox_cookie(response, sandbox)

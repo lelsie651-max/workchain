@@ -309,6 +309,7 @@ def test_evidence_detail_returns_full_text_for_current_sandbox(tmp_path, monkeyp
     assert response.status_code == 200
     assert full_text in response.text
     assert evidence_id in response.text
+    assert "不会影响完整性校验" in response.text
 
 
 def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
@@ -329,6 +330,175 @@ def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
         response = client_b.get(f"/evidence/{evidence_id}")
 
     assert response.status_code == 404
+
+
+def test_patch_slots_updates_fields_and_recomputes_slots_filled(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "先存一条待修正记录。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        patch_response = client.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={
+                "slot_deliverable": "渠道复盘数据",
+                "slot_due_raw": "下周五",
+                "slot_due_date": "2026-08-08",
+                "slot_direction": "i_owe",
+                "kind": "request",
+                "plain_summary": "张总要你补渠道复盘。",
+                "caveats": ["日期可能有变动"],
+            },
+        )
+
+    assert patch_response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT slot_deliverable, slot_due_raw, slot_due, slot_direction,
+                   kind, plain_summary, caveats, slots_filled
+            FROM evidence WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert row["slot_deliverable"] == "渠道复盘数据"
+        assert row["slot_due_raw"] == "下周五"
+        assert row["slot_due"] is not None
+        assert row["slot_direction"] == "i_owe"
+        assert row["kind"] == "request"
+        assert row["plain_summary"] == "张总要你补渠道复盘。"
+        assert row["slots_filled"] == 2
+    finally:
+        conn.close()
+
+
+def test_patch_slots_keeps_verify_chain_valid(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "这条记录稍后会被手动修正。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        patch_response = client.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={
+                "slot_deliverable": "复盘",
+                "slot_due_raw": "周五",
+                "slot_due_date": "2026-08-08",
+                "slot_direction": "i_owe",
+                "kind": "request",
+                "plain_summary": "这是一条人工确认后的说明。",
+                "caveats": ["先保留一个提醒"],
+            },
+        )
+
+    assert patch_response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_patch_rejects_protected_fields(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "尝试改保护字段。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        response = client.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={"raw_text": "改原文", "content_hash": "x", "chain_hash": "y", "seq": 999},
+        )
+
+    assert response.status_code == 400
+
+
+def test_patch_returns_404_for_other_sandbox(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        create_response = client_a.post(
+            "/api/evidence",
+            json={"text": "只有 A 可改。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        response = client_b.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={"slot_deliverable": "不该成功"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_patch_demo_record_returns_403(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.patch(
+            "/api/evidence/ev_demo_01/slots",
+            json={"slot_deliverable": "不该成功"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "演示记录不可修改"
+
+
+def test_patch_sets_verified_flag_and_pages_show_badge(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "这条会被我人工确认。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        patch_response = client.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={
+                "slot_deliverable": "复盘",
+                "slot_due_raw": "周五",
+                "slot_due_date": "2026-08-08",
+                "slot_direction": "i_owe",
+                "kind": "request",
+                "plain_summary": "我已经核对过这条。",
+                "caveats": [],
+            },
+        )
+        detail_response = client.get(f"/evidence/{evidence_id}")
+        index_response = client.get("/")
+
+    assert patch_response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (f"verified:{evidence_id}",),
+        ).fetchone()
+        assert row["value"] == "1"
+    finally:
+        conn.close()
+
+    assert "已确认" in detail_response.text
+    assert "已确认" in index_response.text
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):
