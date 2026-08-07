@@ -361,13 +361,16 @@ def _prepare_reference_row(row: sqlite3.Row) -> dict[str, Any]:
 
 def _prepare_recent_row(row: sqlite3.Row) -> dict[str, Any]:
     platform, scene = source_label(row["source_hint"])
+    raw_text = row["raw_text"] or ""
     return {
         "evidence_id": row["evidence_id"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
         "platform": platform,
         "platform_class": source_badge_class(platform),
         "scene": scene,
-        "raw_text_preview": _truncate_text(row["raw_text"] or ""),
+        "raw_text": raw_text,
+        "raw_text_preview": _truncate_text(raw_text),
+        "is_long_text": len(raw_text) > 100,
         "parse_status": row["parse_status"],
         "parse_detail": row["parse_detail"],
         "plain_summary": row["plain_summary"],
@@ -499,6 +502,40 @@ def _fetch_thread_detail(conn: sqlite3.Connection, thread_id: str) -> dict[str, 
             ),
         },
         "entries": [_prepare_timeline_row(row) for row in evidence_rows],
+    }
+
+
+def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT
+            evidence_id, seq, occurred_at, captured_at, source_hint, raw_text,
+            plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats,
+            content_hash, slots_filled
+        FROM evidence
+        WHERE evidence_id = ?
+        """,
+        (evidence_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    platform, scene = source_label(row["source_hint"])
+    return {
+        "evidence_id": row["evidence_id"],
+        "seq": row["seq"],
+        "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
+        "captured_at_text": _format_datetime(row["captured_at"], "%m-%d %H:%M"),
+        "platform": platform,
+        "platform_class": source_badge_class(platform),
+        "scene": scene,
+        "raw_text": row["raw_text"] or "",
+        "plain_summary": row["plain_summary"],
+        "deliverable": row["slot_deliverable"],
+        "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
+        "caveats": _decode_json_array(row["caveats"]),
+        "content_hash_prefix": (row["content_hash"] or "")[:12],
+        "slots_filled": row["slots_filled"],
     }
 
 
@@ -644,6 +681,36 @@ def create_app() -> FastAPI:
                 "references": context["references"],
                 "recent_records": context["recent_records"],
                 "source_presets": SOURCE_PRESETS,
+            },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.get("/evidence/{evidence_id}", response_class=HTMLResponse)
+    def evidence_detail(
+        request: Request,
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        context = _fetch_evidence_detail(conn, evidence_id)
+        if context is None:
+            raise HTTPException(status_code=404, detail="evidence not found")
+        status_conn = init_db(sandbox.db_path)
+        try:
+            parse_status = _get_parse_status(status_conn, evidence_id)
+            parse_detail = _get_parse_detail(status_conn, evidence_id)
+        finally:
+            status_conn.close()
+
+        response = TEMPLATES.TemplateResponse(
+            request,
+            "evidence.html",
+            {
+                "page_title": "记录详情",
+                "evidence": context,
+                "parse_status": parse_status,
+                "parse_detail": parse_detail,
             },
         )
         apply_sandbox_cookie(response, sandbox)

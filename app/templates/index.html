@@ -2,7 +2,14 @@
 
 {% block content %}
 <section class="mb-8 sm:mb-10">
+    <div
+        id="flash-banner"
+        class="mb-4 hidden rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500"
+        role="status"
+        aria-live="polite"
+    ></div>
     <form id="evidence-form" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
+        <p class="mb-3 text-sm text-slate-400">把聊天记录粘进来,系统会读懂谁答应了谁什么、什么时候要</p>
         <label for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
         <textarea
             id="evidence-text"
@@ -51,10 +58,11 @@
 
         <div class="mt-4 flex flex-wrap items-center gap-3">
             <button
+                id="submit-button"
                 type="submit"
                 class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
             >
-                存证
+                保存
             </button>
             <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
         </div>
@@ -119,10 +127,36 @@
                 <span>{{ item.scene }}</span>
                 {% endif %}
             </div>
-            <p class="text-sm leading-6 text-slate-200">{{ item.raw_text_preview }}</p>
+            <div class="text-sm leading-6 text-slate-200">
+                <p
+                    data-raw-preview
+                    class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
+                >{{ item.raw_text_preview }}</p>
+                <div
+                    data-raw-full
+                    class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
+                >{{ item.raw_text }}</div>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-3">
+                {% if item.is_long_text %}
+                <button
+                    type="button"
+                    data-toggle-fulltext
+                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                >
+                    展开全文
+                </button>
+                {% endif %}
+                <a
+                    href="/evidence/{{ item.evidence_id }}"
+                    class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                >
+                    详情
+                </a>
+            </div>
             <div class="mt-3 text-sm text-slate-300" data-parse-body>
                 {% if item.parse_status == "pending" %}
-                <p class="text-cyan-200">解析中…</p>
+                <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>解析中…</p>
                 {% elif item.parse_status == "done" %}
                 {% if item.plain_summary %}
                 <p class="text-slate-200">{{ item.plain_summary }}</p>
@@ -182,7 +216,10 @@
         const sourceCustom = document.getElementById("source-custom");
         const sourceDetail = document.getElementById("source-detail");
         const message = document.getElementById("form-message");
+        const flashBanner = document.getElementById("flash-banner");
+        const submitButton = document.getElementById("submit-button");
         const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status='pending']")];
+        const toggleButtons = [...document.querySelectorAll("[data-toggle-fulltext]")];
 
         const syncCustomSource = () => {
             const isCustom = sourceSelect.value === "__custom__";
@@ -192,8 +229,36 @@
             }
         };
 
+        const showBanner = (text, tone) => {
+            if (!flashBanner) {
+                return;
+            }
+            flashBanner.textContent = text;
+            flashBanner.className = "mb-4 rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500";
+            if (tone === "success") {
+                flashBanner.classList.add("border-emerald-400/30", "bg-emerald-400/10", "text-emerald-100");
+            } else {
+                flashBanner.classList.add("border-red-400/30", "bg-red-400/10", "text-red-100");
+            }
+            flashBanner.classList.remove("hidden", "opacity-0");
+            if (tone === "success") {
+                window.setTimeout(() => {
+                    flashBanner.classList.add("opacity-0");
+                    window.setTimeout(() => flashBanner.classList.add("hidden"), 500);
+                }, 3000);
+            }
+        };
+
+        const setSubmitting = (submitting) => {
+            submitButton.disabled = submitting;
+            submitButton.textContent = submitting ? "保存中…" : "保存";
+            submitButton.classList.toggle("opacity-60", submitting);
+            submitButton.classList.toggle("cursor-not-allowed", submitting);
+        };
+
         const submitForm = async () => {
-            message.textContent = "正在存证...";
+            message.textContent = "";
+            setSubmitting(true);
             const selectedSource = sourceSelect.value === "__custom__" ? sourceCustom.value.trim() : sourceSelect.value;
             const payload = {
                 text: textarea.value,
@@ -201,19 +266,33 @@
                 source_detail: sourceDetail.value.trim() || null,
             };
 
-            const response = await fetch("/api/evidence", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                },
-                body: JSON.stringify(payload),
-            });
-            const data = await response.json();
-            if (!response.ok) {
-                message.textContent = data.detail || "存证失败,请稍后再试";
-                return;
+            try {
+                const response = await fetch("/api/evidence", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                    },
+                    body: JSON.stringify(payload),
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    const errorText = response.status === 429
+                        ? "今天存得有点多啦,明天再来"
+                        : (data.detail || "保存失败,请稍后再试");
+                    showBanner(errorText, "error");
+                    message.textContent = errorText;
+                    return;
+                }
+                textarea.value = "";
+                sessionStorage.setItem("workchainFlash", JSON.stringify({ tone: "success", text: "已保存,正在解析…" }));
+                window.location.reload();
+            } catch (error) {
+                const errorText = "网络异常,请稍后再试";
+                showBanner(errorText, "error");
+                message.textContent = errorText;
+            } finally {
+                setSubmitting(false);
             }
-            window.location.reload();
         };
 
         const renderParseBody = (card, payload) => {
@@ -266,6 +345,24 @@
         sourceSelect.addEventListener("change", syncCustomSource);
         syncCustomSource();
 
+        toggleButtons.forEach((button) => {
+            button.addEventListener("click", () => {
+                const card = button.closest("[data-evidence-id]");
+                if (!card) {
+                    return;
+                }
+                const preview = card.querySelector("[data-raw-preview]");
+                const full = card.querySelector("[data-raw-full]");
+                if (!preview || !full) {
+                    return;
+                }
+                const isExpanded = !full.classList.contains("hidden");
+                preview.classList.toggle("hidden", !isExpanded);
+                full.classList.toggle("hidden", isExpanded);
+                button.textContent = isExpanded ? "展开全文" : "收起";
+            });
+        });
+
         form.addEventListener("submit", (event) => {
             event.preventDefault();
             submitForm();
@@ -277,6 +374,17 @@
                 form.requestSubmit();
             }
         });
+
+        const storedFlash = sessionStorage.getItem("workchainFlash");
+        if (storedFlash) {
+            sessionStorage.removeItem("workchainFlash");
+            try {
+                const flash = JSON.parse(storedFlash);
+                showBanner(flash.text, flash.tone);
+            } catch (error) {
+                // Ignore malformed flash payloads.
+            }
+        }
 
         pendingCards.forEach((card) => pollParseStatus(card));
     })();

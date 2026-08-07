@@ -106,7 +106,9 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert "需求改了 3 次,你一次都没等到确认" in html
     assert "飞书" in html
     assert "企业微信" in html
-    assert "存证" in html
+    assert "保存" in html
+    assert "存证" not in html
+    assert "谁答应了谁什么" in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -274,6 +276,58 @@ def test_index_shows_recent_user_records_after_post(tmp_path, monkeypatch):
     assert "我刚存的" in response.text
     assert "这些记录只属于你" in response.text
     assert "李娜刚补了一句" in response.text
+
+
+def test_index_contains_full_long_text_in_html(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    long_text = "这是一条很长的原文。\\n" + ("后续细节" * 30)
+
+    with client:
+        client.post(
+            "/api/evidence",
+            json={"text": long_text, "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert long_text in response.text
+
+
+def test_evidence_detail_returns_full_text_for_current_sandbox(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    full_text = "第一行\\n第二行\\n第三行，完整查看。"
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": full_text, "source": "企业微信", "source_detail": "私聊-李娜"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        response = client.get(f"/evidence/{evidence_id}")
+
+    assert response.status_code == 200
+    assert full_text in response.text
+    assert evidence_id in response.text
+
+
+def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        create_response = client_a.post(
+            "/api/evidence",
+            json={"text": "只有 A 能看到这条。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        response = client_b.get(f"/evidence/{evidence_id}")
+
+    assert response.status_code == 404
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):
