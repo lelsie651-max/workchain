@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -167,10 +168,22 @@ def _fetch_thread_detail(conn: sqlite3.Connection, thread_id: str) -> dict[str, 
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        print(f"starting workchain, port={os.environ.get('PORT')}, cwd={os.getcwd()}")
         demo_dir = _get_demo_dir()
         db_path = demo_dir / "workchain.db"
-        if not demo_dir.exists() or not db_path.exists():
-            seed_demo_data(demo_dir)
+        try:
+            if not demo_dir.exists() or not db_path.exists():
+                seed_demo_data(demo_dir)
+
+            conn = _open_readonly_connection(db_path)
+            try:
+                evidence_count = conn.execute("SELECT COUNT(*) AS count FROM evidence").fetchone()["count"]
+            finally:
+                conn.close()
+            print(f"demo data ready: {evidence_count} records")
+        except Exception:
+            traceback.print_exc()
+            raise
 
         app.state.demo_dir = demo_dir
         app.state.db_path = db_path
