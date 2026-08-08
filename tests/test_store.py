@@ -382,7 +382,7 @@ def test_verify_chain_still_passes_after_100_writes_with_auto_checkpoint(db_file
     assert verify_chain(conn) == (True, None, None)
 
 
-def test_semantic_v2_tables_do_not_affect_verify_chain(db_file, blobs_root):
+def test_semantic_v3_tables_do_not_affect_verify_chain(db_file, blobs_root):
     conn = init_db(db_file)
     _insert_actor(conn, "act-1")
     _insert_actor(conn, "act-2")
@@ -414,8 +414,9 @@ def test_semantic_v2_tables_do_not_affect_verify_chain(db_file, blobs_root):
         """
         INSERT INTO facts (
             fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
-            confidence, event_assignment, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            confidence, event_assignment, event_assignment_confidence,
+            due_anchor_at, origin, review_status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "fact-1",
@@ -427,6 +428,10 @@ def test_semantic_v2_tables_do_not_affect_verify_chain(db_file, blobs_root):
             "下周五",
             0.92,
             "confirmed",
+            0.74,
+            1723000000,
+            "ai",
+            "unreviewed",
             1723000200,
             1723000200,
         ),
@@ -454,6 +459,14 @@ def test_semantic_v2_tables_do_not_affect_verify_chain(db_file, blobs_root):
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         ("itp-1", "fact-1", None, "explanation", "这里是在明确交付物范围", 0.88, 1723000300),
+    )
+    conn.execute(
+        """
+        UPDATE facts
+        SET due_anchor_at = ?, event_assignment_confidence = ?, origin = ?, review_status = ?
+        WHERE fact_id = ?
+        """,
+        (1723086400, 0.81, "user", "corrected", "fact-1"),
     )
     conn.commit()
 

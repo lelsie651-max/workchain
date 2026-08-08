@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -230,6 +230,47 @@ def _create_v2_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _column_exists(conn: sqlite3.Connection, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row["name"] == column_name for row in rows)
+
+
+def _create_v3_schema(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "facts", "due_anchor_at"):
+        conn.execute("ALTER TABLE facts ADD COLUMN due_anchor_at INTEGER")
+    if not _column_exists(conn, "facts", "event_assignment_confidence"):
+        conn.execute(
+            """
+            ALTER TABLE facts
+            ADD COLUMN event_assignment_confidence REAL CHECK (
+                event_assignment_confidence IS NULL
+                OR (
+                    event_assignment_confidence >= 0
+                    AND event_assignment_confidence <= 1
+                )
+            )
+            """
+        )
+    if not _column_exists(conn, "facts", "origin"):
+        conn.execute(
+            """
+            ALTER TABLE facts
+            ADD COLUMN origin TEXT NOT NULL DEFAULT 'ai' CHECK (
+                origin IN ('ai', 'user')
+            )
+            """
+        )
+    if not _column_exists(conn, "facts", "review_status"):
+        conn.execute(
+            """
+            ALTER TABLE facts
+            ADD COLUMN review_status TEXT NOT NULL DEFAULT 'unreviewed' CHECK (
+                review_status IN ('unreviewed', 'confirmed', 'corrected')
+            )
+            """
+        )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -255,26 +296,61 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 2)
 
 
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    _create_v3_schema(conn)
+    _set_schema_version(conn, 3)
+
+
+def _is_fresh_database(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        """
+        SELECT name FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'meta'
+        """
+    ).fetchall()
+    return len(rows) == 0
+
+
 def init_db(path: str | Path) -> sqlite3.Connection:
     conn = _connect(path)
     _ensure_meta_table(conn)
     schema_version = _read_schema_version(conn)
 
     if schema_version is None:
+        if not _is_fresh_database(conn):
+            conn.close()
+            raise ValueError("database schema_version is missing or unsupported")
         _create_v1_schema(conn)
         _create_v2_schema(conn)
+        _create_v3_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
         raise ValueError(
             f"database schema_version {schema_version} is newer than supported version {SCHEMA_VERSION}"
         )
+    elif schema_version < 1:
+        conn.close()
+        raise ValueError(
+            f"database schema_version {schema_version} is unsupported; supported versions are 1..{SCHEMA_VERSION}"
+        )
     elif schema_version == 1:
         _create_v1_schema(conn)
         _migrate_v1_to_v2(conn)
-    else:
+        _migrate_v2_to_v3(conn)
+    elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
+        _migrate_v2_to_v3(conn)
+    elif schema_version == 3:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+    else:
+        conn.close()
+        raise ValueError(
+            f"database schema_version {schema_version} is unsupported; supported versions are 1..{SCHEMA_VERSION}"
+        )
 
     conn.commit()
     return conn

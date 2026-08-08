@@ -106,6 +106,18 @@ def _make_v1_db(path):
         conn.close()
 
 
+def _make_v2_db(path):
+    conn = db_module._connect(path)
+    try:
+        db_module._ensure_meta_table(conn)
+        db_module._create_v1_schema(conn)
+        db_module._create_v2_schema(conn)
+        db_module._set_schema_version(conn, 2)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def db_file(tmp_path):
     return tmp_path / "workchain.db"
@@ -140,7 +152,15 @@ def test_init_db_creates_all_tables(db_file):
         "submissions",
         "threads",
     ]
-    assert get_schema_version(conn) == 2
+    columns = conn.execute("PRAGMA table_info(facts)").fetchall()
+
+    assert get_schema_version(conn) == 3
+    assert {column["name"] for column in columns} >= {
+        "due_anchor_at",
+        "event_assignment_confidence",
+        "origin",
+        "review_status",
+    }
 
 
 def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
@@ -149,16 +169,21 @@ def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
 
     conn2 = init_db(db_file)
 
-    assert get_schema_version(conn2) == 2
+    assert get_schema_version(conn2) == 3
 
 
-def test_v1_database_is_migrated_to_v2_without_losing_existing_rows(db_file):
+def test_v1_database_is_migrated_to_v3_without_losing_existing_rows(db_file):
     _make_v1_db(db_file)
-    conn = init_db(db_file)
+    reopened = None
     try:
+        conn = db_module._connect(db_file)
         _insert_actor(conn, "act-1", 0)
         _insert_thread(conn, thread_id="thr-1")
         _insert_evidence(conn, evidence_id="ev-1", seq=1, thread_id="thr-1")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("custom:v1-note", "kept"),
+        )
         conn.commit()
         conn.close()
 
@@ -166,27 +191,33 @@ def test_v1_database_is_migrated_to_v2_without_losing_existing_rows(db_file):
         actor = reopened.execute("SELECT actor_id FROM actors WHERE actor_id = 'act-1'").fetchone()
         thread = reopened.execute("SELECT thread_id FROM threads WHERE thread_id = 'thr-1'").fetchone()
         evidence = reopened.execute("SELECT evidence_id FROM evidence WHERE evidence_id = 'ev-1'").fetchone()
+        meta_row = reopened.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("custom:v1-note",),
+        ).fetchone()
         facts_table = reopened.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'facts'"
         ).fetchone()
 
-        assert get_schema_version(reopened) == 2
+        assert get_schema_version(reopened) == 3
         assert actor["actor_id"] == "act-1"
         assert thread["thread_id"] == "thr-1"
         assert evidence["evidence_id"] == "ev-1"
+        assert meta_row["value"] == "kept"
         assert facts_table["name"] == "facts"
     finally:
-        reopened.close()
+        if reopened is not None:
+            reopened.close()
 
 
-def test_v1_to_v2_migration_is_idempotent(db_file):
+def test_v1_to_v3_migration_is_idempotent(db_file):
     _make_v1_db(db_file)
 
     first = init_db(db_file)
     first.close()
     second = init_db(db_file)
     try:
-        assert get_schema_version(second) == 2
+        assert get_schema_version(second) == 3
         tables = second.execute(
             """
             SELECT name FROM sqlite_master
@@ -209,6 +240,19 @@ def test_init_db_rejects_future_schema_version(db_file):
         conn.close()
 
     with pytest.raises(ValueError, match="newer than supported version"):
+        init_db(db_file)
+
+
+def test_init_db_rejects_unsupported_low_schema_version(db_file):
+    conn = db_module._connect(db_file)
+    try:
+        db_module._ensure_meta_table(conn)
+        db_module._set_schema_version(conn, 0)
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ValueError, match="unsupported"):
         init_db(db_file)
 
 
@@ -272,7 +316,7 @@ def test_foreign_keys_are_enabled_and_missing_thread_is_rejected(db_file):
 def test_init_db_supports_memory_database():
     conn = init_db(":memory:")
 
-    assert get_schema_version(conn) == 2
+    assert get_schema_version(conn) == 3
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'actors'").fetchone() is not None
 
 
@@ -546,3 +590,181 @@ def test_interpretations_require_parent_and_validate_constraints(db_file):
             """,
             ("itp-bad-confidence", "fact-1", None, "uncertainty", "x", -0.1, 4),
         )
+
+
+def test_v2_database_with_existing_events_and_facts_migrates_to_v3_without_data_loss(db_file):
+    _make_v2_db(db_file)
+
+    conn = db_module._connect(db_file)
+    try:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("evt-1", "渠道复盘", "active", "既有事件", 1723000000, 1723000001),
+        )
+        conn.execute(
+            """
+            INSERT INTO facts (
+                fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
+                confidence, event_assignment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact-1",
+                "evt-1",
+                "deadline_change",
+                "原计划下周五交付",
+                1723000000,
+                1723600000,
+                "下周五",
+                0.61,
+                "suggested",
+                1723000002,
+                1723000003,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = init_db(db_file)
+    try:
+        row = reopened.execute(
+            """
+            SELECT
+                event_id, fact_type, content, due_at, due_raw, confidence,
+                event_assignment, due_anchor_at, event_assignment_confidence,
+                origin, review_status
+            FROM facts
+            WHERE fact_id = ?
+            """,
+            ("fact-1",),
+        ).fetchone()
+
+        assert get_schema_version(reopened) == 3
+        assert row["event_id"] == "evt-1"
+        assert row["fact_type"] == "deadline_change"
+        assert row["content"] == "原计划下周五交付"
+        assert row["due_at"] == 1723600000
+        assert row["due_raw"] == "下周五"
+        assert row["confidence"] == 0.61
+        assert row["event_assignment"] == "suggested"
+        assert row["due_anchor_at"] is None
+        assert row["event_assignment_confidence"] is None
+        assert row["origin"] == "ai"
+        assert row["review_status"] == "unreviewed"
+    finally:
+        reopened.close()
+
+
+def test_facts_v3_defaults_and_checks_are_enforced(db_file):
+    conn = init_db(db_file)
+
+    conn.execute(
+        """
+        INSERT INTO facts (
+            fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
+            confidence, event_assignment, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("fact-defaults", None, "statement", "先记一条", None, None, "下下周五", 0.4, "unassigned", 1, 1),
+    )
+
+    row = conn.execute(
+        """
+        SELECT due_anchor_at, event_assignment_confidence, origin, review_status
+        FROM facts WHERE fact_id = ?
+        """,
+        ("fact-defaults",),
+    ).fetchone()
+
+    assert row["due_anchor_at"] is None
+    assert row["event_assignment_confidence"] is None
+    assert row["origin"] == "ai"
+    assert row["review_status"] == "unreviewed"
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO facts (
+                fact_id, event_id, fact_type, content, confidence,
+                event_assignment_confidence, event_assignment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("fact-bad-assignment-confidence", None, "statement", "x", 0.5, 1.1, "unassigned", 1, 1),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO facts (
+                fact_id, event_id, fact_type, content, confidence,
+                origin, event_assignment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("fact-bad-origin", None, "statement", "x", 0.5, "human", "unassigned", 1, 1),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            """
+            INSERT INTO facts (
+                fact_id, event_id, fact_type, content, confidence,
+                review_status, event_assignment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("fact-bad-review", None, "statement", "x", 0.5, "approved", "unassigned", 1, 1),
+        )
+
+
+def test_fact_confidence_and_event_assignment_confidence_are_independent(db_file):
+    conn = init_db(db_file)
+    conn.execute(
+        """
+        INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("evt-1", "渠道复盘", "active", None, 1, 1),
+    )
+    conn.execute(
+        """
+        INSERT INTO facts (
+            fact_id, event_id, fact_type, content, confidence,
+            event_assignment, event_assignment_confidence, created_at, updated_at,
+            due_raw, due_anchor_at, origin, review_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fact-1",
+            "evt-1",
+            "request",
+            "请补一份渠道复盘数据",
+            0.27,
+            "confirmed",
+            0.91,
+            1,
+            2,
+            "下下周五",
+            1723000000,
+            "user",
+            "corrected",
+        ),
+    )
+    conn.commit()
+
+    row = conn.execute(
+        """
+        SELECT confidence, event_assignment_confidence, due_raw, due_anchor_at, origin, review_status
+        FROM facts WHERE fact_id = ?
+        """,
+        ("fact-1",),
+    ).fetchone()
+
+    assert row["confidence"] == 0.27
+    assert row["event_assignment_confidence"] == 0.91
+    assert row["due_raw"] == "下下周五"
+    assert row["due_anchor_at"] == 1723000000
+    assert row["origin"] == "user"
+    assert row["review_status"] == "corrected"

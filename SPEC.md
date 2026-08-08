@@ -128,7 +128,7 @@ V2 的目标底层关系为:
 - **Fact**: 从一份或多份 Evidence 中抽出的中立事实表达
 - **Event**: 多个 Fact 归并后形成的事件容器
 - **Derived State**: 从 Event 聚合出的当前状态、摘要、风险标签、视图投影
-- **Interpretation**: 独立解释层,可挂在 Fact 或 Evidence 上,但不进入哈希链
+- **Interpretation**: 独立解释层,可挂在 Fact 或 Evidence 上,但不进入哈希链,也不得反向改写 Fact
 
 > 当前 `threads / slot_* / slot_direction / plain_summary` 仍然保留并继续服务现有功能,但它们属于 **兼容层**，不再代表目标底层模型。
 
@@ -225,7 +225,7 @@ V2 的目标底层关系为:
 
 | key 模式 | value | 用途 |
 |---|---|---|
-| `schema_version` | `1` | schema 版本 |
+| `schema_version` | `1/2/3` | schema 版本 |
 | `parse_status:{evidence_id}` | `ocr_running / llm_running / done / failed / unsupported` | 解析状态机 |
 | `parse_detail:{evidence_id}` | TEXT | 解析失败或降级说明 |
 | `extract_note:{evidence_id}` | TEXT | 文档提取 / OCR 的具体失败原因 |
@@ -287,16 +287,23 @@ V2 的目标底层关系为:
 | fact_type | TEXT NOT NULL | request / commitment / confirmation / scope_change / responsibility_change / deadline_change / delivery / cancellation / denial / statement / reference |
 | content | TEXT NOT NULL | 中立事实内容 |
 | occurred_at | INTEGER | 发生时间 |
-| due_at | INTEGER | 时限 |
-| due_raw | TEXT | 时限原文 |
-| confidence | REAL NULL | 0..1 |
+| due_at | INTEGER | 解析后的时限;没有可靠锚点时允许为空 |
+| due_raw | TEXT | 时限原文,保留歧义,如"下下周五" |
+| due_anchor_at | INTEGER NULL | 相对日期换算所依据的可靠时间锚点 |
+| confidence | REAL NULL | Fact 内容抽取置信度,0..1 |
 | event_assignment | TEXT NOT NULL DEFAULT `unassigned` | unassigned / auto / suggested / confirmed |
+| event_assignment_confidence | REAL NULL | Event 归属置信度,0..1,与 `confidence` 分离 |
+| origin | TEXT NOT NULL DEFAULT `ai` | ai / user,标记该 Fact 当前结果来源 |
+| review_status | TEXT NOT NULL DEFAULT `unreviewed` | unreviewed / confirmed / corrected |
 | created_at | INTEGER NOT NULL | 创建时间 |
 | updated_at | INTEGER NOT NULL | 更新时间 |
 
 约束:
 - `event_assignment = 'unassigned'` 时,`event_id` 必须为 `NULL`
 - 其余 assignment 时,`event_id` 必须非 `NULL`
+- `due_raw` 可独立存在;没有可靠时间锚点时,不得为了凑结构强行生成 `due_at`
+- 当 `due_raw` 被换算为具体 `due_at`,且换算依据来自可靠消息时间时,应同时保存 `due_anchor_at`
+- `origin` / `review_status` 用于保护用户确认或修正后的结果,避免后续 AI 重跑无条件覆盖
 
 #### fact_evidence
 
@@ -322,6 +329,11 @@ V2 的目标底层关系为:
 
 约束:
 - `fact_id` / `evidence_id` 至少一个非 `NULL`
+
+语义边界:
+- Interpretation 只表达解释、术语、行动提示或不确定性
+- Interpretation 不得反向改写 Fact 的原始抽取结果
+- Evidence 始终代表原始证据,解释层变化不改变 Evidence 的完整性语义
 
 ---
 
@@ -473,6 +485,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 新增 `ocr_running` / `llm_running` 状态、OCR 文本人工校正、举证包附带 PDF 与说明文件 | 让处理过程可见、结果可追溯,并与现有导出物保持一致 |
 | 2026-08-08 | 核心定位从"谁欠谁"调整为"中立记录谁对谁表达了什么、发生了什么变化" | `"我的待办"`降级为可选身份视图,不再作为底层事实模型的核心差异点 |
 | 2026-08-08 | 新增 V2 语义模型骨架: Submission → Evidence → Fact → Event → Derived State | 为后续语义归档与事件层演进预留安全迁移路径,同时保留现有兼容层 |
+| 2026-08-08 | V3 为 facts 增加 `due_anchor_at / event_assignment_confidence / origin / review_status` | 加固相对日期换算语义,拆分事件归属置信度,并为用户确认/修正预留保护状态 |
 
 ---
 
