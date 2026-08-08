@@ -85,6 +85,7 @@
 - 高置信度且语义单一时,允许自动归档到已有事件
 - 存在分叉、多事件候选或冲突语义时,只给建议并要求用户确认
 - 低置信度或上下文不足时,进入"待归档",不得自动瞎建事件
+- **是否 auto / confirm / needs_context 由确定性代码策略决定,不由模型决定**
 
 **理由**:
 - 事实层一旦错误归档,后续所有事件时间线都会被污染
@@ -95,11 +96,13 @@
 **决策**:
 - 图 → 文:阿里云百炼 `vanchin/deepseek-ocr`(OpenAI 兼容接口)
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
-- 文 → 槽位:DeepSeek `deepseek-chat`(纯文本)
+- 文 → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
+- Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
+- Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
-- 文档提取与 OCR 产物统一落到 `raw_text`,后续搜索、导出、详情页、LLM 槽位抽取全部复用同一链路
+- 文档提取与 OCR 产物统一落到 `raw_text`,后续搜索、导出、详情页、语义解析全部复用同一链路
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
 
 ### D6. 访客沙箱优先于账号体系
@@ -419,7 +422,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 哈希 | hashlib 标准库 | |
 | OCR | DashScope `vanchin/deepseek-ocr` | OpenAI 兼容接口;仅做图转文 |
 | 文档提取 | `pypdf` / `python-docx` | PDF / docx / txt |
-| LLM | DeepSeek `deepseek-chat` | 纯文本槽位抽取 |
+| LLM | DeepSeek OpenAI-compatible (`DEEPSEEK_MODEL`) | 默认 `deepseek-v4-flash`,用于 Semantic Parser 与 Event Matcher |
 | 后端 | FastAPI | 已落地 |
 | 前端 | Jinja2 Templates + 原生 JS + Tailwind CDN | 已落地 |
 | 测试 | pytest | |
@@ -442,6 +445,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 ### 阶段二:AI 解析
 **已完成首版**
 - DeepSeek 文本槽位抽取
+- Semantic Parser V2:文本 → Fact / Interpretation
 - PDF / docx / txt 文档提取
 - 图片 OCR → 文本 → 现有槽位抽取链路
 - 身份设置(`self_names`)与私人词典(`glossary`)
@@ -454,6 +458,10 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 事项线展示
 - 风险标签与变更提示
 - 搜索覆盖 `raw_text` / `plain_summary` / actor 关联信息
+
+**正在收口**
+- Event Matcher:Fact 分组 + 归属建议
+- `auto / confirm / needs_context` 由确定性 routing policy 决定,不由模型决定
 
 ### 阶段四:界面与导出
 **已完成首版**
