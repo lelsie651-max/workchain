@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.1 · 最后更新 2026-08-08
+> 版本 v1.2 · 最后更新 2026-08-08
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -95,7 +95,7 @@
 ### D5. AI 分阶段解析,复用同一条证据链
 **决策**:
 - 图 → 文:阿里云百炼 `vanchin/deepseek-ocr`(OpenAI 兼容接口)
-- 可替换实验能力:Visual Provider(如 Doubao Ark)可输出 `transcript + observations`,但 production 默认仍使用现有 OCR
+- 生产图片提取:默认使用 DashScope OCR,可通过 `WORKCHAIN_IMAGE_EXTRACTION_PROVIDER=ark_vision` 切到 Ark Vision 优先,并在 Ark 失败时按配置与 OCR 配额决定是否回退到 DashScope OCR
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
 - `Evidence -> Extraction(transcript + visual observations) -> Fact -> Event`
 - 文 → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
@@ -104,7 +104,9 @@
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
-- Visual Provider 属于可替换实验能力,用于补充界面可观察事实,但不改变 production 默认 OCR 链路
+- 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
+- Ark Vision 可同时产出 `transcript + observations`;其中 transcript 可作为旧文本解析链输入,observations 只进入 Extraction 层,不得混入 `raw_text`
+- 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
@@ -240,7 +242,7 @@ V2 的目标底层关系为:
 
 | key 模式 | value | 用途 |
 |---|---|---|
-| `schema_version` | `1/2/3/4` | schema 版本 |
+| `schema_version` | `1/2/3/4/5` | schema 版本 |
 | `parse_status:{evidence_id}` | `ocr_running / llm_running / done / failed / unsupported` | 解析状态机 |
 | `parse_detail:{evidence_id}` | TEXT | 解析失败或降级说明 |
 | `extract_note:{evidence_id}` | TEXT | 文档提取 / OCR 的具体失败原因 |
@@ -363,6 +365,7 @@ V2 的目标底层关系为:
 | model | TEXT NULL | 提取模型名 |
 | transcript | TEXT NULL | 提取到的文字 |
 | observations | TEXT NOT NULL | JSON 数组,默认 `[]` |
+| warnings | TEXT NOT NULL | JSON 数组,默认 `[]`,记录 fallback 或提取提示 |
 | created_at | INTEGER NOT NULL | 创建时间 |
 | supersedes_extraction_id | TEXT NULL | 指向被 supersede 的旧版本 |
 
@@ -373,6 +376,7 @@ V2 的目标底层关系为:
 - Observation 不得推断心理、态度或意图,例如不得写成"小王已认真阅读并同意全部内容"
 - 如果画面里能看到 reaction 存在,但看不到反应者身份,只能记录 reaction 存在或身份未知,不得根据后续对话猜测是谁点的
 - 旧版本 Extraction 不删除、不覆盖
+- 图片类 Evidence 的 `raw_text` 仅保留 transcript 兼容层,不得把 observations 混入原文
 - 当前 `raw_text` 仍保留为兼容层展示 / 搜索 / 解析输入,但机器或用户提取历史应落入 `evidence_extractions`
 - `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
 
@@ -458,7 +462,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 语言 | Python 3.11+ | |
 | 存储 | SQLite | 无 ORM,直接 sqlite3 |
 | 哈希 | hashlib 标准库 | |
-| OCR | DashScope `vanchin/deepseek-ocr` | OpenAI 兼容接口;仅做图转文 |
+| OCR | DashScope `vanchin/deepseek-ocr` | 生产图片提取默认 provider,也作为 Ark Vision 失败时的 fallback |
 | 文档提取 | `pypdf` / `python-docx` | PDF / docx / txt |
 | LLM | DeepSeek OpenAI-compatible (`DEEPSEEK_MODEL`) | 默认 `deepseek-v4-flash`,用于 Semantic Parser 与 Event Matcher |
 | 后端 | FastAPI | 已落地 |
@@ -537,6 +541,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 新增实验 Visual Provider 边界,production 默认仍为 OCR | 为本地评测和未来多模态能力预留接口,但不改变线上默认图片提取链路 |
 | 2026-08-08 | diagnostics 入口加开关保护,并新增 Ark Vision 只读实验对照接口 | 避免真实模型调用裸露对外,同时支持同 Evidence 的安全 A/B 视觉提取诊断 |
 | 2026-08-08 | Ark diagnostics Extraction 使用 disabled thinking,并拆分 text/vision 独立 timeout | 单独验证视觉 timeout 与推理开关对 Ark 实验提取成功率的影响,不改其它请求变量 |
+| 2026-08-08 | 生产图片 Extraction 改为 provider-aware 路由:默认 OCR,可切 Ark Vision,失败后按 OCR 配置与配额 fallback | 保持默认行为稳定,同时让 transcript 与 observations 分离落库并保留真实 provenance |
 
 ---
 

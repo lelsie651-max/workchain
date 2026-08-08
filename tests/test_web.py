@@ -1332,6 +1332,239 @@ def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchab
         conn.close()
 
 
+def test_image_upload_defaults_to_ocr_when_provider_not_configured(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    monkeypatch.delenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "默认走 OCR。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("默认 OCR 文字", "")) as mock_ocr:
+        with patch("app.vision_provider.extract_visual_evidence") as mock_vision:
+            with patch("app.main.llm.extract_slots", return_value=parsed):
+                with client:
+                    response = _upload_png(client, filename="default-provider.png")
+                    evidence_id = response.json()["evidence_id"]
+                    status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "ocr_running"
+    assert status_response.json()["parse_status"] == "done"
+    mock_ocr.assert_called_once()
+    mock_vision.assert_not_called()
+
+
+def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "Ark transcript 进入旧文本解析链。",
+        "caveats": [],
+    }
+    ark_extraction = {
+        "transcript": "Ark transcript",
+        "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": ["局部遮挡"],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
+        with patch("app.extract.ocr.image_to_text") as mock_ocr:
+            with patch("app.main.llm.extract_slots", return_value=parsed) as mock_llm:
+                with client:
+                    response = _upload_png(client, filename="ark-success.png")
+                    evidence_id = response.json()["evidence_id"]
+                    status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "ocr_running"
+    assert status_response.json()["parse_status"] == "done"
+    mock_vision.assert_called_once()
+    mock_ocr.assert_not_called()
+    mock_llm.assert_called_once()
+    assert mock_llm.call_args.args[0] == main_module._llm_input_text("Ark transcript")
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT raw_text FROM evidence WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        extraction_row = conn.execute(
+            """
+            SELECT provider, model, transcript, observations, warnings
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert row["raw_text"] == "[图片] ark-success.png\n\nArk transcript"
+        assert extraction_row["provider"] == "doubao-ark"
+        assert extraction_row["model"] == "doubao-seed-2-0-lite-260215"
+        assert extraction_row["transcript"] == "Ark transcript"
+        assert json.loads(extraction_row["observations"]) == [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}]
+        assert json.loads(extraction_row["warnings"]) == ["局部遮挡"]
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_ark_provider_falls_back_to_ocr_and_consumes_budget_only_on_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "走 OCR fallback。",
+        "caveats": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=None) as mock_vision:
+        with patch("app.extract.ocr.image_to_text", return_value=("Fallback OCR transcript", "")) as mock_ocr:
+            with patch("app.main.llm.extract_slots", return_value=parsed):
+                with client:
+                    response = _upload_png(client, filename="ark-fallback.png")
+                    evidence_id = response.json()["evidence_id"]
+                    status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "ocr_running"
+    assert status_response.json()["parse_status"] == "done"
+    mock_vision.assert_called_once()
+    mock_ocr.assert_called_once()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        extraction_row = conn.execute(
+            """
+            SELECT provider, model, transcript, warnings
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        ocr_counter = conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'ocr_count:%'"
+        ).fetchone()
+        assert extraction_row["provider"] == "dashscope"
+        assert extraction_row["model"] == "vanchin/deepseek-ocr"
+        assert extraction_row["transcript"] == "Fallback OCR transcript"
+        assert json.loads(extraction_row["warnings"]) == ["ark_vision_failed_fallback_to_ocr"]
+        assert ocr_counter is not None
+        assert ocr_counter["value"] == "1"
+    finally:
+        conn.close()
+
+
+def test_ark_provider_failure_without_ocr_fallback_still_keeps_original(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=None):
+        with patch("app.main.llm.extract_slots") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="ark-no-fallback.png")
+                evidence_id = response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "ocr_running"
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert "Ark Vision 提取失败" in status_response.json()["detail"]
+    mock_llm.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        extraction_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        ocr_counter = conn.execute("SELECT value FROM meta WHERE key LIKE 'ocr_count:%'").fetchone()
+        assert row["raw_text"] == "[图片] ark-no-fallback.png"
+        assert extraction_count == 0
+        assert ocr_counter is None
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_ark_provider_observations_only_does_not_call_old_text_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    ark_extraction = {
+        "transcript": None,
+        "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.llm.extract_slots") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="ark-observation-only.png")
+                evidence_id = response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert "可观察界面事实" in status_response.json()["detail"]
+    mock_llm.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        extraction_row = conn.execute(
+            "SELECT transcript, observations FROM evidence_extractions WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["raw_text"] == "[图片] ark-observation-only.png"
+        assert extraction_row["transcript"] is None
+        assert json.loads(extraction_row["observations"]) == [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}]
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
 def test_image_upload_ocr_timeout_still_succeeds_and_marks_unsupported(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
@@ -2102,7 +2335,7 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
 def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
     parsed = {
@@ -2115,10 +2348,17 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
         "plain_summary": "审批通过,周五前交付渠道复盘数据",
         "caveats": [],
     }
+    ark_extraction = {
+        "transcript": "Ark 识别到的文字",
+        "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": ["画面局部遮挡"],
+    }
 
-    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
-            with patch("app.vision_provider.extract_visual_evidence") as mock_vision:
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
+        with patch("app.extract.ocr.image_to_text") as mock_ocr:
+            with patch("app.main.llm.extract_slots", return_value=parsed):
                 with client:
                     create_response = _upload_png(client, filename="diag-on.png")
                     evidence_id = create_response.json()["evidence_id"]
@@ -2132,9 +2372,14 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     payload = diag_response.json()
     assert payload["parse_status"] == "done"
     assert payload["image_pipeline"] == {
-        "actual_provider": "dashscope",
-        "actual_provider_label": "DashScope",
-        "actual_model": "vanchin/deepseek-ocr",
+        "configured_provider": "ark_vision",
+        "configured_provider_label": "Doubao Ark Vision",
+        "configured_model": "doubao-seed-2-0-lite-260215",
+        "actual_provider": "doubao-ark",
+        "actual_provider_label": "Doubao Ark",
+        "actual_model": "doubao-seed-2-0-lite-260215",
+        "fallback_used": False,
+        "route": "app.main._run_image_pipeline -> app.evidence_extractor.run_production_image_extraction",
     }
     assert payload["text_llm"]["provider"] == "deepseek"
     assert payload["text_llm"]["model"] == main_module.llm.get_deepseek_model()
@@ -2142,17 +2387,19 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
         {
             "origin": "machine",
             "origin_label": "机器提取",
-            "provider": "dashscope",
-            "provider_label": "DashScope",
-            "model": "vanchin/deepseek-ocr",
+            "provider": "doubao-ark",
+            "provider_label": "Doubao Ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": ["画面局部遮挡"],
             "created_at": payload["extraction_history"][0]["created_at"],
             "created_at_text": payload["extraction_history"][0]["created_at_text"],
         }
     ]
     assert isinstance(payload["extraction_history"][0]["created_at"], int)
     assert payload["extraction_history"][0]["created_at_text"]
-    assert "原始识别文字" not in diag_response.text
-    mock_vision.assert_not_called()
+    assert "Ark 识别到的文字" not in diag_response.text
+    mock_vision.assert_called_once()
+    mock_ocr.assert_not_called()
 
 
 def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_path, monkeypatch):

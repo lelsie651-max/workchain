@@ -169,7 +169,7 @@ def test_init_db_creates_all_tables(db_file):
     ]
     columns = conn.execute("PRAGMA table_info(facts)").fetchall()
 
-    assert get_schema_version(conn) == 4
+    assert get_schema_version(conn) == 5
     assert {column["name"] for column in columns} >= {
         "due_anchor_at",
         "event_assignment_confidence",
@@ -184,10 +184,10 @@ def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
 
     conn2 = init_db(db_file)
 
-    assert get_schema_version(conn2) == 4
+    assert get_schema_version(conn2) == 5
 
 
-def test_v1_database_is_migrated_to_v4_without_losing_existing_rows(db_file):
+def test_v1_database_is_migrated_to_v5_without_losing_existing_rows(db_file):
     _make_v1_db(db_file)
     reopened = None
     try:
@@ -218,7 +218,7 @@ def test_v1_database_is_migrated_to_v4_without_losing_existing_rows(db_file):
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_extractions'"
         ).fetchone()
 
-        assert get_schema_version(reopened) == 4
+        assert get_schema_version(reopened) == 5
         assert actor["actor_id"] == "act-1"
         assert thread["thread_id"] == "thr-1"
         assert evidence["evidence_id"] == "ev-1"
@@ -230,14 +230,14 @@ def test_v1_database_is_migrated_to_v4_without_losing_existing_rows(db_file):
             reopened.close()
 
 
-def test_v1_to_v4_migration_is_idempotent(db_file):
+def test_v1_to_v5_migration_is_idempotent(db_file):
     _make_v1_db(db_file)
 
     first = init_db(db_file)
     first.close()
     second = init_db(db_file)
     try:
-        assert get_schema_version(second) == 4
+        assert get_schema_version(second) == 5
         tables = second.execute(
             """
             SELECT name FROM sqlite_master
@@ -342,7 +342,7 @@ def test_foreign_keys_are_enabled_and_missing_thread_is_rejected(db_file):
 def test_init_db_supports_memory_database():
     conn = init_db(":memory:")
 
-    assert get_schema_version(conn) == 4
+    assert get_schema_version(conn) == 5
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'actors'").fetchone() is not None
 
 
@@ -618,7 +618,7 @@ def test_interpretations_require_parent_and_validate_constraints(db_file):
         )
 
 
-def test_v2_database_with_existing_events_and_facts_migrates_to_v4_without_data_loss(db_file):
+def test_v2_database_with_existing_events_and_facts_migrates_to_v5_without_data_loss(db_file):
     _make_v2_db(db_file)
 
     conn = db_module._connect(db_file)
@@ -669,7 +669,7 @@ def test_v2_database_with_existing_events_and_facts_migrates_to_v4_without_data_
             ("fact-1",),
         ).fetchone()
 
-        assert get_schema_version(reopened) == 4
+        assert get_schema_version(reopened) == 5
         assert row["event_id"] == "evt-1"
         assert row["fact_type"] == "deadline_change"
         assert row["content"] == "原计划下周五交付"
@@ -745,7 +745,7 @@ def test_facts_v3_defaults_and_checks_are_enforced(db_file):
         )
 
 
-def test_v3_database_migrates_to_v4_without_losing_existing_rows(db_file):
+def test_v3_database_migrates_to_v5_without_losing_existing_rows(db_file):
     _make_v3_db(db_file)
     conn = db_module._connect(db_file)
     try:
@@ -771,7 +771,7 @@ def test_v3_database_migrates_to_v4_without_losing_existing_rows(db_file):
             ("custom:v3-note",),
         ).fetchone()
 
-        assert get_schema_version(reopened) == 4
+        assert get_schema_version(reopened) == 5
         assert evidence["evidence_id"] == "ev-1"
         assert meta_row["value"] == "still-here"
         assert {column["name"] for column in extraction_columns} >= {
@@ -782,6 +782,7 @@ def test_v3_database_migrates_to_v4_without_losing_existing_rows(db_file):
             "model",
             "transcript",
             "observations",
+            "warnings",
             "created_at",
             "supersedes_extraction_id",
         }

@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any
 
-from evidence_core.extraction_contract import normalize_observations
+from evidence_core.extraction_contract import normalize_observations, normalize_warnings
 
 
 class ExtractionStoreError(ValueError):
@@ -63,9 +63,20 @@ def _decode_observations(value: Any) -> list[dict[str, Any]]:
     return normalize_observations(parsed)
 
 
+def _decode_warnings(value: Any) -> list[str]:
+    if not isinstance(value, str):
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return []
+    return normalize_warnings(parsed)
+
+
 def _row_to_extraction(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["observations"] = _decode_observations(row["observations"])
+    result["warnings"] = _decode_warnings(row["warnings"])
     return result
 
 
@@ -78,6 +89,7 @@ def create_extraction(
     model: str | None = None,
     transcript: str | None = None,
     observations: Any = None,
+    warnings: Any = None,
     created_at: int | None = None,
     extraction_id: str | None = None,
     supersedes_extraction_id: str | None = None,
@@ -92,6 +104,7 @@ def create_extraction(
     transcript = _coerce_text(transcript)
     model = _coerce_text(model)
     normalized_observations = normalize_observations(observations if observations is not None else [])
+    normalized_warnings = normalize_warnings(warnings)
     if transcript is None and not normalized_observations:
         raise ExtractionStoreError("extraction requires transcript or observations")
 
@@ -115,8 +128,8 @@ def create_extraction(
             """
             INSERT INTO evidence_extractions (
                 extraction_id, evidence_id, origin, provider, model,
-                transcript, observations, created_at, supersedes_extraction_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transcript, observations, warnings, created_at, supersedes_extraction_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 extraction_id,
@@ -126,6 +139,7 @@ def create_extraction(
                 model,
                 transcript,
                 json.dumps(normalized_observations, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(normalized_warnings, ensure_ascii=False, separators=(",", ":")),
                 created_at,
                 supersedes_extraction_id,
             ),

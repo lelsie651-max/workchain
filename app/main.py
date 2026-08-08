@@ -25,7 +25,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm, ocr, vision_provider
-from app.extract import extract_image_text_with_metadata, extract_text
+from app.evidence_extractor import (
+    ARK_FALLBACK_WARNING,
+    get_image_extraction_provider,
+    get_image_extraction_provider_label,
+    get_image_extraction_startup,
+    run_production_image_extraction,
+)
+from app.extract import extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
 from app.pdf_report import PDF_FILENAME_PREFIX, build_evidence_pdf
@@ -125,6 +132,8 @@ def _emit_structured_log(event: str, payload: dict[str, Any]) -> None:
 def _provider_label(provider: str | None) -> str:
     mapping = {
         "dashscope": "DashScope",
+        "doubao-ark": "Doubao Ark",
+        "ark_vision": "Doubao Ark Vision",
         "manual": "人工校正",
         "builtin": "Builtin",
         "deepseek": "DeepSeek",
@@ -160,18 +169,27 @@ def _format_extraction_item(extraction: dict[str, Any]) -> dict[str, Any]:
         "provider": provider,
         "provider_label": provider_label,
         "model": model,
+        "warnings": extraction.get("warnings") if isinstance(extraction.get("warnings"), list) else [],
         "created_at": created_at,
         "created_at_text": created_at_text,
         "summary": summary,
     }
 
 
-def _production_image_pipeline_info() -> dict[str, Any]:
+def _production_image_pipeline_info(current_extraction: dict[str, Any] | None = None) -> dict[str, Any]:
+    startup = get_image_extraction_startup()
+    warnings = []
+    if current_extraction is not None and isinstance(current_extraction.get("warnings"), list):
+        warnings = current_extraction["warnings"]
     return {
-        "provider": "dashscope",
-        "provider_label": _provider_label("dashscope"),
-        "model": ocr.OCR_MODEL,
-        "route": "app.main._run_image_pipeline -> app.extract -> app.ocr",
+        "configured_provider": startup["configured_provider"],
+        "configured_provider_label": get_image_extraction_provider_label(startup["configured_provider"]),
+        "configured_model": startup["configured_model"],
+        "actual_provider": None if current_extraction is None else current_extraction.get("provider"),
+        "actual_provider_label": None if current_extraction is None else _provider_label(current_extraction.get("provider")),
+        "actual_model": None if current_extraction is None else current_extraction.get("model"),
+        "fallback_used": ARK_FALLBACK_WARNING in warnings,
+        "route": "app.main._run_image_pipeline -> app.evidence_extractor.run_production_image_extraction",
     }
 
 
@@ -359,9 +377,11 @@ def _record_machine_extraction(
     conn: sqlite3.Connection,
     *,
     evidence_id: str,
-    transcript: str,
+    transcript: str | None,
+    observations: list[dict[str, Any]] | None,
     provider: str,
     model: str | None,
+    warnings: list[str] | None = None,
     created_at: int | None = None,
 ) -> None:
     create_extraction(
@@ -371,7 +391,8 @@ def _record_machine_extraction(
         provider=provider,
         model=model,
         transcript=transcript,
-        observations=[],
+        observations=observations or [],
+        warnings=warnings or [],
         created_at=created_at,
     )
 
@@ -392,6 +413,7 @@ def _record_user_extraction(
         model=None,
         transcript=transcript,
         observations=[],
+        warnings=[],
         created_at=created_at,
         supersedes_extraction_id=None if latest is None else latest["extraction_id"],
     )
@@ -418,6 +440,10 @@ def _saved_original_detail(note: str) -> str:
         return note
     note = note.rstrip("。")
     return f"{note}。原件已完整保存。"
+
+
+def _can_run_text_parse(transcript: str | None) -> bool:
+    return isinstance(transcript, str) and bool(transcript.strip())
 
 
 def _export_timestamp() -> str:
@@ -896,30 +922,54 @@ def _run_image_pipeline(
     filename: str | None,
     counterpart: str | None,
 ) -> None:
-    extracted_text, extract_status, _ = extract_image_text_with_metadata(
+    mime_type = _detect_blob_content_type(image_bytes, filename)
+    selected_provider = get_image_extraction_provider()
+    extraction_result = run_production_image_extraction(
         image_bytes,
-        filename or "",
-        evidence_id=evidence_id,
+        mime_type,
+        provider=selected_provider,
+        allow_ocr_fallback=selected_provider != "ocr",
+        consume_ocr_fallback_budget=(
+            None
+            if selected_provider == "ocr"
+            else lambda: _consume_ocr_budget(sandbox_db_path, global_meta_db_path)
+        ),
     )
+    extraction = extraction_result.get("extraction")
+    transcript = None if extraction is None else extraction.get("transcript")
+    observations = [] if extraction is None else extraction.get("observations", [])
+    warnings = [] if extraction is None else extraction.get("warnings", [])
     conn = init_db(sandbox_db_path)
     try:
-        if extracted_text is None:
+        if extraction is None:
+            detail = extraction_result.get("detail") or "图片提取暂不可用,原件已完整保存"
             _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
-            _set_parse_detail(conn, evidence_id, _saved_original_detail(extract_status))
-            _set_extract_note(conn, evidence_id, extract_status)
+            _set_parse_detail(conn, evidence_id, _saved_original_detail(detail))
+            _set_extract_note(conn, evidence_id, detail)
             return
 
-        conn.execute(
-            "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
-            (_build_attachment_raw_text("image", filename, extracted_text), evidence_id),
-        )
         _record_machine_extraction(
             conn,
             evidence_id=evidence_id,
-            transcript=extracted_text,
-            provider="dashscope",
-            model=ocr.OCR_MODEL,
+            transcript=transcript,
+            observations=observations,
+            provider=extraction.get("provider") or "unknown",
+            model=extraction.get("model"),
+            warnings=warnings,
         )
+        conn.execute(
+            "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
+            (_build_attachment_raw_text("image", filename, transcript), evidence_id),
+        )
+        _clear_extract_note(conn, evidence_id)
+        if not _can_run_text_parse(transcript):
+            note = "图片已完成视觉提取,记录了可观察界面事实,但没有识别到可供文本解析的文字"
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
+            _set_parse_detail(conn, evidence_id, _saved_original_detail(note))
+            _set_extract_note(conn, evidence_id, note)
+            conn.commit()
+            return
+
         _clear_extract_note(conn, evidence_id)
         _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
         _set_parse_detail(conn, evidence_id, "")
@@ -931,7 +981,7 @@ def _run_image_pipeline(
         sandbox_db_path,
         global_meta_db_path,
         evidence_id,
-        extracted_text,
+        transcript,
         counterpart,
     )
 
@@ -1328,6 +1378,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
             **_format_extraction_item(latest_extraction),
             "transcript": latest_extraction.get("transcript"),
             "observations": latest_extraction.get("observations") if isinstance(latest_extraction.get("observations"), list) else [],
+            "warnings": latest_extraction.get("warnings") if isinstance(latest_extraction.get("warnings"), list) else [],
         }
     return {
         "evidence_id": row["evidence_id"],
@@ -1379,16 +1430,13 @@ def _build_evidence_diagnostics(
                 "provider": item["provider"],
                 "provider_label": item["provider_label"],
                 "model": item["model"],
+                "warnings": item.get("warnings", []),
                 "created_at": item["created_at"],
                 "created_at_text": item["created_at_text"],
             }
             for item in evidence["extraction_history"]
         ],
-        "image_pipeline": {
-            "actual_provider": _production_image_pipeline_info()["provider"],
-            "actual_provider_label": _production_image_pipeline_info()["provider_label"],
-            "actual_model": _production_image_pipeline_info()["model"],
-        },
+        "image_pipeline": _production_image_pipeline_info(evidence.get("current_extraction")),
         "text_llm": {
             "provider": "deepseek",
             "provider_label": _provider_label("deepseek"),
@@ -2201,11 +2249,12 @@ def create_app() -> FastAPI:
                 filename = upload.filename if upload is not None else None
                 raw_text_override = _build_attachment_raw_text(media_type, filename)
                 if media_type == "image":
-                    if not ocr.is_configured():
+                    image_startup = get_image_extraction_startup()
+                    if not image_startup["supported"] or not image_startup["configured"]:
                         parse_status = PARSE_STATUS_UNSUPPORTED
-                        extract_note = "图片识别未配置(DASHSCOPE_API_KEY 未设置)"
+                        extract_note = image_startup["detail"] or "图片提取暂不可用"
                         parse_detail = _saved_original_detail(extract_note)
-                    else:
+                    elif image_startup["requires_ocr_budget_on_start"]:
                         allowed, reason = _consume_ocr_budget(sandbox.db_path, request.app.state.global_meta_db_path)
                         if allowed:
                             parse_status = PARSE_STATUS_OCR_RUNNING
@@ -2215,6 +2264,10 @@ def create_app() -> FastAPI:
                             parse_status = PARSE_STATUS_UNSUPPORTED
                             extract_note = reason
                             parse_detail = _saved_original_detail(reason or "图片识别暂不可用")
+                    else:
+                        parse_status = PARSE_STATUS_OCR_RUNNING
+                        parse_detail = ""
+                        image_pipeline_args = (file_bytes, filename, counterpart)
                 else:
                     extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
                     if extracted_text is not None:
@@ -2247,8 +2300,10 @@ def create_app() -> FastAPI:
                         conn,
                         evidence_id=row["evidence_id"],
                         transcript=extracted_for_parse,
+                        observations=[],
                         provider="builtin",
                         model=None,
+                        warnings=[],
                         created_at=now_ms,
                     )
                 row = conn.execute("SELECT * FROM evidence WHERE evidence_id = ?", (row["evidence_id"],)).fetchone()

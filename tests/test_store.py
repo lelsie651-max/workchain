@@ -472,8 +472,8 @@ def test_semantic_v4_tables_do_not_affect_verify_chain(db_file, blobs_root):
         """
         INSERT INTO evidence_extractions (
             extraction_id, evidence_id, origin, provider, model,
-            transcript, observations, created_at, supersedes_extraction_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            transcript, observations, warnings, created_at, supersedes_extraction_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "ext-1",
@@ -483,6 +483,7 @@ def test_semantic_v4_tables_do_not_affect_verify_chain(db_file, blobs_root):
             "vanchin/deepseek-ocr",
             "原始识别文字",
             "[]",
+            "[]",
             1723000400,
             None,
         ),
@@ -491,8 +492,8 @@ def test_semantic_v4_tables_do_not_affect_verify_chain(db_file, blobs_root):
         """
         INSERT INTO evidence_extractions (
             extraction_id, evidence_id, origin, provider, model,
-            transcript, observations, created_at, supersedes_extraction_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            transcript, observations, warnings, created_at, supersedes_extraction_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             "ext-2",
@@ -501,6 +502,7 @@ def test_semantic_v4_tables_do_not_affect_verify_chain(db_file, blobs_root):
             "manual",
             None,
             "人工修正后的识别文字",
+            "[]",
             "[]",
             1723000500,
             "ext-1",

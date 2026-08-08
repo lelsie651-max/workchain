@@ -40,7 +40,7 @@ def _append_text(conn, blobs_root, *, text: str, captured_at: int):
 def test_fresh_db_supports_evidence_extractions(db_file):
     conn = init_db(db_file)
 
-    assert get_schema_version(conn) == 4
+    assert get_schema_version(conn) == 5
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_extractions'"
     ).fetchone()
@@ -69,6 +69,7 @@ def test_machine_extraction_can_be_saved_with_transcript_only(db_file, blobs_roo
     assert created["observations"] == []
     assert created["provider"] == "dashscope"
     assert created["model"] == "vanchin/deepseek-ocr"
+    assert created["warnings"] == []
 
 
 def test_user_correction_can_supersede_machine_extraction_without_deleting_history(db_file, blobs_root):
@@ -107,6 +108,7 @@ def test_user_correction_can_supersede_machine_extraction_without_deleting_histo
     assert history[1]["supersedes_extraction_id"] == "ext-machine"
     assert latest["extraction_id"] == "ext-user"
     assert latest["origin"] == "user"
+    assert latest["warnings"] == []
 
 
 def test_create_extraction_rejects_cross_evidence_supersede(db_file, blobs_root):
@@ -162,6 +164,7 @@ def test_create_extraction_allows_observations_without_transcript(db_file, blobs
     assert created["observations"] == [
         {"kind": "reaction", "content": "小王账号对该消息显示👍反应", "confidence": 0.81}
     ]
+    assert created["warnings"] == []
 
 
 def test_create_extraction_normalizes_observations_to_json_array(db_file, blobs_root):
@@ -180,6 +183,25 @@ def test_create_extraction_normalizes_observations_to_json_array(db_file, blobs_
     )
 
     assert created["observations"] == []
+
+
+def test_create_extraction_persists_warnings(db_file, blobs_root):
+    conn = init_db(db_file)
+    evidence = _append_text(conn, blobs_root, text="原始截图", captured_at=1723000000)
+
+    created = create_extraction(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        origin="machine",
+        provider="dashscope",
+        model="vanchin/deepseek-ocr",
+        transcript="OCR transcript",
+        observations=[],
+        warnings=["ark_vision_failed_fallback_to_ocr", "图片局部模糊"],
+        created_at=1723000100,
+    )
+
+    assert created["warnings"] == ["ark_vision_failed_fallback_to_ocr", "图片局部模糊"]
 
 
 def test_create_extraction_rejects_when_transcript_and_observations_are_both_empty(db_file, blobs_root):
