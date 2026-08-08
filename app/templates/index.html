@@ -319,13 +319,25 @@
                         </button>
                         <p class="mt-2 text-xs text-slate-500">{{ item.filename or "未命名图片" }}</p>
                         {% elif item.is_file %}
-                        <a
-                            href="{{ item.blob_url }}"
-                            class="flex min-h-11 items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3 transition hover:border-cyan-400/40"
-                        >
-                            <span class="inline-flex h-11 w-11 items-center justify-center rounded-xl border border-slate-700 text-xs text-slate-300">文件</span>
-                            <span class="min-w-0 flex-1 truncate text-sm text-slate-100">{{ item.filename or "未命名文件" }}</span>
-                        </a>
+                        <div class="space-y-3">
+                            <a
+                                href="{{ item.blob_url }}"
+                                class="flex min-h-11 items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3 transition hover:border-cyan-400/40"
+                            >
+                                <span class="inline-flex h-11 w-11 items-center justify-center rounded-xl border border-slate-700 text-xs text-slate-300">文件</span>
+                                <span class="min-w-0 flex-1 truncate text-sm text-slate-100">{{ item.filename or "未命名文件" }}</span>
+                            </a>
+                            {% if item.display_text %}
+                            <p
+                                data-raw-preview
+                                class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
+                            >{{ item.raw_text_preview }}</p>
+                            <div
+                                data-raw-full
+                                class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
+                            >{{ item.display_text }}</div>
+                            {% endif %}
+                        </div>
                         {% else %}
                         <p
                             data-raw-preview
@@ -338,7 +350,7 @@
                         {% endif %}
                     </div>
                     <div class="mt-3 flex flex-wrap items-center gap-3">
-                        {% if item.is_long_text and not item.is_image and not item.is_file %}
+                        {% if item.is_long_text and not item.is_image %}
                         <button
                             type="button"
                             data-toggle-fulltext
@@ -376,7 +388,13 @@
                         {% if item.plain_summary %}
                         <p class="text-slate-200">{{ item.plain_summary }}</p>
                         {% endif %}
-                        <p class="mt-2 text-slate-400">{{ item.parse_detail or "解析暂不可用,记录已完整保存" }}</p>
+                        <p class="mt-2 text-slate-400">
+                            {% if item.extract_note %}
+                            {{ item.extract_note }}。原件已完整保存。
+                            {% else %}
+                            {{ item.parse_detail or "解析暂不可用,记录已完整保存" }}
+                            {% endif %}
+                        </p>
                         {% endif %}
                     </div>
                 </article>

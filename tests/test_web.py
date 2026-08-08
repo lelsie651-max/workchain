@@ -10,14 +10,21 @@ import sys
 import threading
 import time
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from docx import Document
 from fastapi.testclient import TestClient
 import httpx
 from pypdf import PdfReader
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfgen import canvas
 
 from app.main import create_app
+from evidence_core.chain import compute_content_hash
 from evidence_core.db import init_db
 from evidence_core.store import verify_chain
 
@@ -25,6 +32,28 @@ from evidence_core.store import verify_chain
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ioAAAAASUVORK5CYII="
 )
+
+
+def _build_pdf_bytes(text: str | None = None, *, image_only: bool = False) -> bytes:
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer)
+    pdf.setFont("STSong-Light", 14)
+    if text:
+        pdf.drawString(72, 720, text)
+    if image_only:
+        pdf.drawImage(ImageReader(BytesIO(PNG_BYTES)), 72, 650, width=80, height=80)
+    pdf.save()
+    return buffer.getvalue()
+
+
+def _build_docx_bytes(*parts: str) -> bytes:
+    document = Document()
+    for part in parts:
+        document.add_paragraph(part)
+    buffer = BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
 
 
 def _make_client(tmp_path, monkeypatch):
@@ -389,6 +418,25 @@ def test_search_with_empty_query_shows_prompt(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert "输入关键词开始搜索" in response.text
+
+
+def test_search_hits_extracted_document_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    pdf_bytes = _build_pdf_bytes("独特关键词甲乙丙")
+
+    with patch("app.main.llm.extract_slots", return_value=None):
+        with client:
+            upload_response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("search.pdf", pdf_bytes, "application/pdf")},
+            )
+            search_response = client.get("/search", params={"q": "甲乙丙"})
+
+    assert upload_response.status_code == 200
+    assert search_response.status_code == 200
+    assert "独特关键词<mark>甲乙丙</mark>" in search_response.text
 
 
 def test_help_page_returns_200_and_contains_review_notes(tmp_path, monkeypatch):
@@ -874,6 +922,159 @@ def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypa
         assert row["media_type"] == "image"
         assert row["raw_text"] == "[文件] annotated.png"
         assert row["plain_summary"] == "这是我补充的说明"
+    finally:
+        conn.close()
+
+
+def test_pdf_upload_extracts_text_into_raw_text_and_preserves_original_hash(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    pdf_bytes = _build_pdf_bytes("渠道复盘数据")
+
+    with patch("app.main.llm.extract_slots", return_value=None):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("demo.pdf", pdf_bytes, "application/pdf")},
+            )
+            evidence_id = response.json()["evidence_id"]
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT raw_text, content_hash, media_type FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["media_type"] == "file"
+        assert "渠道复盘数据" in row["raw_text"]
+        assert row["content_hash"] == compute_content_hash(pdf_bytes)
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_docx_upload_extracts_paragraph_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    docx_bytes = _build_docx_bytes("第一段内容", "第二段内容")
+
+    with patch("app.main.llm.extract_slots", return_value=None):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("demo.docx", docx_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+            )
+            evidence_id = response.json()["evidence_id"]
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        assert "第一段内容" in row["raw_text"]
+        assert "第二段内容" in row["raw_text"]
+    finally:
+        conn.close()
+
+
+def test_txt_upload_extracts_utf8_and_gbk_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.llm.extract_slots", return_value=None):
+        with client:
+            utf8_response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("utf8.txt", "渠道复盘数据".encode("utf-8"), "text/plain")},
+            )
+            gbk_response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("gbk.txt", "用户明细".encode("gbk"), "text/plain")},
+            )
+
+    assert utf8_response.status_code == 200
+    assert gbk_response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT raw_text FROM evidence WHERE evidence_id IN (?, ?)",
+            (utf8_response.json()["evidence_id"], gbk_response.json()["evidence_id"]),
+        ).fetchall()
+        joined = "\n".join(row["raw_text"] for row in rows)
+        assert "渠道复盘数据" in joined
+        assert "用户明细" in joined
+    finally:
+        conn.close()
+
+
+def test_image_only_pdf_upload_marks_unsupported_and_stores_extract_note(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    image_pdf = _build_pdf_bytes(image_only=True)
+
+    with patch("app.main.llm.extract_slots") as mock_extract:
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("scan.pdf", image_pdf, "application/pdf")},
+            )
+            evidence_id = response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert "扫描件" in status_response.json()["detail"]
+    mock_extract.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        note = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (f"extract_note:{evidence_id}",),
+        ).fetchone()
+        raw_row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        assert note["value"] == "这份 PDF 看起来是扫描件,没有可提取的文字"
+        assert raw_row["raw_text"] == "[文件] scan.pdf"
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_broken_pdf_upload_still_succeeds_and_marks_unsupported(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    broken_pdf = b"%PDF-broken"
+
+    with patch("app.main.llm.extract_slots") as mock_extract:
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("broken.pdf", broken_pdf, "application/pdf")},
+            )
+            evidence_id = response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert "PDF 暂时无法读取" in status_response.json()["detail"]
+    mock_extract.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        assert row["raw_text"] == "[文件] broken.pdf"
     finally:
         conn.close()
 
@@ -1458,6 +1659,29 @@ def test_parse_pipeline_passes_empty_self_names_without_error(tmp_path, monkeypa
     assert response.status_code == 200
     assert captured["context"]["self_names"] == []
     assert captured["context"]["glossary"] == []
+
+
+def test_document_text_is_truncated_before_sending_to_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+    long_text = "很长的文档内容" * 1200
+
+    def fake_extract(text, today, context=None):
+        captured["text"] = text
+        return None
+
+    with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("long.txt", long_text.encode("utf-8"), "text/plain")},
+            )
+
+    assert response.status_code == 200
+    assert len(captured["text"]) <= 8000
+    assert "以下内容较长,已截取前一部分" in captured["text"]
 
 
 def test_settings_save_and_read_self_names(tmp_path, monkeypatch):

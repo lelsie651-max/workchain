@@ -2,6 +2,7 @@ fastapi
 httpx
 jinja2
 pypdf
+python-docx
 python-multipart
 pytest
 reportlab

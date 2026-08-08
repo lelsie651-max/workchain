@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm
+from app.extract import extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
 from app.pdf_report import PDF_FILENAME_PREFIX, build_evidence_pdf
@@ -50,6 +51,7 @@ TEMPLATES = Jinja2Templates(directory=str(BASE_DIR / "app" / "templates"))
 MAX_TEXT_LENGTH = 20_000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_LLM_TEXT_LENGTH = 8_000
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PACKAGE_README_TEXT = (
     "这个文件夹里的记录不能被偷偷修改。\n"
@@ -127,7 +129,18 @@ def _format_bytes(size: int) -> str:
 def _extract_filename(raw_text: str | None) -> str | None:
     if not raw_text or not raw_text.startswith("[文件] "):
         return None
-    return raw_text[5:]
+    first_line = raw_text.splitlines()[0]
+    return first_line[5:]
+
+
+def _extract_file_text(raw_text: str | None) -> str | None:
+    if not raw_text or not raw_text.startswith("[文件] "):
+        return None
+    parts = raw_text.split("\n\n", 1)
+    if len(parts) != 2:
+        return None
+    extracted = parts[1].strip()
+    return extracted or None
 
 
 def _is_upload_value(value: Any) -> bool:
@@ -137,11 +150,13 @@ def _is_upload_value(value: Any) -> bool:
 def _looks_like_text(data: bytes) -> bool:
     if b"\x00" in data:
         return False
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return True
+    for encoding in ("utf-8", "gbk", "gb18030"):
+        try:
+            data.decode(encoding)
+            return True
+        except UnicodeDecodeError:
+            continue
+    return False
 
 
 def _detect_upload_type(upload: UploadFile, data: bytes) -> tuple[str, str]:
@@ -233,6 +248,31 @@ def _build_content_disposition(disposition: str, filename: str | None) -> str:
 
 def _unsupported_detail(media_type: str) -> str:
     return f"这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。"
+
+
+def _extract_note_key(evidence_id: str) -> str:
+    return f"extract_note:{evidence_id}"
+
+
+def _set_extract_note(conn: sqlite3.Connection, evidence_id: str, note: str) -> None:
+    _set_meta_value(conn, _extract_note_key(evidence_id), note)
+    conn.commit()
+
+
+def _get_extract_note(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    return _get_meta_value(conn, _extract_note_key(evidence_id))
+
+
+def _llm_input_text(text: str) -> str:
+    if len(text) <= MAX_LLM_TEXT_LENGTH:
+        return text
+    prefix = "以下内容较长,已截取前一部分。\n\n"
+    return prefix + text[: MAX_LLM_TEXT_LENGTH - len(prefix)]
+
+
+def _saved_original_detail(note: str) -> str:
+    note = note.rstrip("。")
+    return f"{note}。原件已完整保存。"
 
 
 def _export_timestamp() -> str:
@@ -442,6 +482,22 @@ def _get_parse_detail_map(conn: sqlite3.Connection, evidence_ids: Iterable[str])
     return result
 
 
+def _get_extract_note_map(conn: sqlite3.Connection, evidence_ids: Iterable[str]) -> dict[str, str | None]:
+    ids = [evidence_id for evidence_id in evidence_ids]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    keys = [_extract_note_key(evidence_id) for evidence_id in ids]
+    rows = conn.execute(
+        f"SELECT key, value FROM meta WHERE key IN ({placeholders})",
+        keys,
+    ).fetchall()
+    result = {row["key"].split(":", 1)[1]: row["value"] for row in rows}
+    for evidence_id in ids:
+        result.setdefault(evidence_id, None)
+    return result
+
+
 def _try_increment_meta_counter(conn: sqlite3.Connection, key: str, limit: int) -> bool:
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -531,7 +587,7 @@ def _run_parse_pipeline(
         context["counterpart"] = counterpart
 
     try:
-        parsed = llm.extract_slots(text, _today_str(), context=context)
+        parsed = llm.extract_slots(_llm_input_text(text), _today_str(), context=context)
     except Exception:
         parsed = None
     parsed = llm.normalize_slots(parsed)
@@ -622,6 +678,8 @@ def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, 
     platform, scene = source_label(row["source_hint"])
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
+    extracted_text = _extract_file_text(raw_text)
+    display_text = extracted_text if extracted_text is not None else raw_text
     return {
         "evidence_id": row["evidence_id"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
@@ -629,10 +687,12 @@ def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, 
         "platform_class": source_badge_class(platform),
         "scene": scene,
         "raw_text": raw_text,
-        "raw_text_preview": _truncate_text(raw_text),
-        "is_long_text": len(raw_text) > 100,
+        "display_text": display_text,
+        "raw_text_preview": _truncate_text(display_text),
+        "is_long_text": len(display_text) > 100,
         "parse_status": row["parse_status"],
         "parse_detail": row["parse_detail"],
+        "extract_note": row.get("extract_note"),
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
@@ -870,12 +930,14 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
     ).fetchall()
     parse_status_map = _get_parse_status_map(conn, [row["evidence_id"] for row in recent_rows])
     parse_detail_map = _get_parse_detail_map(conn, [row["evidence_id"] for row in recent_rows])
+    extract_note_map = _get_extract_note_map(conn, [row["evidence_id"] for row in recent_rows])
     verified_map = _get_verified_map(conn, [row["evidence_id"] for row in recent_rows])
     decorated_recent_rows = []
     for row in recent_rows:
         row_dict = dict(row)
         row_dict["parse_status"] = parse_status_map.get(row["evidence_id"], "failed")
         row_dict["parse_detail"] = parse_detail_map.get(row["evidence_id"])
+        row_dict["extract_note"] = extract_note_map.get(row["evidence_id"])
         row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
         decorated_recent_rows.append(row_dict)
     return {
@@ -951,7 +1013,9 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         return None
 
     platform, scene = source_label(row["source_hint"])
-    filename = _extract_filename(row["raw_text"])
+    raw_text = row["raw_text"] or ""
+    filename = _extract_filename(raw_text)
+    extracted_text = _extract_file_text(raw_text)
     return {
         "evidence_id": row["evidence_id"],
         "seq": row["seq"],
@@ -960,7 +1024,9 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "platform": platform,
         "platform_class": source_badge_class(platform),
         "scene": scene,
-        "raw_text": row["raw_text"] or "",
+        "raw_text": raw_text,
+        "display_text": extracted_text if extracted_text is not None else raw_text,
+        "extracted_text": extracted_text,
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
         "due_date_value": _format_datetime(row["slot_due"], "%Y-%m-%d"),
@@ -1093,6 +1159,7 @@ def create_app() -> FastAPI:
             if row is None:
                 raise HTTPException(status_code=404, detail="evidence not found")
             parse_status = _get_parse_status(conn, evidence_id)
+            parse_detail = _get_parse_detail(conn, evidence_id) or _get_extract_note(conn, evidence_id)
             return {
                 "parse_status": parse_status,
                 "slots_filled": row["slots_filled"],
@@ -1100,7 +1167,7 @@ def create_app() -> FastAPI:
                 "deliverable": row["slot_deliverable"],
                 "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
                 "caveats": _decode_json_array(row["caveats"]),
-                "detail": _get_parse_detail(conn, evidence_id),
+                "detail": parse_detail,
                 "is_verified": _is_verified(conn, evidence_id),
                 "media_type": row["media_type"],
             }
@@ -1284,7 +1351,7 @@ def create_app() -> FastAPI:
         status_conn = init_db(sandbox.db_path)
         try:
             parse_status = _get_parse_status(status_conn, evidence_id)
-            parse_detail = _get_parse_detail(status_conn, evidence_id)
+            parse_detail = _get_parse_detail(status_conn, evidence_id) or _get_extract_note(status_conn, evidence_id)
             is_verified = _is_verified(status_conn, evidence_id)
         finally:
             status_conn.close()
@@ -1454,13 +1521,28 @@ def create_app() -> FastAPI:
             raw_text_override = None
             parse_status = "pending"
             parse_detail = ""
+            extracted_for_parse = text
+            extract_note = None
             if file_bytes is not None and upload_media_type is not None:
                 _ensure_upload_budget(conn, sandbox.blobs_root, file_bytes)
                 media_type = upload_media_type
                 append_payload = file_bytes
-                raw_text_override = _build_file_label(upload.filename if upload is not None else None)
-                parse_status = "unsupported"
-                parse_detail = _unsupported_detail(media_type)
+                filename = upload.filename if upload is not None else None
+                raw_text_override = _build_file_label(filename)
+                if media_type == "image":
+                    parse_status = "unsupported"
+                    parse_detail = _unsupported_detail(media_type)
+                else:
+                    extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
+                    if extracted_text is not None:
+                        raw_text_override = f"{_build_file_label(filename)}\n\n{extracted_text}"
+                        extracted_for_parse = extracted_text
+                        parse_status = "pending"
+                        parse_detail = ""
+                    else:
+                        parse_status = "unsupported"
+                        extract_note = extract_status
+                        parse_detail = _saved_original_detail(extract_status)
 
             row = append_evidence(
                 conn,
@@ -1481,16 +1563,18 @@ def create_app() -> FastAPI:
                 row = dict(row)
             _set_parse_status(conn, row["evidence_id"], parse_status)
             _set_parse_detail(conn, row["evidence_id"], parse_detail)
+            if extract_note is not None:
+                _set_extract_note(conn, row["evidence_id"], extract_note)
         finally:
             conn.close()
 
-        if file_bytes is None:
+        if parse_status == "pending":
             background_tasks.add_task(
                 _run_parse_pipeline,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 row["evidence_id"],
-                text,
+                extracted_for_parse,
                 counterpart,
             )
 
