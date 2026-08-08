@@ -2225,6 +2225,8 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
         "latency_ms": 12,
         "model": "doubao-seed-2-0-lite-260215",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 20.0,
+        "thinking_mode": "disabled",
         "response_shape": {
             "top_level_keys": ["output_text"],
             "output_type": None,
@@ -2245,6 +2247,8 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
         "latency_ms": 34,
         "model": "doubao-seed-2-0-lite-260215",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 90.0,
+        "thinking_mode": "disabled",
         "response_shape": {
             "top_level_keys": ["output_text"],
             "output_type": None,
@@ -2368,6 +2372,8 @@ def test_ark_vision_diagnostic_returns_clear_failure_when_ark_key_missing(tmp_pa
     assert payload["ark_vision"]["extraction"] is None
     assert payload["ark_vision"]["text_preflight"]["stage"] == "config"
     assert payload["ark_vision"]["text_preflight"]["error_code"] == "not_configured"
+    assert payload["ark_vision"]["text_preflight"]["timeout_seconds"] == 20.0
+    assert payload["ark_vision"]["text_preflight"]["thinking_mode"] == "disabled"
     assert payload["ark_vision"]["diagnostic"] is None
 
 
@@ -2404,6 +2410,8 @@ def test_ark_vision_diagnostic_distinguishes_text_preflight_success_and_vision_f
         "latency_ms": 5,
         "model": "doubao-seed-2-0-lite-260215",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 20.0,
+        "thinking_mode": "disabled",
         "response_shape": {
             "top_level_keys": ["output_text"],
             "output_type": None,
@@ -2424,6 +2432,8 @@ def test_ark_vision_diagnostic_distinguishes_text_preflight_success_and_vision_f
         "latency_ms": 19,
         "model": "doubao-seed-2-0-lite-260215",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 90.0,
+        "thinking_mode": "disabled",
         "response_shape": {
             "top_level_keys": ["output_text"],
             "output_type": None,
@@ -2446,6 +2456,92 @@ def test_ark_vision_diagnostic_distinguishes_text_preflight_success_and_vision_f
     assert payload["ark_vision"]["extraction"] is None
     assert payload["ark_vision"]["text_preflight"]["success"] is True
     assert payload["ark_vision"]["diagnostic"]["stage"] == "model_json"
+    assert payload["ark_vision"]["diagnostic"]["timeout_seconds"] == 90.0
+    assert payload["ark_vision"]["diagnostic"]["thinking_mode"] == "disabled"
+
+
+def test_ark_vision_timeout_response_reports_visual_timeout_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_date": None,
+        "due_raw": None,
+        "direction": "none",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="ark-timeout.png")
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    preflight = {
+        "success": True,
+        "stage": "output_text",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-preflight",
+        "latency_ms": 4,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 20.0,
+        "thinking_mode": "disabled",
+        "response_shape": {
+            "top_level_keys": ["output_text"],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": "str",
+        },
+        "extraction": None,
+    }
+    diagnostic = {
+        "success": False,
+        "stage": "http",
+        "status_code": None,
+        "error_code": "timeout",
+        "error_type": "ReadTimeout",
+        "safe_message": "请求超过当前超时上限 90 秒",
+        "request_id": None,
+        "latency_ms": 90123,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "timeout_seconds": 90.0,
+        "thinking_mode": "disabled",
+        "response_shape": {
+            "top_level_keys": [],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": None,
+        },
+        "extraction": None,
+    }
+
+    with patch("app.main.vision_provider.diagnose_text_preflight", return_value=preflight):
+        with patch("app.main.vision_provider.diagnose_visual_evidence", return_value=diagnostic):
+            with client:
+                response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+
+    assert detail_response.status_code == 200
+    assert "超时上限" in detail_response.text
+    assert "Thinking" in detail_response.text
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["ark_vision"]["detail"] == "请求超过当前视觉超时上限 90 秒"
+    assert payload["ark_vision"]["diagnostic"]["error_code"] == "timeout"
+    assert payload["ark_vision"]["diagnostic"]["timeout_seconds"] == 90.0
+    assert payload["ark_vision"]["diagnostic"]["thinking_mode"] == "disabled"
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):

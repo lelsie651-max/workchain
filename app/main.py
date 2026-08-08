@@ -1488,6 +1488,11 @@ def _ark_diagnostic_detail(preflight: dict[str, Any], diagnostic: dict[str, Any]
         return "Ark 已正常返回,但 WorkChain 在 contract 阶段无法解析结果"
     if stage == "output_text":
         return "Ark 已正常返回,但 WorkChain 在 output_text 阶段找不到模型文本"
+    if stage == "http" and diagnostic.get("error_code") == "timeout":
+        timeout_seconds = diagnostic.get("timeout_seconds")
+        if isinstance(timeout_seconds, (int, float)):
+            return f"请求超过当前视觉超时上限 {timeout_seconds:g} 秒"
+        return "请求超过当前视觉超时上限"
     safe_message = diagnostic.get("safe_message")
     if isinstance(safe_message, str) and safe_message.strip():
         return safe_message

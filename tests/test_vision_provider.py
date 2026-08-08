@@ -27,6 +27,27 @@ class FakeResponse:
         return self._payload
 
 
+def test_ark_timeout_defaults_and_invalid_values_fallback(monkeypatch):
+    monkeypatch.delenv("ARK_TEXT_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("ARK_VISION_TIMEOUT_SECONDS", raising=False)
+
+    assert vision_provider.get_ark_text_timeout_seconds() == 20.0
+    assert vision_provider.get_ark_vision_timeout_seconds() == 90.0
+
+    monkeypatch.setenv("ARK_TEXT_TIMEOUT_SECONDS", "bad")
+    monkeypatch.setenv("ARK_VISION_TIMEOUT_SECONDS", "0")
+    assert vision_provider.get_ark_text_timeout_seconds() == 20.0
+    assert vision_provider.get_ark_vision_timeout_seconds() == 90.0
+
+
+def test_ark_timeout_env_overrides(monkeypatch):
+    monkeypatch.setenv("ARK_TEXT_TIMEOUT_SECONDS", "12.5")
+    monkeypatch.setenv("ARK_VISION_TIMEOUT_SECONDS", "120")
+
+    assert vision_provider.get_ark_text_timeout_seconds() == 12.5
+    assert vision_provider.get_ark_vision_timeout_seconds() == 120.0
+
+
 def test_diagnose_visual_evidence_reports_missing_key(monkeypatch):
     monkeypatch.delenv("ARK_API_KEY", raising=False)
 
@@ -39,6 +60,8 @@ def test_diagnose_visual_evidence_reports_missing_key(monkeypatch):
     assert result["error_type"] == "config"
     assert result["safe_message"] == "ARK_API_KEY 未设置"
     assert result["latency_ms"] == 0
+    assert result["timeout_seconds"] == 90.0
+    assert result["thinking_mode"] == "disabled"
     assert result["extraction"] is None
 
 
@@ -64,6 +87,8 @@ def test_diagnose_visual_evidence_reports_401(monkeypatch):
     assert result["error_type"] == "auth_error"
     assert result["safe_message"] == "bad key"
     assert result["request_id"] == "req-401"
+    assert result["timeout_seconds"] == 90.0
+    assert result["thinking_mode"] == "disabled"
 
 
 def test_diagnose_visual_evidence_reports_403(monkeypatch):
@@ -86,6 +111,8 @@ def test_diagnose_visual_evidence_reports_403(monkeypatch):
     assert result["error_code"] == "access_denied"
     assert result["error_type"] == "permission_error"
     assert result["safe_message"] == "not allowed"
+    assert result["timeout_seconds"] == 90.0
+    assert result["thinking_mode"] == "disabled"
 
 
 def test_diagnose_visual_evidence_reports_400_and_redacts_key_and_data_url(monkeypatch):
@@ -117,6 +144,7 @@ def test_diagnose_visual_evidence_reports_400_and_redacts_key_and_data_url(monke
     assert fake_key not in result["safe_message"]
     assert "base64" not in result["safe_message"]
     assert "[redacted]" in result["safe_message"]
+    assert result["timeout_seconds"] == 90.0
 
 
 def test_diagnose_visual_evidence_reports_timeout(monkeypatch):
@@ -134,7 +162,9 @@ def test_diagnose_visual_evidence_reports_timeout(monkeypatch):
     assert result["stage"] == "http"
     assert result["error_code"] == "timeout"
     assert result["error_type"] == "TimeoutException"
-    assert "超时" in result["safe_message"]
+    assert result["safe_message"] == "请求超过当前超时上限 90 秒"
+    assert result["timeout_seconds"] == 90.0
+    assert result["thinking_mode"] == "disabled"
 
 
 def test_diagnose_visual_evidence_reports_200_non_json_response(monkeypatch):
@@ -153,6 +183,7 @@ def test_diagnose_visual_evidence_reports_200_non_json_response(monkeypatch):
     assert result["status_code"] == 200
     assert result["error_code"] == "invalid_http_json"
     assert result["error_type"] == "JSONDecodeError"
+    assert result["timeout_seconds"] == 90.0
 
 
 def test_diagnose_visual_evidence_reports_missing_output_text(monkeypatch):
@@ -176,6 +207,7 @@ def test_diagnose_visual_evidence_reports_missing_output_text(monkeypatch):
     assert result["response_shape"]["output_type"] == "list"
     assert "dict" in result["response_shape"]["output_item_types"]
     assert "refusal" in result["response_shape"]["content_types"]
+    assert result["timeout_seconds"] == 90.0
 
 
 def test_diagnose_visual_evidence_reports_invalid_model_json(monkeypatch):
@@ -197,6 +229,7 @@ def test_diagnose_visual_evidence_reports_invalid_model_json(monkeypatch):
     assert result["error_code"] == "invalid_model_json"
     assert result["error_type"] == "JSONDecodeError"
     assert "model_json" in result["safe_message"]
+    assert result["timeout_seconds"] == 90.0
 
 
 def test_diagnose_visual_evidence_reports_invalid_contract(monkeypatch):
@@ -218,6 +251,7 @@ def test_diagnose_visual_evidence_reports_invalid_contract(monkeypatch):
     assert result["error_code"] == "invalid_contract"
     assert result["error_type"] == "contract_validation_failed"
     assert "contract" in result["safe_message"]
+    assert result["timeout_seconds"] == 90.0
 
 
 def test_diagnose_visual_evidence_successfully_normalizes_result(monkeypatch):
@@ -261,6 +295,8 @@ def test_diagnose_visual_evidence_successfully_normalizes_result(monkeypatch):
     assert result["stage"] == "contract"
     assert result["status_code"] == 200
     assert result["request_id"] == "req-ok"
+    assert result["timeout_seconds"] == 90.0
+    assert result["thinking_mode"] == "disabled"
     assert result["response_shape"]["top_level_keys"] == ["output_text"]
     assert result["extraction"] == {
         "transcript": "请周五前补齐渠道复盘数据",
@@ -277,8 +313,9 @@ def test_diagnose_visual_evidence_successfully_normalizes_result(monkeypatch):
     }
     assert captured["url"] == "https://ark.cn-beijing.volces.com/api/v3/responses"
     assert captured["headers"]["Authorization"] == "Bearer ark-test-key"
-    assert captured["timeout"] == vision_provider.ARK_TIMEOUT_SECONDS
+    assert captured["timeout"] == 90.0
     assert captured["json"]["model"] == "doubao-seed-2-0-lite-260215"
+    assert captured["json"]["thinking"] == {"type": "disabled"}
     assert captured["json"]["input"][0]["role"] == "system"
     assert "reaction 存在" in captured["json"]["input"][0]["content"][0]["text"]
     assert captured["json"]["input"][1]["content"][0]["type"] == "input_text"
@@ -292,6 +329,7 @@ def test_diagnose_text_preflight_uses_text_only_input(monkeypatch):
 
     def fake_post(*args, **kwargs):
         captured["json"] = kwargs["json"]
+        captured["timeout"] = kwargs["timeout"]
         return FakeResponse(status_code=200, payload={"output_text": "pong"})
 
     monkeypatch.setattr(vision_provider.httpx, "post", fake_post)
@@ -301,6 +339,9 @@ def test_diagnose_text_preflight_uses_text_only_input(monkeypatch):
     assert result["success"] is True
     assert result["stage"] == "output_text"
     assert result["status_code"] == 200
+    assert result["timeout_seconds"] == 20.0
+    assert result["thinking_mode"] == "disabled"
+    assert captured["json"]["thinking"] == {"type": "disabled"}
     assert captured["json"]["input"] == [
         {
             "role": "user",
@@ -312,6 +353,25 @@ def test_diagnose_text_preflight_uses_text_only_input(monkeypatch):
             ],
         }
     ]
+    assert captured["timeout"] == 20.0
+
+
+def test_text_and_vision_use_different_timeouts(monkeypatch):
+    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
+    captured_timeouts = []
+
+    def fake_post(*args, **kwargs):
+        captured_timeouts.append(kwargs["timeout"])
+        return FakeResponse(status_code=200, payload={"output_text": json.dumps({"transcript": "文字", "observations": [], "warnings": []}, ensure_ascii=False)})
+
+    monkeypatch.setattr(vision_provider.httpx, "post", fake_post)
+
+    preflight = vision_provider.diagnose_text_preflight()
+    vision = vision_provider.diagnose_visual_evidence(b"fake-image", "image/png")
+
+    assert preflight["timeout_seconds"] == 20.0
+    assert vision["timeout_seconds"] == 90.0
+    assert captured_timeouts == [20.0, 90.0]
 
 
 def test_extract_visual_evidence_remains_production_compatible(monkeypatch):

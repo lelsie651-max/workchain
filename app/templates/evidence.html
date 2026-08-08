@@ -351,6 +351,8 @@
                         <p>说明：${escapeHtml(item.safe_message || "无")}</p>
                         <p>Request ID：${escapeHtml(item.request_id || "无")}</p>
                         <p>Latency：${escapeHtml(item.latency_ms ?? "0")} ms</p>
+                        <p>超时上限：${escapeHtml(item.timeout_seconds ?? "无")} s</p>
+                        <p>Thinking：${escapeHtml(item.thinking_mode || "无")}</p>
                         <p>Model：${escapeHtml(item.model || "无")}</p>
                         <p>Base URL：${escapeHtml(item.base_url || "无")}</p>
                     </div>

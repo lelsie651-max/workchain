@@ -14,9 +14,13 @@ from evidence_core.extraction_contract import build_extraction_result
 
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_ARK_VISION_MODEL = "doubao-seed-2-0-lite-260215"
-ARK_TIMEOUT_SECONDS = 30.0
+DEFAULT_ARK_TEXT_TIMEOUT_SECONDS = 20.0
+DEFAULT_ARK_VISION_TIMEOUT_SECONDS = 90.0
+ARK_TEXT_TIMEOUT_ENV = "ARK_TEXT_TIMEOUT_SECONDS"
+ARK_VISION_TIMEOUT_ENV = "ARK_VISION_TIMEOUT_SECONDS"
 ARK_PROVIDER_NAME = "doubao-ark"
 ARK_RESPONSE_PATH = "/responses"
+ARK_THINKING_MODE = "disabled"
 
 VISION_SYSTEM_PROMPT = """你是 WorkChain 的 Visual Extraction 实验 provider。
 
@@ -57,6 +61,27 @@ def get_ark_base_url() -> str:
 
 def get_ark_vision_model() -> str:
     return os.getenv("ARK_VISION_MODEL", "").strip() or DEFAULT_ARK_VISION_MODEL
+
+
+def _timeout_from_env(env_name: str, default: float) -> float:
+    raw_value = os.getenv(env_name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return value
+
+
+def get_ark_text_timeout_seconds() -> float:
+    return _timeout_from_env(ARK_TEXT_TIMEOUT_ENV, DEFAULT_ARK_TEXT_TIMEOUT_SECONDS)
+
+
+def get_ark_vision_timeout_seconds() -> float:
+    return _timeout_from_env(ARK_VISION_TIMEOUT_ENV, DEFAULT_ARK_VISION_TIMEOUT_SECONDS)
 
 
 def _build_data_url(image_bytes: bytes, mime_type: str) -> str:
@@ -187,6 +212,7 @@ def _diagnostic_result(
     latency_ms: int,
     model: str,
     base_url: str,
+    timeout_seconds: float,
     status_code: int | None = None,
     error_code: str | None = None,
     error_type: str | None = None,
@@ -206,6 +232,8 @@ def _diagnostic_result(
         "latency_ms": latency_ms,
         "model": model,
         "base_url": base_url,
+        "timeout_seconds": timeout_seconds,
+        "thinking_mode": ARK_THINKING_MODE,
         "response_shape": response_shape if response_shape is not None else _empty_response_shape(),
         "extraction": extraction,
     }
@@ -215,6 +243,7 @@ def _call_ark_responses(
     input_payload: list[dict[str, Any]],
     *,
     expect_contract: bool,
+    timeout_seconds: float,
 ) -> dict[str, Any]:
     api_key = get_ark_api_key()
     base_url = get_ark_base_url().rstrip("/")
@@ -226,6 +255,7 @@ def _call_ark_responses(
             latency_ms=0,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             error_code="not_configured",
             error_type="config",
             safe_message="ARK_API_KEY 未设置",
@@ -241,9 +271,10 @@ def _call_ark_responses(
             },
             json={
                 "model": model,
+                "thinking": {"type": ARK_THINKING_MODE},
                 "input": input_payload,
             },
-            timeout=ARK_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
         )
     except httpx.TimeoutException as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -253,9 +284,10 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             error_code="timeout",
             error_type=type(exc).__name__,
-            safe_message="请求 Ark /responses 超时",
+            safe_message=f"请求超过当前超时上限 {timeout_seconds:g} 秒",
         )
     except httpx.RequestError as exc:
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -265,6 +297,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             error_code="network_error",
             error_type=type(exc).__name__,
             safe_message=f"无法连接 Ark /responses: {type(exc).__name__}",
@@ -277,6 +310,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             error_code="request_error",
             error_type=type(exc).__name__,
             safe_message=_redact_sensitive_text(str(exc), api_key) or type(exc).__name__,
@@ -299,6 +333,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             error_code=parsed_error_code or _status_error_code(status_code),
             error_type=parsed_error_type,
@@ -316,6 +351,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             error_code="invalid_http_json",
             error_type=type(exc).__name__,
@@ -332,6 +368,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             error_code="missing_output_text",
             error_type="missing_output_text",
@@ -347,6 +384,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             request_id=request_id,
             response_shape=response_shape,
@@ -360,6 +398,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             error_code="invalid_model_json",
             error_type="JSONDecodeError",
@@ -376,6 +415,7 @@ def _call_ark_responses(
             latency_ms=latency_ms,
             model=model,
             base_url=base_url,
+            timeout_seconds=timeout_seconds,
             status_code=status_code,
             error_code="invalid_contract",
             error_type="contract_validation_failed",
@@ -390,6 +430,7 @@ def _call_ark_responses(
         latency_ms=latency_ms,
         model=model,
         base_url=base_url,
+        timeout_seconds=timeout_seconds,
         status_code=status_code,
         request_id=request_id,
         response_shape=response_shape,
@@ -481,6 +522,7 @@ def diagnose_text_preflight() -> dict[str, Any]:
             }
         ],
         expect_contract=False,
+        timeout_seconds=get_ark_text_timeout_seconds(),
     )
 
 
@@ -511,6 +553,7 @@ def diagnose_visual_evidence(image_bytes: bytes, mime_type: str) -> dict[str, An
             },
         ],
         expect_contract=True,
+        timeout_seconds=get_ark_vision_timeout_seconds(),
     )
 
 
