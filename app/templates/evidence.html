@@ -141,6 +141,46 @@
                         <p>图片链路：{{ diagnostics.image_pipeline.actual_provider_label }} / {{ diagnostics.image_pipeline.actual_model }}</p>
                         <p>文本模型：{{ diagnostics.text_llm.provider_label }} / {{ diagnostics.text_llm.model }}</p>
                     </div>
+                    {% if evidence.is_image %}
+                    <div class="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                        <div class="flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                                <p class="text-sm text-slate-200">Visual A/B Diagnostics</p>
+                                <p class="text-xs leading-6 text-amber-200">实验结果,不会保存或影响当前记录。</p>
+                            </div>
+                            <button
+                                id="run-ark-vision-diagnostic"
+                                type="button"
+                                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            >
+                                用 Ark Vision 实验解析
+                            </button>
+                        </div>
+                        <div class="mt-4 grid gap-4 lg:grid-cols-2">
+                            <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                                <p class="text-xs uppercase tracking-wide text-slate-500">当前机器提取</p>
+                                {% if evidence.current_extraction %}
+                                <div class="mt-2 space-y-2 text-sm text-slate-300">
+                                    <p>{{ evidence.current_extraction.summary }}</p>
+                                    {% if evidence.current_extraction.created_at_text %}
+                                    <p class="text-xs text-slate-500">提取时间：{{ evidence.current_extraction.created_at_text }}</p>
+                                    {% endif %}
+                                    <p class="text-xs text-slate-500">文字长度：{{ (evidence.current_extraction.transcript or "")|length }} 字 · observations {{ evidence.current_extraction.observations|length }} 条</p>
+                                </div>
+                                <pre class="mt-3 max-h-[30vh] overflow-auto whitespace-pre-wrap text-xs leading-6 text-slate-200">{{ evidence.current_extraction.transcript or "当前无机器 transcript" }}</pre>
+                                {% else %}
+                                <p class="mt-2 text-sm text-slate-400">当前没有可对照的提取基线。</p>
+                                {% endif %}
+                            </div>
+                            <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+                                <p class="text-xs uppercase tracking-wide text-slate-500">Ark Vision 实验结果</p>
+                                <div id="ark-vision-result" class="mt-2 text-sm text-slate-300">
+                                    尚未运行。点击上方按钮后,这里会显示实验结果,用于和当前机器提取对照。
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% endif %}
                     <pre class="max-h-[40vh] overflow-auto whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{{ diagnostics_json }}</pre>
                 </div>
             </details>
@@ -250,6 +290,8 @@
         const ocrTextReadonly = document.getElementById("ocr-text-readonly");
         const ocrTextEditor = document.getElementById("ocr-text-editor");
         const ocrTextInput = document.getElementById("ocr-text-input");
+        const runArkVisionDiagnosticButton = document.getElementById("run-ark-vision-diagnostic");
+        const arkVisionResult = document.getElementById("ark-vision-result");
 
         const showFlash = (text, tone) => {
             flash.textContent = text;
@@ -269,6 +311,66 @@
             ocrTextEditor.classList.toggle("hidden", !open);
             ocrTextReadonly.classList.toggle("hidden", open);
             editOcrTextButton.classList.toggle("hidden", open);
+        };
+
+        const escapeHtml = (value) => {
+            return String(value)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll("\"", "&quot;")
+                .replaceAll("'", "&#39;");
+        };
+
+        const renderArkVisionResult = (payload) => {
+            if (!arkVisionResult) {
+                return;
+            }
+            const result = payload?.ark_vision || {};
+            const baseline = payload?.baseline || null;
+            const extraction = result.extraction || null;
+            if (!extraction) {
+                arkVisionResult.innerHTML = `
+                    <div class="space-y-2">
+                        <p class="text-sm text-red-200">状态：失败</p>
+                        <p class="text-xs leading-6 text-slate-400">${escapeHtml(result.detail || "Ark Vision 实验解析失败")}</p>
+                        ${baseline ? `<p class="text-xs leading-6 text-slate-500">基线：${escapeHtml(baseline.summary || "无")}<\/p>` : ""}
+                    </div>
+                `;
+                return;
+            }
+
+            const observations = Array.isArray(extraction.observations) ? extraction.observations : [];
+            const warnings = Array.isArray(extraction.warnings) ? extraction.warnings : [];
+            const observationHtml = observations.length
+                ? observations.map((item) => `<li>${escapeHtml(item.kind || "observation")}：${escapeHtml(item.content || "")}<\/li>`).join("")
+                : "<li>无 observations</li>";
+            const warningHtml = warnings.length
+                ? warnings.map((item) => `<li>${escapeHtml(item)}<\/li>`).join("")
+                : "<li>无 warnings</li>";
+            arkVisionResult.innerHTML = `
+                <div class="space-y-3">
+                    <div class="rounded-xl border border-cyan-400/20 bg-cyan-400/5 px-3 py-2 text-xs leading-6 text-slate-300">
+                        <p>状态：成功</p>
+                        <p>Provider：${escapeHtml(extraction.provider || "unknown")}</p>
+                        <p>Model：${escapeHtml(extraction.model || "unknown")}</p>
+                        ${baseline ? `<p>基线：${escapeHtml(baseline.summary || "无")}<\/p>` : ""}
+                    </div>
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Transcript</p>
+                        <pre class="mt-2 max-h-[20vh] overflow-auto whitespace-pre-wrap text-xs leading-6 text-slate-100">${escapeHtml(extraction.transcript || "无可见文字")}<\/pre>
+                    </div>
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Observations</p>
+                        <ul class="mt-2 space-y-2 text-xs leading-6 text-slate-300">${observationHtml}<\/ul>
+                    </div>
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">Warnings</p>
+                        <ul class="mt-2 space-y-2 text-xs leading-6 text-slate-300">${warningHtml}<\/ul>
+                    </div>
+                    <p class="text-xs leading-6 text-amber-200">${escapeHtml(result.detail || "实验结果仅供对照,不会保存或影响当前记录")}<\/p>
+                </div>
+            `;
         };
 
         const caveatRow = (value = "") => {
@@ -382,6 +484,33 @@
             } finally {
                 saveOcrTextButton.disabled = false;
                 saveOcrTextButton.classList.remove("opacity-60", "cursor-not-allowed");
+            }
+        });
+
+        runArkVisionDiagnosticButton?.addEventListener("click", async () => {
+            if (!arkVisionResult) {
+                return;
+            }
+            runArkVisionDiagnosticButton.disabled = true;
+            runArkVisionDiagnosticButton.classList.add("opacity-60", "cursor-not-allowed");
+            arkVisionResult.textContent = "正在运行 Ark Vision 实验解析…";
+            try {
+                const response = await fetch(`/api/evidence/${evidenceId}/diagnostics/ark-vision`, {
+                    method: "POST",
+                });
+                const payload = await response.json();
+                renderArkVisionResult(payload);
+                if (!response.ok) {
+                    showFlash(payload?.ark_vision?.detail || payload.detail || "Ark Vision 实验解析失败", "error");
+                    return;
+                }
+                showFlash("Ark Vision 实验结果已更新,不会保存到当前记录。", "success");
+            } catch (error) {
+                arkVisionResult.textContent = "Ark Vision 实验解析失败,请稍后再试。";
+                showFlash("Ark Vision 实验解析失败,请稍后再试", "error");
+            } finally {
+                runArkVisionDiagnosticButton.disabled = false;
+                runArkVisionDiagnosticButton.classList.remove("opacity-60", "cursor-not-allowed");
             }
         });
 

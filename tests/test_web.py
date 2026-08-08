@@ -196,6 +196,7 @@ def test_diag_llm_response_never_contains_api_key(tmp_path, monkeypatch):
 
 
 def test_diag_ocr_without_api_key_returns_configured_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -211,6 +212,7 @@ def test_diag_ocr_without_api_key_returns_configured_false(tmp_path, monkeypatch
 
 
 def test_diag_ocr_with_connection_error_returns_reachable_false_and_never_leaks_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     fake_key = "dashscope-visible-secret"
     monkeypatch.setenv("DASHSCOPE_API_KEY", fake_key)
     client, _, _ = _make_client(tmp_path, monkeypatch)
@@ -232,6 +234,16 @@ def test_diag_ocr_with_connection_error_returns_reachable_false_and_never_leaks_
     assert "无法连接图片识别服务:ConnectError" in payload["detail"]
     assert fake_key not in response.text
     assert fake_key not in payload["detail"]
+
+
+def test_diag_ocr_returns_404_when_diagnostics_disabled(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKCHAIN_DIAGNOSTICS", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/api/diag/ocr")
+
+    assert response.status_code == 404
 
 
 def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
@@ -2076,10 +2088,15 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
                 evidence_id = create_response.json()["evidence_id"]
                 detail_response = client.get(f"/evidence/{evidence_id}")
                 diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
+                ocr_diag_response = client.get("/api/diag/ocr")
+                ark_response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
 
     assert detail_response.status_code == 200
     assert "解析诊断" not in detail_response.text
+    assert "用 Ark Vision 实验解析" not in detail_response.text
     assert diag_response.status_code == 404
+    assert ocr_diag_response.status_code == 404
+    assert ark_response.status_code == 404
 
 
 def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, monkeypatch):
@@ -2110,6 +2127,7 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
 
     assert detail_response.status_code == 200
     assert "解析诊断" in detail_response.text
+    assert "用 Ark Vision 实验解析" in detail_response.text
     assert diag_response.status_code == 200
     payload = diag_response.json()
     assert payload["parse_status"] == "done"
@@ -2135,6 +2153,209 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     assert payload["extraction_history"][0]["created_at_text"]
     assert "原始识别文字" not in diag_response.text
     mock_vision.assert_not_called()
+
+
+def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="ark-diag.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        before = conn.execute(
+            """
+            SELECT raw_text, content_hash, chain_hash, blob_path
+            FROM evidence
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        before_extraction_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        before_parse_status = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (f"parse_status:{evidence_id}",),
+        ).fetchone()["value"]
+    finally:
+        conn.close()
+
+    expected_blob_bytes = (db_path.parent / "blobs" / before["blob_path"]).read_bytes()
+    ark_result = {
+        "transcript": "Ark 看到的文字",
+        "observations": [
+            {
+                "kind": "reaction",
+                "content": "有人对该消息显示👍反应,身份在画面中不可见",
+                "confidence": 0.68,
+            }
+        ],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": ["画面右上角有轻微遮挡"],
+    }
+
+    with patch("app.main.extract_image_evidence", return_value=ark_result) as mock_extract:
+        with patch("app.main._emit_structured_log") as mock_log:
+            with client:
+                response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["baseline"]["provider"] == "dashscope"
+    assert payload["baseline"]["summary"].startswith("机器提取")
+    assert payload["ark_vision"] == {
+        "status": "succeeded",
+        "detail": "Ark Vision 实验解析完成,结果仅供对照,不会保存或影响当前记录",
+        "extraction": ark_result,
+    }
+    assert "ark-test-key" not in response.text
+    assert "data:image/" not in response.text
+    assert str(db_path.parent) not in response.text
+
+    mock_extract.assert_called_once()
+    args, kwargs = mock_extract.call_args
+    assert args[0] == expected_blob_bytes
+    assert args[1] == "image/png"
+    assert kwargs == {"provider": "ark_vision"}
+    mock_log.assert_called_once()
+    assert mock_log.call_args.args[0] == "ark_vision_diagnostic"
+    assert mock_log.call_args.args[1]["evidence_id"] == evidence_id
+    assert mock_log.call_args.args[1]["provider"] == "doubao-ark"
+    assert mock_log.call_args.args[1]["status"] == "succeeded"
+    assert mock_log.call_args.args[1]["transcript_chars"] == len("Ark 看到的文字")
+    assert mock_log.call_args.args[1]["observation_count"] == 1
+    assert mock_log.call_args.args[1]["error_type"] is None
+
+    conn = init_db(db_path)
+    try:
+        after = conn.execute(
+            """
+            SELECT raw_text, content_hash, chain_hash
+            FROM evidence
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        after_extraction_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        after_parse_status = conn.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (f"parse_status:{evidence_id}",),
+        ).fetchone()["value"]
+        assert after["raw_text"] == before["raw_text"]
+        assert after["content_hash"] == before["content_hash"]
+        assert after["chain_hash"] == before["chain_hash"]
+        assert after_extraction_count == before_extraction_count
+        assert after_parse_status == before_parse_status
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_ark_vision_diagnostic_rejects_non_image_and_missing_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        text_response = client.post(
+            "/api/evidence",
+            json={"text": "只是文字", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        text_evidence_id = text_response.json()["evidence_id"]
+        non_image_response = client.post(f"/api/evidence/{text_evidence_id}/diagnostics/ark-vision")
+        missing_response = client.post("/api/evidence/ev_missing/diagnostics/ark-vision")
+
+    assert text_response.status_code == 200
+    assert non_image_response.status_code == 400
+    assert non_image_response.json()["detail"] == "只有图片记录支持 Ark Vision 实验解析"
+    assert missing_response.status_code == 404
+
+
+def test_ark_vision_diagnostic_returns_clear_failure_when_ark_key_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.delenv("ARK_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_date": None,
+        "due_raw": None,
+        "direction": "none",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="ark-no-key.png")
+                evidence_id = create_response.json()["evidence_id"]
+                response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload["ark_vision"]["status"] == "failed"
+    assert payload["ark_vision"]["detail"] == "Ark Vision 未配置(ARK_API_KEY 未设置)"
+    assert payload["ark_vision"]["extraction"] is None
+
+
+def test_ark_vision_diagnostic_returns_clear_failure_when_provider_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_date": None,
+        "due_raw": None,
+        "direction": "none",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="ark-provider-fail.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    with patch("app.main.extract_image_evidence", return_value=None):
+        with client:
+            response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+
+    assert response.status_code == 502
+    payload = response.json()
+    assert payload["ark_vision"]["status"] == "failed"
+    assert payload["ark_vision"]["detail"] == "Ark Vision 实验解析失败"
+    assert payload["ark_vision"]["extraction"] is None
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):

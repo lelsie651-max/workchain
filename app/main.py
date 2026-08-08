@@ -24,7 +24,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import llm, ocr
+from app import llm, ocr, vision_provider
+from app.evidence_extractor import ARK_VISION_EXTRACTION_PROVIDER, extract_image_evidence
 from app.extract import extract_image_text_with_metadata, extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
@@ -1319,8 +1320,16 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
     extracted_text = _extract_file_text(raw_text)
-    extraction_history = [_format_extraction_item(item) for item in list_extractions(conn, evidence_id)]
-    current_extraction = extraction_history[-1] if extraction_history else None
+    raw_extractions = list_extractions(conn, evidence_id)
+    extraction_history = [_format_extraction_item(item) for item in raw_extractions]
+    current_extraction = None
+    if raw_extractions:
+        latest_extraction = raw_extractions[-1]
+        current_extraction = {
+            **_format_extraction_item(latest_extraction),
+            "transcript": latest_extraction.get("transcript"),
+            "observations": latest_extraction.get("observations") if isinstance(latest_extraction.get("observations"), list) else [],
+        }
     return {
         "evidence_id": row["evidence_id"],
         "seq": row["seq"],
@@ -1387,6 +1396,77 @@ def _build_evidence_diagnostics(
             "model": llm.get_deepseek_model(),
         },
     }
+
+
+def _build_extraction_baseline_summary(extraction: dict[str, Any] | None) -> dict[str, Any] | None:
+    if extraction is None:
+        return None
+    created_at = extraction.get("created_at")
+    created_at_text = _format_datetime(created_at, "%Y-%m-%d %H:%M:%S") if isinstance(created_at, int) else None
+    provider = extraction.get("provider")
+    model = extraction.get("model")
+    observations = extraction.get("observations")
+    normalized_observations = observations if isinstance(observations, list) else []
+    return {
+        "origin": extraction.get("origin"),
+        "origin_label": _extraction_origin_label(extraction.get("origin")),
+        "provider": provider,
+        "provider_label": _provider_label(provider),
+        "model": model,
+        "created_at": created_at,
+        "created_at_text": created_at_text,
+        "summary": _format_extraction_item(extraction)["summary"],
+        "transcript_chars": len(extraction.get("transcript") or ""),
+        "observation_count": len(normalized_observations),
+    }
+
+
+def _ark_diagnostic_response(
+    *,
+    baseline: dict[str, Any] | None,
+    status: str,
+    detail: str,
+    extraction: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "baseline": baseline,
+        "ark_vision": {
+            "status": status,
+            "detail": detail,
+            "extraction": extraction,
+        },
+    }
+
+
+def _log_ark_diagnostic_attempt(
+    *,
+    evidence_id: str,
+    model: str | None,
+    status: str,
+    latency_ms: int,
+    extraction: dict[str, Any] | None = None,
+    error_type: str | None = None,
+) -> None:
+    observations = []
+    transcript = None
+    if extraction is not None:
+        maybe_observations = extraction.get("observations")
+        if isinstance(maybe_observations, list):
+            observations = maybe_observations
+        transcript = extraction.get("transcript")
+    _emit_structured_log(
+        "ark_vision_diagnostic",
+        {
+            "evidence_id": evidence_id,
+            "provider": vision_provider.ARK_PROVIDER_NAME,
+            "model": model,
+            "status": status,
+            "latency_ms": latency_ms,
+            "transcript_chars": len(transcript or ""),
+            "observation_count": len(observations),
+            "error_type": error_type,
+        },
+    )
 
 
 def create_app() -> FastAPI:
@@ -1486,7 +1566,101 @@ def create_app() -> FastAPI:
 
     @app.get("/api/diag/ocr")
     def diag_ocr() -> dict[str, Any]:
+        if not _diagnostics_enabled():
+            raise HTTPException(status_code=404, detail="diagnostics disabled")
         return ocr.diagnose_ocr()
+
+    @app.post("/api/evidence/{evidence_id}/diagnostics/ark-vision")
+    def evidence_ark_vision_diagnostic(
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        if not _diagnostics_enabled():
+            raise HTTPException(status_code=404, detail="diagnostics disabled")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            evidence = _fetch_evidence_detail(conn, evidence_id)
+            if evidence is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if evidence["media_type"] != "image":
+                raise HTTPException(status_code=400, detail="只有图片记录支持 Ark Vision 实验解析")
+            if not evidence["blob_path"]:
+                raise HTTPException(status_code=404, detail="blob not found")
+
+            blob_path = sandbox.blobs_root / evidence["blob_path"]
+            if not blob_path.exists():
+                raise HTTPException(status_code=404, detail="blob not found")
+
+            latest_extraction = get_latest_extraction(conn, evidence_id)
+            baseline = _build_extraction_baseline_summary(latest_extraction)
+        finally:
+            conn.close()
+
+        image_bytes = blob_path.read_bytes()
+        mime_type = _detect_blob_content_type(image_bytes, evidence.get("filename"))
+        model = vision_provider.get_ark_vision_model()
+
+        if not vision_provider.get_ark_api_key():
+            _log_ark_diagnostic_attempt(
+                evidence_id=evidence_id,
+                model=model,
+                status="failed",
+                latency_ms=0,
+                error_type="not_configured",
+            )
+            return JSONResponse(
+                status_code=503,
+                content=_ark_diagnostic_response(
+                    baseline=baseline,
+                    status="failed",
+                    detail="Ark Vision 未配置(ARK_API_KEY 未设置)",
+                    extraction=None,
+                ),
+            )
+
+        start = time.perf_counter()
+        extraction = extract_image_evidence(
+            image_bytes,
+            mime_type,
+            provider=ARK_VISION_EXTRACTION_PROVIDER,
+        )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
+        if extraction is None:
+            _log_ark_diagnostic_attempt(
+                evidence_id=evidence_id,
+                model=model,
+                status="failed",
+                latency_ms=latency_ms,
+                error_type="provider_failure",
+            )
+            return JSONResponse(
+                status_code=502,
+                content=_ark_diagnostic_response(
+                    baseline=baseline,
+                    status="failed",
+                    detail="Ark Vision 实验解析失败",
+                    extraction=None,
+                ),
+            )
+
+        _log_ark_diagnostic_attempt(
+            evidence_id=evidence_id,
+            model=extraction.get("model"),
+            status="succeeded",
+            latency_ms=latency_ms,
+            extraction=extraction,
+            error_type=None,
+        )
+        return JSONResponse(
+            _ark_diagnostic_response(
+                baseline=baseline,
+                status="succeeded",
+                detail="Ark Vision 实验解析完成,结果仅供对照,不会保存或影响当前记录",
+                extraction=extraction,
+            )
+        )
 
     @app.get("/api/evidence/{evidence_id}/diagnostics")
     def evidence_diagnostics(

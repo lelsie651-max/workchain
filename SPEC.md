@@ -508,6 +508,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - PDF 导出
 - 完整举证包 zip 导出(全链)
 - `/api/diag/llm` 与 `/api/diag/ocr` 连通性自检
+- diagnostics-only Visual A/B Diagnostics:可对同一图片 Evidence 临时运行 Ark Vision,与当前 machine extraction 做只读对照,结果不落库不改状态
 
 ### 下一阶段
 - TSA/外部时间锚点,进一步补强 checkpoint 之后的链尾截断问题
@@ -533,6 +534,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | V3 为 facts 增加 `due_anchor_at / event_assignment_confidence / origin / review_status` | 加固相对日期换算语义,拆分事件归属置信度,并为用户确认/修正预留保护状态 |
 | 2026-08-08 | V4 新增 `evidence_extractions`,将提取层显式化为 `Evidence -> Extraction -> Fact` | 为 OCR / 文档提取 / 人工校正提供可追溯版本历史,同时保持 `raw_text` 兼容层不变 |
 | 2026-08-08 | 新增实验 Visual Provider 边界,production 默认仍为 OCR | 为本地评测和未来多模态能力预留接口,但不改变线上默认图片提取链路 |
+| 2026-08-08 | diagnostics 入口加开关保护,并新增 Ark Vision 只读实验对照接口 | 避免真实模型调用裸露对外,同时支持同 Evidence 的安全 A/B 视觉提取诊断 |
 
 ---
 
