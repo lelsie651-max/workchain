@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
+import time
 from typing import Any
 
 import httpx
@@ -42,6 +44,7 @@ VISION_SYSTEM_PROMPT = """你是 WorkChain 的 Visual Extraction 实验 provider
 """
 
 VISION_USER_PROMPT = """请基于图片做提取,返回 transcript + observations + warnings 的 JSON。"""
+ARK_TEXT_PREFLIGHT_PROMPT = "ping"
 
 
 def get_ark_api_key() -> str:
@@ -59,6 +62,339 @@ def get_ark_vision_model() -> str:
 def _build_data_url(image_bytes: bytes, mime_type: str) -> str:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _redact_sensitive_text(value: Any, api_key: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if api_key:
+        text = text.replace(api_key, "[redacted]")
+    text = re.sub(r"Bearer\s+[A-Za-z0-9._\-]+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(r"data:[^;]+;base64,[A-Za-z0-9+/=]+", "data:[redacted]", text)
+    if len(text) > 300:
+        text = f"{text[:300]}..."
+    return text
+
+
+def _coerce_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _empty_response_shape() -> dict[str, Any]:
+    return {
+        "top_level_keys": [],
+        "output_type": None,
+        "output_item_types": [],
+        "content_types": [],
+        "output_text_type": None,
+    }
+
+
+def _build_response_shape(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return _empty_response_shape()
+
+    output_item_types: list[str] = []
+    content_types: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            output_item_types.append(type(item).__name__)
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for content_item in content:
+                if not isinstance(content_item, dict):
+                    content_types.append(type(content_item).__name__)
+                    continue
+                content_types.append(_coerce_text(content_item.get("type")) or "dict")
+
+    return {
+        "top_level_keys": sorted(str(key) for key in payload.keys()),
+        "output_type": type(output).__name__ if output is not None else None,
+        "output_item_types": output_item_types,
+        "content_types": content_types,
+        "output_text_type": type(payload.get("output_text")).__name__ if "output_text" in payload else None,
+    }
+
+
+def _request_id_from_response(response: Any) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    for key in ("x-request-id", "request-id", "x-tt-logid", "x-ark-request-id"):
+        try:
+            value = headers.get(key)
+        except Exception:
+            value = None
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _http_error_details(payload: Any, api_key: str) -> tuple[str | None, str | None, str | None]:
+    if not isinstance(payload, dict):
+        return None, None, None
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = _coerce_text(error.get("code")) or _coerce_text(payload.get("code"))
+        error_type = _coerce_text(error.get("type")) or _coerce_text(payload.get("type"))
+        message = (
+            _coerce_text(error.get("message"))
+            or _coerce_text(error.get("msg"))
+            or _coerce_text(payload.get("message"))
+            or _coerce_text(payload.get("msg"))
+        )
+        return code, error_type, _redact_sensitive_text(message, api_key)
+
+    code = _coerce_text(payload.get("code"))
+    error_type = _coerce_text(payload.get("type"))
+    message = _coerce_text(payload.get("message")) or _coerce_text(payload.get("msg"))
+    return code, error_type, _redact_sensitive_text(message, api_key)
+
+
+def _status_error_code(status_code: int | None) -> str | None:
+    if status_code is None:
+        return None
+    if status_code == 400:
+        return "bad_request"
+    if status_code == 401:
+        return "unauthorized"
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 429:
+        return "rate_limited"
+    if status_code >= 500:
+        return "server_error"
+    return f"http_{status_code}"
+
+
+def _diagnostic_result(
+    *,
+    success: bool,
+    stage: str,
+    latency_ms: int,
+    model: str,
+    base_url: str,
+    status_code: int | None = None,
+    error_code: str | None = None,
+    error_type: str | None = None,
+    safe_message: str | None = None,
+    request_id: str | None = None,
+    response_shape: dict[str, Any] | None = None,
+    extraction: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "success": success,
+        "stage": stage,
+        "status_code": status_code,
+        "error_code": error_code,
+        "error_type": error_type,
+        "safe_message": safe_message,
+        "request_id": request_id,
+        "latency_ms": latency_ms,
+        "model": model,
+        "base_url": base_url,
+        "response_shape": response_shape if response_shape is not None else _empty_response_shape(),
+        "extraction": extraction,
+    }
+
+
+def _call_ark_responses(
+    input_payload: list[dict[str, Any]],
+    *,
+    expect_contract: bool,
+) -> dict[str, Any]:
+    api_key = get_ark_api_key()
+    base_url = get_ark_base_url().rstrip("/")
+    model = get_ark_vision_model()
+    if not api_key:
+        return _diagnostic_result(
+            success=False,
+            stage="config",
+            latency_ms=0,
+            model=model,
+            base_url=base_url,
+            error_code="not_configured",
+            error_type="config",
+            safe_message="ARK_API_KEY 未设置",
+        )
+
+    start = time.perf_counter()
+    try:
+        response = httpx.post(
+            f"{base_url}{ARK_RESPONSE_PATH}",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "input": input_payload,
+            },
+            timeout=ARK_TIMEOUT_SECONDS,
+        )
+    except httpx.TimeoutException as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return _diagnostic_result(
+            success=False,
+            stage="http",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            error_code="timeout",
+            error_type=type(exc).__name__,
+            safe_message="请求 Ark /responses 超时",
+        )
+    except httpx.RequestError as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return _diagnostic_result(
+            success=False,
+            stage="http",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            error_code="network_error",
+            error_type=type(exc).__name__,
+            safe_message=f"无法连接 Ark /responses: {type(exc).__name__}",
+        )
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        return _diagnostic_result(
+            success=False,
+            stage="http",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            error_code="request_error",
+            error_type=type(exc).__name__,
+            safe_message=_redact_sensitive_text(str(exc), api_key) or type(exc).__name__,
+        )
+
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    status_code = getattr(response, "status_code", None)
+    request_id = _request_id_from_response(response)
+
+    if status_code != 200:
+        payload = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        parsed_error_code, parsed_error_type, safe_message = _http_error_details(payload, api_key)
+        return _diagnostic_result(
+            success=False,
+            stage="http",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            error_code=parsed_error_code or _status_error_code(status_code),
+            error_type=parsed_error_type,
+            safe_message=safe_message or f"Ark /responses 返回 HTTP {status_code}",
+            request_id=request_id,
+            response_shape=_build_response_shape(payload),
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        return _diagnostic_result(
+            success=False,
+            stage="response_json",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            error_code="invalid_http_json",
+            error_type=type(exc).__name__,
+            safe_message="Ark 返回了 200,但响应体不是合法 JSON",
+            request_id=request_id,
+        )
+
+    response_shape = _build_response_shape(payload)
+    output_text = _extract_text_from_output(payload)
+    if output_text is None:
+        return _diagnostic_result(
+            success=False,
+            stage="output_text",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            error_code="missing_output_text",
+            error_type="missing_output_text",
+            safe_message="Ark 已正常返回,但响应中找不到可解析的 output text",
+            request_id=request_id,
+            response_shape=response_shape,
+        )
+
+    if not expect_contract:
+        return _diagnostic_result(
+            success=True,
+            stage="output_text",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            request_id=request_id,
+            response_shape=response_shape,
+        )
+
+    parsed = _parse_json_text(output_text)
+    if parsed is None:
+        return _diagnostic_result(
+            success=False,
+            stage="model_json",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            error_code="invalid_model_json",
+            error_type="JSONDecodeError",
+            safe_message="Ark 已正常返回,但 WorkChain 在 model_json 阶段无法解析结果",
+            request_id=request_id,
+            response_shape=response_shape,
+        )
+
+    extraction = _normalize_visual_result(parsed)
+    if extraction is None or (extraction["transcript"] is None and not extraction["observations"]):
+        return _diagnostic_result(
+            success=False,
+            stage="contract",
+            latency_ms=latency_ms,
+            model=model,
+            base_url=base_url,
+            status_code=status_code,
+            error_code="invalid_contract",
+            error_type="contract_validation_failed",
+            safe_message="Ark 已正常返回,但 WorkChain 在 contract 阶段无法解析结果",
+            request_id=request_id,
+            response_shape=response_shape,
+        )
+
+    return _diagnostic_result(
+        success=True,
+        stage="contract",
+        latency_ms=latency_ms,
+        model=model,
+        base_url=base_url,
+        status_code=status_code,
+        request_id=request_id,
+        response_shape=response_shape,
+        extraction=extraction,
+    )
 
 
 def _extract_text_from_output(payload: Any) -> str | None:
@@ -131,52 +467,55 @@ def _normalize_visual_result(payload: Any) -> dict[str, Any] | None:
     )
 
 
-def extract_visual_evidence(image_bytes: bytes, mime_type: str) -> dict[str, Any] | None:
-    api_key = get_ark_api_key()
-    if not api_key:
-        return None
-
-    try:
-        response = httpx.post(
-            f"{get_ark_base_url().rstrip('/')}{ARK_RESPONSE_PATH}",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": get_ark_vision_model(),
-                "input": [
+def diagnose_text_preflight() -> dict[str, Any]:
+    return _call_ark_responses(
+        [
+            {
+                "role": "user",
+                "content": [
                     {
-                        "role": "system",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": VISION_SYSTEM_PROMPT,
-                            }
-                        ],
+                        "type": "input_text",
+                        "text": ARK_TEXT_PREFLIGHT_PROMPT,
+                    }
+                ],
+            }
+        ],
+        expect_contract=False,
+    )
+
+
+def diagnose_visual_evidence(image_bytes: bytes, mime_type: str) -> dict[str, Any]:
+    return _call_ark_responses(
+        [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": VISION_SYSTEM_PROMPT,
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": VISION_USER_PROMPT,
                     },
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": VISION_USER_PROMPT,
-                            },
-                            {
-                                "type": "input_image",
-                                "image_url": _build_data_url(image_bytes, mime_type),
-                            },
-                        ],
+                        "type": "input_image",
+                        "image_url": _build_data_url(image_bytes, mime_type),
                     },
                 ],
             },
-            timeout=ARK_TIMEOUT_SECONDS,
-        )
-        if response.status_code != 200:
-            return None
+        ],
+        expect_contract=True,
+    )
 
-        payload = response.json()
-        parsed = _parse_json_text(_extract_text_from_output(payload))
-        return _normalize_visual_result(parsed)
-    except Exception:
+
+def extract_visual_evidence(image_bytes: bytes, mime_type: str) -> dict[str, Any] | None:
+    diagnostic = diagnose_visual_evidence(image_bytes, mime_type)
+    if not diagnostic["success"]:
         return None
+    return diagnostic["extraction"]

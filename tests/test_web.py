@@ -2214,11 +2214,52 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
         "model": "doubao-seed-2-0-lite-260215",
         "warnings": ["画面右上角有轻微遮挡"],
     }
+    preflight = {
+        "success": True,
+        "stage": "output_text",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-preflight",
+        "latency_ms": 12,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "response_shape": {
+            "top_level_keys": ["output_text"],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": "str",
+        },
+        "extraction": None,
+    }
+    diagnostic = {
+        "success": True,
+        "stage": "contract",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-vision",
+        "latency_ms": 34,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "response_shape": {
+            "top_level_keys": ["output_text"],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": "str",
+        },
+        "extraction": ark_result,
+    }
 
-    with patch("app.main.extract_image_evidence", return_value=ark_result) as mock_extract:
-        with patch("app.main._emit_structured_log") as mock_log:
-            with client:
-                response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+    with patch("app.main.vision_provider.diagnose_text_preflight", return_value=preflight) as mock_preflight:
+        with patch("app.main.vision_provider.diagnose_visual_evidence", return_value=diagnostic) as mock_vision:
+            with patch("app.main._emit_structured_log") as mock_log:
+                with client:
+                    response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
 
     assert response.status_code == 200
     payload = response.json()
@@ -2228,16 +2269,18 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
         "status": "succeeded",
         "detail": "Ark Vision 实验解析完成,结果仅供对照,不会保存或影响当前记录",
         "extraction": ark_result,
+        "text_preflight": preflight,
+        "diagnostic": diagnostic,
     }
     assert "ark-test-key" not in response.text
     assert "data:image/" not in response.text
     assert str(db_path.parent) not in response.text
 
-    mock_extract.assert_called_once()
-    args, kwargs = mock_extract.call_args
-    assert args[0] == expected_blob_bytes
-    assert args[1] == "image/png"
-    assert kwargs == {"provider": "ark_vision"}
+    mock_preflight.assert_called_once_with()
+    mock_vision.assert_called_once()
+    args, kwargs = mock_vision.call_args
+    assert args == (expected_blob_bytes, "image/png")
+    assert kwargs == {}
     mock_log.assert_called_once()
     assert mock_log.call_args.args[0] == "ark_vision_diagnostic"
     assert mock_log.call_args.args[1]["evidence_id"] == evidence_id
@@ -2321,11 +2364,14 @@ def test_ark_vision_diagnostic_returns_clear_failure_when_ark_key_missing(tmp_pa
     assert response.status_code == 503
     payload = response.json()
     assert payload["ark_vision"]["status"] == "failed"
-    assert payload["ark_vision"]["detail"] == "Ark Vision 未配置(ARK_API_KEY 未设置)"
+    assert payload["ark_vision"]["detail"] == "Ark text preflight 失败,优先排查 Key、Base URL、模型配置或模型开通状态。"
     assert payload["ark_vision"]["extraction"] is None
+    assert payload["ark_vision"]["text_preflight"]["stage"] == "config"
+    assert payload["ark_vision"]["text_preflight"]["error_code"] == "not_configured"
+    assert payload["ark_vision"]["diagnostic"] is None
 
 
-def test_ark_vision_diagnostic_returns_clear_failure_when_provider_fails(tmp_path, monkeypatch):
+def test_ark_vision_diagnostic_distinguishes_text_preflight_success_and_vision_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("ARK_API_KEY", "ark-test-key")
@@ -2347,15 +2393,59 @@ def test_ark_vision_diagnostic_returns_clear_failure_when_provider_fails(tmp_pat
                 create_response = _upload_png(client, filename="ark-provider-fail.png")
                 evidence_id = create_response.json()["evidence_id"]
 
-    with patch("app.main.extract_image_evidence", return_value=None):
-        with client:
-            response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+    preflight = {
+        "success": True,
+        "stage": "output_text",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-preflight",
+        "latency_ms": 5,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "response_shape": {
+            "top_level_keys": ["output_text"],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": "str",
+        },
+        "extraction": None,
+    }
+    diagnostic = {
+        "success": False,
+        "stage": "model_json",
+        "status_code": 200,
+        "error_code": "invalid_model_json",
+        "error_type": "JSONDecodeError",
+        "safe_message": "Ark 已正常返回,但 WorkChain 在 model_json 阶段无法解析结果",
+        "request_id": "req-vision",
+        "latency_ms": 19,
+        "model": "doubao-seed-2-0-lite-260215",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "response_shape": {
+            "top_level_keys": ["output_text"],
+            "output_type": None,
+            "output_item_types": [],
+            "content_types": [],
+            "output_text_type": "str",
+        },
+        "extraction": None,
+    }
+
+    with patch("app.main.vision_provider.diagnose_text_preflight", return_value=preflight):
+        with patch("app.main.vision_provider.diagnose_visual_evidence", return_value=diagnostic):
+            with client:
+                response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
 
     assert response.status_code == 502
     payload = response.json()
     assert payload["ark_vision"]["status"] == "failed"
-    assert payload["ark_vision"]["detail"] == "Ark Vision 实验解析失败"
+    assert payload["ark_vision"]["detail"] == "Ark 已正常返回,但 WorkChain 在 model_json 阶段无法解析结果"
     assert payload["ark_vision"]["extraction"] is None
+    assert payload["ark_vision"]["text_preflight"]["success"] is True
+    assert payload["ark_vision"]["diagnostic"]["stage"] == "model_json"
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):

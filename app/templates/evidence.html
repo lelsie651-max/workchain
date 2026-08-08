@@ -328,13 +328,42 @@
             }
             const result = payload?.ark_vision || {};
             const baseline = payload?.baseline || null;
+            const preflight = result.text_preflight || null;
+            const diagnostic = result.diagnostic || null;
             const extraction = result.extraction || null;
+            const diagnosticBlock = (title, item, fallbackText) => {
+                if (!item) {
+                    return `
+                        <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-300">
+                            <p>${escapeHtml(title)}</p>
+                            <p class="text-slate-500">${escapeHtml(fallbackText)}</p>
+                        </div>
+                    `;
+                }
+                return `
+                    <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-300">
+                        <p class="text-slate-200">${escapeHtml(title)}</p>
+                        <p>连接测试：${item.success ? "成功" : "失败"}</p>
+                        <p>阶段：${escapeHtml(item.stage || "无")}</p>
+                        <p>HTTP：${escapeHtml(item.status_code ?? "无")}</p>
+                        <p>错误代码：${escapeHtml(item.error_code || "无")}</p>
+                        <p>错误类型：${escapeHtml(item.error_type || "无")}</p>
+                        <p>说明：${escapeHtml(item.safe_message || "无")}</p>
+                        <p>Request ID：${escapeHtml(item.request_id || "无")}</p>
+                        <p>Latency：${escapeHtml(item.latency_ms ?? "0")} ms</p>
+                        <p>Model：${escapeHtml(item.model || "无")}</p>
+                        <p>Base URL：${escapeHtml(item.base_url || "无")}</p>
+                    </div>
+                `;
+            };
             if (!extraction) {
                 arkVisionResult.innerHTML = `
-                    <div class="space-y-2">
+                    <div class="space-y-3">
                         <p class="text-sm text-red-200">状态：失败</p>
                         <p class="text-xs leading-6 text-slate-400">${escapeHtml(result.detail || "Ark Vision 实验解析失败")}</p>
                         ${baseline ? `<p class="text-xs leading-6 text-slate-500">基线：${escapeHtml(baseline.summary || "无")}<\/p>` : ""}
+                        ${diagnosticBlock("连接测试 / text preflight", preflight, "未执行")}
+                        ${diagnosticBlock("图片实验请求 / vision", diagnostic, preflight?.success ? "未返回图片诊断结果" : "由于连接测试失败,未执行图片实验解析")}
                     </div>
                 `;
                 return;
@@ -356,6 +385,8 @@
                         <p>Model：${escapeHtml(extraction.model || "unknown")}</p>
                         ${baseline ? `<p>基线：${escapeHtml(baseline.summary || "无")}<\/p>` : ""}
                     </div>
+                    ${diagnosticBlock("连接测试 / text preflight", preflight, "未执行")}
+                    ${diagnosticBlock("图片实验请求 / vision", diagnostic, "未执行")}
                     <div>
                         <p class="text-xs uppercase tracking-wide text-slate-500">Transcript</p>
                         <pre class="mt-2 max-h-[20vh] overflow-auto whitespace-pre-wrap text-xs leading-6 text-slate-100">${escapeHtml(extraction.transcript || "无可见文字")}<\/pre>

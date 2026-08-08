@@ -25,7 +25,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm, ocr, vision_provider
-from app.evidence_extractor import ARK_VISION_EXTRACTION_PROVIDER, extract_image_evidence
 from app.extract import extract_image_text_with_metadata, extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
@@ -1427,6 +1426,8 @@ def _ark_diagnostic_response(
     status: str,
     detail: str,
     extraction: dict[str, Any] | None,
+    text_preflight: dict[str, Any] | None,
+    diagnostic: dict[str, Any] | None,
 ) -> dict[str, Any]:
     return {
         "baseline": baseline,
@@ -1434,6 +1435,8 @@ def _ark_diagnostic_response(
             "status": status,
             "detail": detail,
             "extraction": extraction,
+            "text_preflight": text_preflight,
+            "diagnostic": diagnostic,
         },
     }
 
@@ -1467,6 +1470,38 @@ def _log_ark_diagnostic_attempt(
             "error_type": error_type,
         },
     )
+
+
+def _ark_diagnostic_detail(preflight: dict[str, Any], diagnostic: dict[str, Any] | None) -> str:
+    if not preflight.get("success"):
+        return (
+            "Ark text preflight 失败,优先排查 Key、Base URL、模型配置或模型开通状态。"
+        )
+    if diagnostic is None:
+        return "Ark text preflight 成功,但未执行图片实验解析。"
+    if diagnostic.get("success"):
+        return "Ark Vision 实验解析完成,结果仅供对照,不会保存或影响当前记录"
+    stage = diagnostic.get("stage")
+    if stage == "model_json":
+        return "Ark 已正常返回,但 WorkChain 在 model_json 阶段无法解析结果"
+    if stage == "contract":
+        return "Ark 已正常返回,但 WorkChain 在 contract 阶段无法解析结果"
+    if stage == "output_text":
+        return "Ark 已正常返回,但 WorkChain 在 output_text 阶段找不到模型文本"
+    safe_message = diagnostic.get("safe_message")
+    if isinstance(safe_message, str) and safe_message.strip():
+        return safe_message
+    return "Ark Vision 实验解析失败"
+
+
+def _ark_diagnostic_http_status(preflight: dict[str, Any], diagnostic: dict[str, Any] | None) -> int:
+    if not preflight.get("success") and preflight.get("stage") == "config":
+        return 503
+    if diagnostic is None:
+        return 502
+    if not diagnostic.get("success") and diagnostic.get("stage") == "config":
+        return 503
+    return 502
 
 
 def create_app() -> FastAPI:
@@ -1599,57 +1634,56 @@ def create_app() -> FastAPI:
 
         image_bytes = blob_path.read_bytes()
         mime_type = _detect_blob_content_type(image_bytes, evidence.get("filename"))
-        model = vision_provider.get_ark_vision_model()
-
-        if not vision_provider.get_ark_api_key():
+        text_preflight = vision_provider.diagnose_text_preflight()
+        if not text_preflight["success"]:
+            detail = _ark_diagnostic_detail(text_preflight, None)
             _log_ark_diagnostic_attempt(
                 evidence_id=evidence_id,
-                model=model,
+                model=text_preflight.get("model"),
                 status="failed",
-                latency_ms=0,
-                error_type="not_configured",
+                latency_ms=int(text_preflight.get("latency_ms") or 0),
+                error_type=text_preflight.get("error_type") or text_preflight.get("error_code") or text_preflight.get("stage"),
             )
             return JSONResponse(
-                status_code=503,
+                status_code=_ark_diagnostic_http_status(text_preflight, None),
                 content=_ark_diagnostic_response(
                     baseline=baseline,
                     status="failed",
-                    detail="Ark Vision 未配置(ARK_API_KEY 未设置)",
+                    detail=detail,
                     extraction=None,
+                    text_preflight=text_preflight,
+                    diagnostic=None,
                 ),
             )
 
-        start = time.perf_counter()
-        extraction = extract_image_evidence(
-            image_bytes,
-            mime_type,
-            provider=ARK_VISION_EXTRACTION_PROVIDER,
-        )
-        latency_ms = int((time.perf_counter() - start) * 1000)
-
-        if extraction is None:
+        diagnostic = vision_provider.diagnose_visual_evidence(image_bytes, mime_type)
+        detail = _ark_diagnostic_detail(text_preflight, diagnostic)
+        if not diagnostic["success"]:
             _log_ark_diagnostic_attempt(
                 evidence_id=evidence_id,
-                model=model,
+                model=diagnostic.get("model"),
                 status="failed",
-                latency_ms=latency_ms,
-                error_type="provider_failure",
+                latency_ms=int(diagnostic.get("latency_ms") or 0),
+                error_type=diagnostic.get("error_type") or diagnostic.get("error_code") or diagnostic.get("stage"),
             )
             return JSONResponse(
-                status_code=502,
+                status_code=_ark_diagnostic_http_status(text_preflight, diagnostic),
                 content=_ark_diagnostic_response(
                     baseline=baseline,
                     status="failed",
-                    detail="Ark Vision 实验解析失败",
+                    detail=detail,
                     extraction=None,
+                    text_preflight=text_preflight,
+                    diagnostic=diagnostic,
                 ),
             )
 
+        extraction = diagnostic.get("extraction")
         _log_ark_diagnostic_attempt(
             evidence_id=evidence_id,
-            model=extraction.get("model"),
+            model=diagnostic.get("model"),
             status="succeeded",
-            latency_ms=latency_ms,
+            latency_ms=int(diagnostic.get("latency_ms") or 0),
             extraction=extraction,
             error_type=None,
         )
@@ -1657,8 +1691,10 @@ def create_app() -> FastAPI:
             _ark_diagnostic_response(
                 baseline=baseline,
                 status="succeeded",
-                detail="Ark Vision 实验解析完成,结果仅供对照,不会保存或影响当前记录",
+                detail=detail,
                 extraction=extraction,
+                text_preflight=text_preflight,
+                diagnostic=diagnostic,
             )
         )
 
