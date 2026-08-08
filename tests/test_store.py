@@ -380,3 +380,84 @@ def test_verify_chain_still_passes_after_100_writes_with_auto_checkpoint(db_file
         _append_text(conn, blobs_root, text=f"payload-{index}", captured_at=1723000000 + index)
 
     assert verify_chain(conn) == (True, None, None)
+
+
+def test_semantic_v2_tables_do_not_affect_verify_chain(db_file, blobs_root):
+    conn = init_db(db_file)
+    _insert_actor(conn, "act-1")
+    _insert_actor(conn, "act-2")
+    ev1 = _append_text(conn, blobs_root, text="第一条原始记录", captured_at=1723000000)
+    ev2 = _append_text(conn, blobs_root, text="第二条原始记录", captured_at=1723000001)
+
+    before = verify_chain(conn, blobs_root=blobs_root)
+
+    conn.execute(
+        "INSERT INTO submissions (submission_id, created_at, source_hint) VALUES (?, ?, ?)",
+        ("sub-1", 1723000100, "飞书-项目A"),
+    )
+    conn.execute(
+        "INSERT INTO submission_evidence (submission_id, evidence_id, position) VALUES (?, ?, ?)",
+        ("sub-1", ev1["evidence_id"], 0),
+    )
+    conn.execute(
+        "INSERT INTO submission_evidence (submission_id, evidence_id, position) VALUES (?, ?, ?)",
+        ("sub-1", ev2["evidence_id"], 1),
+    )
+    conn.execute(
+        """
+        INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        ("evt-1", "渠道复盘", "active", "事件摘要", 1723000200, 1723000200),
+    )
+    conn.execute(
+        """
+        INSERT INTO facts (
+            fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
+            confidence, event_assignment, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "fact-1",
+            "evt-1",
+            "request",
+            "张总要求补一份渠道复盘",
+            1723000000,
+            1723600000,
+            "下周五",
+            0.92,
+            "confirmed",
+            1723000200,
+            1723000200,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)",
+        ("fact-1", ev1["evidence_id"]),
+    )
+    conn.execute(
+        "INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)",
+        ("fact-1", ev2["evidence_id"]),
+    )
+    conn.execute(
+        "INSERT INTO fact_actors (fact_id, actor_id, role) VALUES (?, ?, ?)",
+        ("fact-1", "act-1", "requester"),
+    )
+    conn.execute(
+        "INSERT INTO fact_actors (fact_id, actor_id, role) VALUES (?, ?, ?)",
+        ("fact-1", "act-2", "owner"),
+    )
+    conn.execute(
+        """
+        INSERT INTO interpretations (
+            interpretation_id, fact_id, evidence_id, kind, content, confidence, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("itp-1", "fact-1", None, "explanation", "这里是在明确交付物范围", 0.88, 1723000300),
+    )
+    conn.commit()
+
+    after = verify_chain(conn, blobs_root=blobs_root)
+
+    assert before == (True, None, None)
+    assert after == (True, None, None)

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -16,7 +16,18 @@ def _connect(path: str | Path) -> sqlite3.Connection:
     return conn
 
 
-def _create_schema(conn: sqlite3.Connection) -> None:
+def _ensure_meta_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _create_v1_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS actors (
@@ -86,11 +97,6 @@ def _create_schema(conn: sqlite3.Connection) -> None:
             tsa_token BLOB
         );
 
-        CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
         CREATE UNIQUE INDEX IF NOT EXISTS idx_actors_is_self_true
             ON actors(is_self) WHERE is_self = 1;
 
@@ -109,17 +115,167 @@ def _create_schema(conn: sqlite3.Connection) -> None:
     )
 
 
-def _ensure_meta(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        "INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
-        ("schema_version", str(SCHEMA_VERSION)),
+def _create_v2_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS submissions (
+            submission_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            source_hint TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS submission_evidence (
+            submission_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL UNIQUE,
+            position INTEGER NOT NULL CHECK(position >= 0),
+            PRIMARY KEY (submission_id, evidence_id),
+            UNIQUE (submission_id, position),
+            FOREIGN KEY (submission_id) REFERENCES submissions(submission_id) ON DELETE RESTRICT,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (
+                status IN ('active', 'resolved', 'archived')
+            ),
+            summary TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS facts (
+            fact_id TEXT PRIMARY KEY,
+            event_id TEXT,
+            fact_type TEXT NOT NULL CHECK (
+                fact_type IN (
+                    'request', 'commitment', 'confirmation', 'scope_change',
+                    'responsibility_change', 'deadline_change', 'delivery',
+                    'cancellation', 'denial', 'statement', 'reference'
+                )
+            ),
+            content TEXT NOT NULL,
+            occurred_at INTEGER,
+            due_at INTEGER,
+            due_raw TEXT,
+            confidence REAL CHECK (
+                confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
+            ),
+            event_assignment TEXT NOT NULL DEFAULT 'unassigned' CHECK (
+                event_assignment IN ('unassigned', 'auto', 'suggested', 'confirmed')
+            ),
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE RESTRICT,
+            CHECK (
+                (event_assignment = 'unassigned' AND event_id IS NULL)
+                OR
+                (event_assignment IN ('auto', 'suggested', 'confirmed') AND event_id IS NOT NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_evidence (
+            fact_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            PRIMARY KEY (fact_id, evidence_id),
+            FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE RESTRICT,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS fact_actors (
+            fact_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            PRIMARY KEY (fact_id, actor_id, role),
+            FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE RESTRICT,
+            FOREIGN KEY (actor_id) REFERENCES actors(actor_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS interpretations (
+            interpretation_id TEXT PRIMARY KEY,
+            fact_id TEXT,
+            evidence_id TEXT,
+            kind TEXT NOT NULL CHECK (
+                kind IN ('explanation', 'term', 'action_hint', 'uncertainty')
+            ),
+            content TEXT NOT NULL,
+            confidence REAL CHECK (
+                confidence IS NULL OR (confidence >= 0 AND confidence <= 1)
+            ),
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (fact_id) REFERENCES facts(fact_id) ON DELETE RESTRICT,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT,
+            CHECK (fact_id IS NOT NULL OR evidence_id IS NOT NULL)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_submission_evidence_submission_id
+            ON submission_evidence(submission_id);
+
+        CREATE INDEX IF NOT EXISTS idx_facts_event_id
+            ON facts(event_id);
+
+        CREATE INDEX IF NOT EXISTS idx_fact_evidence_evidence_id
+            ON fact_evidence(evidence_id);
+
+        CREATE INDEX IF NOT EXISTS idx_fact_actors_actor_id
+            ON fact_actors(actor_id);
+
+        CREATE INDEX IF NOT EXISTS idx_interpretations_fact_id
+            ON interpretations(fact_id);
+
+        CREATE INDEX IF NOT EXISTS idx_interpretations_evidence_id
+            ON interpretations(evidence_id);
+        """
     )
+
+
+def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        ("schema_version", str(version)),
+    )
+
+
+def _read_schema_version(conn: sqlite3.Connection) -> int | None:
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?",
+        ("schema_version",),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["value"])
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+    _create_v2_schema(conn)
+    _set_schema_version(conn, 2)
 
 
 def init_db(path: str | Path) -> sqlite3.Connection:
     conn = _connect(path)
-    _create_schema(conn)
-    _ensure_meta(conn)
+    _ensure_meta_table(conn)
+    schema_version = _read_schema_version(conn)
+
+    if schema_version is None:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _set_schema_version(conn, SCHEMA_VERSION)
+    elif schema_version > SCHEMA_VERSION:
+        conn.close()
+        raise ValueError(
+            f"database schema_version {schema_version} is newer than supported version {SCHEMA_VERSION}"
+        )
+    elif schema_version == 1:
+        _create_v1_schema(conn)
+        _migrate_v1_to_v2(conn)
+    else:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+
     conn.commit()
     return conn
 

@@ -80,10 +80,16 @@
 - **可解释**:用户看到的是"系统识别到谁说了什么、谁确认了什么、哪里发生了变更",而不是"AI 觉得这是不是我的活"
 - 身份缺失、身份变化或多人协作场景下,底层模型仍然稳定
 
-### D4. 归并不追求全自动
-**决策**:高分自动归并,中间地带出建议由用户一键确认,低分开新线。
+### D4. 归档不追求全自动
+**决策**:
+- 高置信度且语义单一时,允许自动归档到已有事件
+- 存在分叉、多事件候选或冲突语义时,只给建议并要求用户确认
+- 低置信度或上下文不足时,进入"待归档",不得自动瞎建事件
 
-**理由**:准确率的锅甩掉一半,且用户每次确认都是标注数据。
+**理由**:
+- 事实层一旦错误归档,后续所有事件时间线都会被污染
+- 把不确定性显式暴露出来,比假装全自动更可靠
+- 用户确认本身就是高价值标注数据
 
 ### D5. AI 分两段,复用同一条文本解析链
 **决策**:
@@ -109,6 +115,22 @@
 ## 3. 数据结构(冻结)
 
 > 字段一旦冻结不得擅自增删。需变更请先更新本文档并记入第 7 节变更日志。
+
+### 3.0 V2 目标语义模型
+
+V2 的目标底层关系为:
+
+`Submission → Evidence → Fact → Event → Derived State`
+
+其中:
+- **Submission**: 一次用户提交动作,可以包含多份 Evidence,并保留顺序
+- **Evidence**: 原始不可变材料,仍是哈希链唯一保护对象
+- **Fact**: 从一份或多份 Evidence 中抽出的中立事实表达
+- **Event**: 多个 Fact 归并后形成的事件容器
+- **Derived State**: 从 Event 聚合出的当前状态、摘要、风险标签、视图投影
+- **Interpretation**: 独立解释层,可挂在 Fact 或 Evidence 上,但不进入哈希链
+
+> 当前 `threads / slot_* / slot_direction / plain_summary` 仍然保留并继续服务现有功能,但它们属于 **兼容层**，不再代表目标底层模型。
 
 ### 3.1 actors(当事人)
 
@@ -222,6 +244,84 @@
 - `done / failed / unsupported`: 含义保持不变
 
 > `parse_status` 描述的是处理阶段,不是业务判断结果;业务展示应优先回到 `kind + slot_* + plain_summary + 变更链路` 这一层。
+
+### 3.7 V2 语义层新增表
+
+#### submissions
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| submission_id | TEXT PK | 一次提交动作 |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| source_hint | TEXT | 来源提示 |
+
+#### submission_evidence
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| submission_id | TEXT NOT NULL | 所属提交 |
+| evidence_id | TEXT NOT NULL UNIQUE | 一份 evidence 只属于一个 submission |
+| position | INTEGER NOT NULL | 在本次提交中的顺序 |
+
+约束:
+- PK `(submission_id, evidence_id)`
+- UNIQUE `(submission_id, position)`
+
+#### events
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| event_id | TEXT PK | 事件 ID |
+| title | TEXT NOT NULL | 事件标题 |
+| status | TEXT NOT NULL | active / resolved / archived |
+| summary | TEXT | 事件摘要 |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| updated_at | INTEGER NOT NULL | 更新时间 |
+
+#### facts
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| fact_id | TEXT PK | 事实 ID |
+| event_id | TEXT NULL | 所属事件 |
+| fact_type | TEXT NOT NULL | request / commitment / confirmation / scope_change / responsibility_change / deadline_change / delivery / cancellation / denial / statement / reference |
+| content | TEXT NOT NULL | 中立事实内容 |
+| occurred_at | INTEGER | 发生时间 |
+| due_at | INTEGER | 时限 |
+| due_raw | TEXT | 时限原文 |
+| confidence | REAL NULL | 0..1 |
+| event_assignment | TEXT NOT NULL DEFAULT `unassigned` | unassigned / auto / suggested / confirmed |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| updated_at | INTEGER NOT NULL | 更新时间 |
+
+约束:
+- `event_assignment = 'unassigned'` 时,`event_id` 必须为 `NULL`
+- 其余 assignment 时,`event_id` 必须非 `NULL`
+
+#### fact_evidence
+
+`Fact ↔ Evidence` 的多对多关系表。
+
+#### fact_actors
+
+`Fact ↔ Actor` 的关系表,带 `role` 字段。
+
+> `role` 当前不做枚举 CHECK,避免过早锁死语义角色集合。
+
+#### interpretations
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| interpretation_id | TEXT PK | 解释 ID |
+| fact_id | TEXT NULL | 可挂到 Fact |
+| evidence_id | TEXT NULL | 也可直接挂到 Evidence |
+| kind | TEXT NOT NULL | explanation / term / action_hint / uncertainty |
+| content | TEXT NOT NULL | 解释内容 |
+| confidence | REAL NULL | 0..1 |
+| created_at | INTEGER NOT NULL | 创建时间 |
+
+约束:
+- `fact_id` / `evidence_id` 至少一个非 `NULL`
 
 ---
 
@@ -372,6 +472,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 图片 OCR 改为 DashScope `vanchin/deepseek-ocr`;新增 `/api/diag/ocr` | 当前工程已不再使用本地 PaddleOCR 方案 |
 | 2026-08-08 | 新增 `ocr_running` / `llm_running` 状态、OCR 文本人工校正、举证包附带 PDF 与说明文件 | 让处理过程可见、结果可追溯,并与现有导出物保持一致 |
 | 2026-08-08 | 核心定位从"谁欠谁"调整为"中立记录谁对谁表达了什么、发生了什么变化" | `"我的待办"`降级为可选身份视图,不再作为底层事实模型的核心差异点 |
+| 2026-08-08 | 新增 V2 语义模型骨架: Submission → Evidence → Fact → Event → Derived State | 为后续语义归档与事件层演进预留安全迁移路径,同时保留现有兼容层 |
 
 ---
 
