@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
-import httpx
-
-from app.llm import get_deepseek_model
-
-
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+from app.ai_provider import chat_json
 FACT_TYPES = {
     "request",
     "commitment",
@@ -386,10 +380,6 @@ def extract_semantics(
     glossary: list[dict[str, Any]] | None = None,
     source_hint: str | None = None,
 ) -> dict[str, Any] | None:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return None
-
     anchor_date = _coerce_date(anchor_date)
     messages = build_semantic_messages(
         text,
@@ -398,26 +388,5 @@ def extract_semantics(
         source_hint=source_hint,
     )
 
-    try:
-        response = httpx.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": get_deepseek_model(),
-                "temperature": 0,
-                "max_tokens": 4096,
-                "response_format": {"type": "json_object"},
-                "messages": messages,
-            },
-            timeout=20.0,
-        )
-        if response.status_code != 200:
-            return None
-        payload = response.json()
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content")
-        return parse_semantic_json(content, anchor_date=anchor_date)
-    except Exception:
-        return None
+    content = chat_json(messages, max_tokens=4096, temperature=0)
+    return parse_semantic_json(content, anchor_date=anchor_date)

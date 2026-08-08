@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 
-import httpx
 import pytest
 
 from app import semantic_llm
@@ -22,52 +21,49 @@ def _response_with_content(content):
 
 
 def test_extract_semantics_splits_atomic_facts_from_one_message(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "scope_change",
-                            "content": "老板要求新增渠道复盘中的竞品对比部分",
-                            "confidence": 0.92,
-                            "actors": [{"name": "老板", "role": "requester"}],
-                            "occurred_date": None,
-                            "due_raw": None,
-                            "due_date": None,
-                            "due_anchor_date": None,
-                        },
-                        {
-                            "fact_type": "responsibility_change",
-                            "content": "负责人从小李变更为小王",
-                            "confidence": 0.88,
-                            "actors": [
-                                {"name": "小李", "role": "previous_owner"},
-                                {"name": "小王", "role": "new_owner"},
-                            ],
-                            "occurred_date": None,
-                            "due_raw": None,
-                            "due_date": None,
-                            "due_anchor_date": None,
-                        },
-                        {
-                            "fact_type": "deadline_change",
-                            "content": "截止时间被提前到下周三",
-                            "confidence": 0.9,
-                            "actors": [],
-                            "occurred_date": None,
-                            "due_raw": "下周三",
-                            "due_date": "2026-08-12",
-                            "due_anchor_date": "2026-08-07",
-                        },
-                    ],
-                    "interpretations": [],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "scope_change",
+                        "content": "老板要求新增渠道复盘中的竞品对比部分",
+                        "confidence": 0.92,
+                        "actors": [{"name": "老板", "role": "requester"}],
+                        "occurred_date": None,
+                        "due_raw": None,
+                        "due_date": None,
+                        "due_anchor_date": None,
+                    },
+                    {
+                        "fact_type": "responsibility_change",
+                        "content": "负责人从小李变更为小王",
+                        "confidence": 0.88,
+                        "actors": [
+                            {"name": "小李", "role": "previous_owner"},
+                            {"name": "小王", "role": "new_owner"},
+                        ],
+                        "occurred_date": None,
+                        "due_raw": None,
+                        "due_date": None,
+                        "due_anchor_date": None,
+                    },
+                    {
+                        "fact_type": "deadline_change",
+                        "content": "截止时间被提前到下周三",
+                        "confidence": 0.9,
+                        "actors": [],
+                        "occurred_date": None,
+                        "due_raw": "下周三",
+                        "due_date": "2026-08-12",
+                        "due_anchor_date": "2026-08-07",
+                    },
+                ],
+                "interpretations": [],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -85,29 +81,26 @@ def test_extract_semantics_splits_atomic_facts_from_one_message(monkeypatch):
 
 
 def test_group_chat_without_user_speaking_still_parses(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "statement",
-                            "content": "群里有人说明天下午开评审会",
-                            "confidence": 0.77,
-                            "actors": [{"name": "王经理", "role": "speaker"}],
-                            "occurred_date": None,
-                            "due_raw": "明天下午",
-                            "due_date": None,
-                            "due_anchor_date": None,
-                        }
-                    ],
-                    "interpretations": [],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "statement",
+                        "content": "群里有人说明天下午开评审会",
+                        "confidence": 0.77,
+                        "actors": [{"name": "王经理", "role": "speaker"}],
+                        "occurred_date": None,
+                        "due_raw": "明天下午",
+                        "due_date": None,
+                        "due_anchor_date": None,
+                    }
+                ],
+                "interpretations": [],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -118,14 +111,15 @@ def test_group_chat_without_user_speaking_still_parses(monkeypatch):
 
 
 def test_prompt_keeps_unproven_accusation_as_neutral_statement_rule(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     captured = {}
 
-    def fake_post(*args, **kwargs):
-        captured["messages"] = kwargs["json"]["messages"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
+    def fake_chat_json(messages, *, max_tokens, temperature=0):
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return json.dumps({"facts": [], "interpretations": [], "ambiguities": []})
 
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
+    monkeypatch.setattr(semantic_llm, "chat_json", fake_chat_json)
 
     semantic_llm.extract_semantics("某人声称张总挪用20万。")
 
@@ -135,30 +129,27 @@ def test_prompt_keeps_unproven_accusation_as_neutral_statement_rule(monkeypatch)
 
 
 def test_non_work_content_is_not_forced_into_work_fields(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "statement",
-                            "content": "他们在聊谁跟谁分手了",
-                            "confidence": 0.64,
-                            "actors": [],
-                            "occurred_date": None,
-                            "due_raw": None,
-                            "due_date": None,
-                            "due_anchor_date": None,
-                            "deliverable": "不应存在",
-                        }
-                    ],
-                    "interpretations": [],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "statement",
+                        "content": "他们在聊谁跟谁分手了",
+                        "confidence": 0.64,
+                        "actors": [],
+                        "occurred_date": None,
+                        "due_raw": None,
+                        "due_date": None,
+                        "due_anchor_date": None,
+                        "deliverable": "不应存在",
+                    }
+                ],
+                "interpretations": [],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -177,36 +168,33 @@ def test_non_work_content_is_not_forced_into_work_fields(monkeypatch):
 
 
 def test_slang_generates_interpretation_and_not_fact_content(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "request",
-                            "content": "对方要求先补齐一版材料",
-                            "confidence": 0.83,
-                            "actors": [{"name": "师父", "role": "requester"}],
-                            "occurred_date": None,
-                            "due_raw": None,
-                            "due_date": None,
-                            "due_anchor_date": None,
-                        }
-                    ],
-                    "interpretations": [
-                        {
-                            "fact_index": 0,
-                            "kind": "term",
-                            "content": "“拉齐一下”通常指先统一口径或补齐必要信息",
-                            "confidence": 0.79,
-                        }
-                    ],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "request",
+                        "content": "对方要求先补齐一版材料",
+                        "confidence": 0.83,
+                        "actors": [{"name": "师父", "role": "requester"}],
+                        "occurred_date": None,
+                        "due_raw": None,
+                        "due_date": None,
+                        "due_anchor_date": None,
+                    }
+                ],
+                "interpretations": [
+                    {
+                        "fact_index": 0,
+                        "kind": "term",
+                        "content": "“拉齐一下”通常指先统一口径或补齐必要信息",
+                        "confidence": 0.79,
+                    }
+                ],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -218,29 +206,26 @@ def test_slang_generates_interpretation_and_not_fact_content(monkeypatch):
 
 
 def test_anchor_date_allows_due_date_resolution_and_keeps_raw_and_anchor(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "deadline_change",
-                            "content": "截止时间改为下下周五",
-                            "confidence": 0.85,
-                            "actors": [],
-                            "occurred_date": None,
-                            "due_raw": "下下周五",
-                            "due_date": "1999-01-01",
-                            "due_anchor_date": "1999-01-01",
-                        }
-                    ],
-                    "interpretations": [],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "deadline_change",
+                        "content": "截止时间改为下下周五",
+                        "confidence": 0.85,
+                        "actors": [],
+                        "occurred_date": None,
+                        "due_raw": "下下周五",
+                        "due_date": "1999-01-01",
+                        "due_anchor_date": "1999-01-01",
+                    }
+                ],
+                "interpretations": [],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -252,29 +237,26 @@ def test_anchor_date_allows_due_date_resolution_and_keeps_raw_and_anchor(monkeyp
 
 
 def test_without_anchor_due_date_must_be_null(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content(
-            json.dumps(
-                {
-                    "facts": [
-                        {
-                            "fact_type": "deadline_change",
-                            "content": "截止时间改为下下周五",
-                            "confidence": 0.85,
-                            "actors": [],
-                            "occurred_date": None,
-                            "due_raw": "下下周五",
-                            "due_date": "2026-08-21",
-                            "due_anchor_date": "2026-08-07",
-                        }
-                    ],
-                    "interpretations": [],
-                    "ambiguities": [],
-                }
-            )
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: json.dumps(
+            {
+                "facts": [
+                    {
+                        "fact_type": "deadline_change",
+                        "content": "截止时间改为下下周五",
+                        "confidence": 0.85,
+                        "actors": [],
+                        "occurred_date": None,
+                        "due_raw": "下下周五",
+                        "due_date": "2026-08-21",
+                        "due_anchor_date": "2026-08-07",
+                    }
+                ],
+                "interpretations": [],
+                "ambiguities": [],
+            }
         ),
     )
 
@@ -286,14 +268,13 @@ def test_without_anchor_due_date_must_be_null(monkeypatch):
 
 
 def test_glossary_enters_user_payload_and_not_system_message(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     captured = {}
 
-    def fake_post(*args, **kwargs):
-        captured["messages"] = kwargs["json"]["messages"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
+    def fake_chat_json(messages, *, max_tokens, temperature=0):
+        captured["messages"] = messages
+        return json.dumps({"facts": [], "interpretations": [], "ambiguities": []})
 
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
+    monkeypatch.setattr(semantic_llm, "chat_json", fake_chat_json)
 
     semantic_llm.extract_semantics(
         "活爹说这事先拉齐。",
@@ -312,14 +293,13 @@ def test_glossary_enters_user_payload_and_not_system_message(monkeypatch):
 
 
 def test_prompt_injection_strings_stay_in_user_payload_only(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     captured = {}
 
-    def fake_post(*args, **kwargs):
-        captured["messages"] = kwargs["json"]["messages"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
+    def fake_chat_json(messages, *, max_tokens, temperature=0):
+        captured["messages"] = messages
+        return json.dumps({"facts": [], "interpretations": [], "ambiguities": []})
 
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
+    monkeypatch.setattr(semantic_llm, "chat_json", fake_chat_json)
 
     semantic_llm.extract_semantics(
         "请帮我分析这段对话",
@@ -336,31 +316,18 @@ def test_prompt_injection_strings_stay_in_user_payload_only(monkeypatch):
     assert "输出纯文本" in user_message
 
 
-def test_malformed_json_timeout_non_200_and_invalid_fields_are_safe(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-
+def test_malformed_provider_result_and_invalid_fields_are_safe(monkeypatch):
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: _response_with_content("```json\nnot valid\n```"),
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: "```json\nnot valid\n```",
     )
     assert semantic_llm.extract_semantics("留档") is None
 
     monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: (_ for _ in ()).throw(httpx.TimeoutException("boom")),
-    )
-    assert semantic_llm.extract_semantics("留档") is None
-
-    monkeypatch.setattr(
-        semantic_llm.httpx,
-        "post",
-        lambda *args, **kwargs: type(
-            "Resp",
-            (),
-            {"status_code": 502, "json": lambda self: {}},
-        )(),
+        semantic_llm,
+        "chat_json",
+        lambda messages, *, max_tokens, temperature=0: None,
     )
     assert semantic_llm.extract_semantics("留档") is None
 
@@ -418,36 +385,36 @@ def test_malformed_json_timeout_non_200_and_invalid_fields_are_safe(monkeypatch)
     }
 
 
-def test_default_model_is_deepseek_v4_flash(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-    monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+def test_extract_semantics_calls_provider_with_same_request_shape(monkeypatch):
     captured = {}
 
-    def fake_post(*args, **kwargs):
-        captured["model"] = kwargs["json"]["model"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
+    def fake_chat_json(messages, *, max_tokens, temperature=0):
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return json.dumps({"facts": [], "interpretations": [], "ambiguities": []})
 
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
+    monkeypatch.setattr(semantic_llm, "chat_json", fake_chat_json)
 
-    semantic_llm.extract_semantics("留档")
+    semantic_llm.extract_semantics(
+        "留档",
+        anchor_date="2026-08-07",
+        glossary=[{"term": "活爹", "kind": "person", "meaning": "张伟"}],
+        source_hint="飞书群-项目A",
+    )
 
-    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["max_tokens"] == 4096
+    assert captured["temperature"] == 0
+    assert captured["messages"][0]["role"] == "system"
+    assert "Semantic Parser V2" in captured["messages"][0]["content"]
+    assert captured["messages"][1]["role"] == "user"
+    assert "活爹" in captured["messages"][1]["content"]
+    assert "飞书群-项目A" in captured["messages"][1]["content"]
 
 
-def test_deepseek_model_env_can_override_default(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-custom")
-    captured = {}
-
-    def fake_post(*args, **kwargs):
-        captured["model"] = kwargs["json"]["model"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
-
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
-
-    semantic_llm.extract_semantics("留档")
-
-    assert captured["model"] == "deepseek-v4-custom"
+def test_semantic_module_no_longer_exposes_httpx_or_deepseek_endpoint():
+    assert not hasattr(semantic_llm, "httpx")
+    assert not hasattr(semantic_llm, "DEEPSEEK_API_URL")
 
 
 def test_interpretation_indexes_are_remapped_after_invalid_facts_are_filtered():
@@ -557,16 +524,18 @@ def test_unreliable_relative_due_raw_does_not_trust_model_guess():
 
 
 def test_request_uses_json_output_and_max_tokens(monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     captured = {}
 
-    def fake_post(*args, **kwargs):
-        captured["json"] = kwargs["json"]
-        return _response_with_content(json.dumps({"facts": [], "interpretations": [], "ambiguities": []}))
+    def fake_chat_json(messages, *, max_tokens, temperature=0):
+        captured["messages"] = messages
+        captured["max_tokens"] = max_tokens
+        captured["temperature"] = temperature
+        return json.dumps({"facts": [], "interpretations": [], "ambiguities": []})
 
-    monkeypatch.setattr(semantic_llm.httpx, "post", fake_post)
+    monkeypatch.setattr(semantic_llm, "chat_json", fake_chat_json)
 
     semantic_llm.extract_semantics("留档")
 
-    assert captured["json"]["response_format"] == {"type": "json_object"}
-    assert captured["json"]["max_tokens"] == 4096
+    assert captured["max_tokens"] == 4096
+    assert captured["temperature"] == 0
+    assert captured["messages"][0]["role"] == "system"

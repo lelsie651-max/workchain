@@ -10,11 +10,11 @@ from typing import Any
 
 import httpx
 
+from app.ai_provider import get_text_model
+
 
 ALLOWED_DIRECTIONS = {"i_owe", "owed_to_me", "none"}
 ALLOWED_KINDS = {"request", "confirm", "change", "deliver", "dispute", "reference"}
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
-
 SYSTEM_PROMPT = """你从一段聊天记录中抽取“谁答应了谁什么、什么时候”。场景不限于工作,私人约定同样算数。
 只输出 JSON,不要解释,不要 markdown 代码块。
 字段:
@@ -34,7 +34,7 @@ CONTEXT_SUFFIX = "词汇对照仅供参考。若某个词在原文中明显是�
 
 
 def get_deepseek_model() -> str:
-    return os.getenv("DEEPSEEK_MODEL", "").strip() or DEFAULT_DEEPSEEK_MODEL
+    return get_text_model()
 
 
 def _default_slots() -> dict[str, Any]:

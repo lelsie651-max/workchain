@@ -113,6 +113,13 @@
 - 避免在早期阶段把精力耗在账号、权限、找回、风控上
 - 让"先试一下"的成本最低,适合演示和评审
 
+### D7. 语义业务层依赖 Provider abstraction
+**决策**:业务语义层(`Semantic Parser` / `Event Matcher`)依赖受控的 Provider abstraction,不直接绑定单一模型供应商的 URL、API Key 和 HTTP 请求细节。当前 production text provider 为 DeepSeek V4 Flash(`DEEPSEEK_MODEL`,默认 `deepseek-v4-flash`),未来允许在 Provider 层做 A/B 替换。
+
+**理由**:
+- 让 Prompt / normalize / routing policy 和供应商接入细节解耦
+- 为未来引入其他文本模型或视觉模型预留边界,同时不把供应商细节扩散到业务模块
+
 ---
 
 ## 3. 数据结构(冻结)

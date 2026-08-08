@@ -1,15 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
-import httpx
-
-from app.llm import get_deepseek_model
-
-
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+from app.ai_provider import chat_json
 AUTO_THRESHOLD = 0.90
 CONFIRM_THRESHOLD = 0.65
 GROUP_TARGETS = {"existing", "new", "unassigned"}
@@ -343,10 +337,6 @@ def match_events(
     *,
     existing_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-    if not api_key:
-        return None
-
     messages = build_event_matcher_messages(
         facts,
         existing_events=existing_events,
@@ -357,33 +347,12 @@ def match_events(
         if (event := _normalize_existing_event_for_payload(raw_event)) is not None
     }
 
-    try:
-        response = httpx.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": get_deepseek_model(),
-                "temperature": 0,
-                "max_tokens": 4096,
-                "response_format": {"type": "json_object"},
-                "messages": messages,
-            },
-            timeout=20.0,
-        )
-        if response.status_code != 200:
-            return None
-        payload = response.json()
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content")
-        return parse_event_match_json(
-            content,
-            facts_count=len(facts),
-            existing_event_ids=existing_event_ids,
-        )
-    except Exception:
-        return None
+    content = chat_json(messages, max_tokens=4096, temperature=0)
+    return parse_event_match_json(
+        content,
+        facts_count=len(facts),
+        existing_event_ids=existing_event_ids,
+    )
 
 
 def decide_assignment_mode(normalized_match: dict[str, Any]) -> str:
