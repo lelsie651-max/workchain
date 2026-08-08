@@ -13,6 +13,7 @@ import httpx
 
 ALLOWED_DIRECTIONS = {"i_owe", "owed_to_me", "none"}
 ALLOWED_KINDS = {"request", "confirm", "change", "deliver", "dispute", "reference"}
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 
 SYSTEM_PROMPT = """你从一段聊天记录中抽取“谁答应了谁什么、什么时候”。场景不限于工作,私人约定同样算数。
 只输出 JSON,不要解释,不要 markdown 代码块。
@@ -30,6 +31,10 @@ SYSTEM_PROMPT = """你从一段聊天记录中抽取“谁答应了谁什么、�
 today 参数为当前日期,用于推算相对时间。"""
 
 CONTEXT_SUFFIX = "词汇对照仅供参考。若某个词在原文中明显是感叹、玩笑或另有所指,以原文语境为准,不要机械套用对照。"
+
+
+def get_deepseek_model() -> str:
+    return os.getenv("DEEPSEEK_MODEL", "").strip() or DEFAULT_DEEPSEEK_MODEL
 
 
 def _default_slots() -> dict[str, Any]:
@@ -195,7 +200,7 @@ def extract_slots(text: str, today: str, context: dict[str, Any] | None = None) 
                 "Content-Type": "application/json",
             },
             json={
-                "model": "deepseek-chat",
+                "model": get_deepseek_model(),
                 "temperature": 0,
                 "messages": messages,
             },

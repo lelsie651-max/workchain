@@ -128,6 +128,56 @@ def test_extract_slots_omits_context_when_absent(monkeypatch):
     assert "以原文语境为准" not in joined
 
 
+def test_extract_slots_uses_default_deepseek_v4_flash_model(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+    captured = {}
+
+    def fake_post(*args, **kwargs):
+        captured["model"] = kwargs["json"]["model"]
+        return type(
+            "Resp",
+            (),
+            {
+                "status_code": 200,
+                "json": lambda self: {
+                    "choices": [{"message": {"content": json.dumps({"kind": "reference", "plain_summary": "留档"})}}]
+                },
+            },
+        )()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+
+    llm.extract_slots("留档", "2026-08-07")
+
+    assert captured["model"] == "deepseek-v4-flash"
+
+
+def test_extract_slots_allows_deepseek_model_override(monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-test")
+    captured = {}
+
+    def fake_post(*args, **kwargs):
+        captured["model"] = kwargs["json"]["model"]
+        return type(
+            "Resp",
+            (),
+            {
+                "status_code": 200,
+                "json": lambda self: {
+                    "choices": [{"message": {"content": json.dumps({"kind": "reference", "plain_summary": "留档"})}}]
+                },
+            },
+        )()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+
+    llm.extract_slots("留档", "2026-08-07")
+
+    assert captured["model"] == "deepseek-v4-test"
+
+
 def test_resolve_actor_with_glossary_backfills_alias(tmp_path):
     demo_dir = tmp_path / "demo"
     seed_demo_data(demo_dir)
