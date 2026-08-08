@@ -87,6 +87,14 @@
                 </summary>
                 <div class="mt-3 space-y-3">
                     <p class="text-xs leading-6 text-slate-500">文字由图片自动识别,可能有误。原始图片已完整保存,识别结果不影响完整性校验。</p>
+                    {% if evidence.current_extraction %}
+                    <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-400">
+                        <p class="text-slate-300">{{ evidence.current_extraction.summary }}</p>
+                        {% if evidence.current_extraction.created_at_text %}
+                        <p>提取时间：{{ evidence.current_extraction.created_at_text }}</p>
+                        {% endif %}
+                    </div>
+                    {% endif %}
                     <div id="ocr-text-readonly" class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.extracted_text }}</div>
                     {% if not evidence.evidence_id.startswith("ev_demo_") %}
                     <button
@@ -121,6 +129,21 @@
             {% endif %}
             {% if evidence.evidence_id.startswith("ev_demo_") %}
             <p class="mt-3 text-sm leading-7 text-slate-300">演示记录不可修改。</p>
+            {% endif %}
+            {% if diagnostics_enabled and diagnostics %}
+            <details class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-diagnostics-details>
+                <summary class="cursor-pointer list-none text-sm text-slate-200">解析诊断</summary>
+                <div class="mt-3 space-y-3">
+                    <p class="text-xs leading-6 text-slate-500">仅显示安全元数据,用于定位当前解析链路,不包含密钥和完整敏感原文。</p>
+                    <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-400">
+                        <p>当前状态：{{ diagnostics.parse_status }}</p>
+                        <p>状态说明：{{ diagnostics.parse_detail or "无" }}</p>
+                        <p>图片链路：{{ diagnostics.image_pipeline.actual_provider_label }} / {{ diagnostics.image_pipeline.actual_model }}</p>
+                        <p>文本模型：{{ diagnostics.text_llm.provider_label }} / {{ diagnostics.text_llm.model }}</p>
+                    </div>
+                    <pre class="max-h-[40vh] overflow-auto whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{{ diagnostics_json }}</pre>
+                </div>
+            </details>
             {% endif %}
             <form id="slots-form" class="mt-4 space-y-4" data-evidence-id="{{ evidence.evidence_id }}">
                 <div>

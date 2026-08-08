@@ -2027,6 +2027,116 @@ def test_patch_ocr_text_persists_user_extraction_superseding_machine_history(tmp
         conn.close()
 
 
+def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="provider-visible.png")
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert detail_response.status_code == 200
+    assert "机器提取 · DashScope / vanchin/deepseek-ocr" in detail_response.text
+
+
+def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKCHAIN_DIAGNOSTICS", raising=False)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="diag-off.png")
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+                diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
+
+    assert detail_response.status_code == 200
+    assert "解析诊断" not in detail_response.text
+    assert diag_response.status_code == 404
+
+
+def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.vision_provider.extract_visual_evidence") as mock_vision:
+                with client:
+                    create_response = _upload_png(client, filename="diag-on.png")
+                    evidence_id = create_response.json()["evidence_id"]
+                    detail_response = client.get(f"/evidence/{evidence_id}")
+                    diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
+
+    assert detail_response.status_code == 200
+    assert "解析诊断" in detail_response.text
+    assert diag_response.status_code == 200
+    payload = diag_response.json()
+    assert payload["parse_status"] == "done"
+    assert payload["image_pipeline"] == {
+        "actual_provider": "dashscope",
+        "actual_provider_label": "DashScope",
+        "actual_model": "vanchin/deepseek-ocr",
+    }
+    assert payload["text_llm"]["provider"] == "deepseek"
+    assert payload["text_llm"]["model"] == main_module.llm.get_deepseek_model()
+    assert payload["extraction_history"] == [
+        {
+            "origin": "machine",
+            "origin_label": "机器提取",
+            "provider": "dashscope",
+            "provider_label": "DashScope",
+            "model": "vanchin/deepseek-ocr",
+            "created_at": payload["extraction_history"][0]["created_at"],
+            "created_at_text": payload["extraction_history"][0]["created_at_text"],
+        }
+    ]
+    assert isinstance(payload["extraction_history"][0]["created_at"], int)
+    assert payload["extraction_history"][0]["created_at_text"]
+    assert "原始识别文字" not in diag_response.text
+    mock_vision.assert_not_called()
+
+
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 

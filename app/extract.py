@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import time
 
 from docx import Document
 from pypdf import PdfReader
@@ -97,3 +98,51 @@ def extract_text(payload: bytes, media_type: str, filename: str) -> tuple[str | 
         return None, "暂不支持提取这类文件中的文字"
     except Exception as exc:  # pragma: no cover
         return None, f"提取失败({type(exc).__name__})"
+
+
+def extract_image_text_with_metadata(
+    payload: bytes,
+    filename: str,
+    *,
+    evidence_id: str | None = None,
+) -> tuple[str | None, str, dict[str, object]]:
+    mime_type = _detect_image_mime_type(payload, filename)
+    _, _, metadata = ocr._prepare_image_for_ocr_with_metadata(payload, mime_type)
+    base_payload = {
+        "evidence_id": evidence_id,
+        "provider": "dashscope",
+        "model": ocr.OCR_MODEL,
+        "original_mime": metadata["original_mime"],
+        "original_width": metadata["original_width"],
+        "original_height": metadata["original_height"],
+        "prepared_mime": metadata["prepared_mime"],
+        "prepared_width": metadata["prepared_width"],
+        "prepared_height": metadata["prepared_height"],
+        "resized": metadata["resized"],
+        "png_to_jpeg": metadata["png_to_jpeg"],
+    }
+    ocr._emit_image_extraction_log(
+        {
+            **base_payload,
+            "status": "started",
+            "latency_ms": 0,
+            "transcript_chars": 0,
+            "warning_types": [],
+            "error_type": None,
+        }
+    )
+    start = time.perf_counter()
+    text, note = ocr.image_to_text(payload, mime_type)
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    warning_type = ocr._classify_note_type(note)
+    ocr._emit_image_extraction_log(
+        {
+            **base_payload,
+            "status": "succeeded" if text is not None else "failed",
+            "latency_ms": latency_ms,
+            "transcript_chars": len(text) if text is not None else 0,
+            "warning_types": [] if warning_type is None else [warning_type],
+            "error_type": None,
+        }
+    )
+    return text, note, metadata

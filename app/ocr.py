@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 import time
@@ -31,11 +32,55 @@ def _current_api_key() -> str:
     return os.getenv("DASHSCOPE_API_KEY", "").strip()
 
 
-def _prepare_image_for_ocr(image_bytes: bytes) -> tuple[bytes, str]:
+def _emit_image_extraction_log(payload: dict[str, Any]) -> None:
+    print(
+        json.dumps(
+            {"event": "image_extraction", **payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        file=sys.stderr,
+    )
+
+
+def _classify_note_type(note: str) -> str | None:
+    if not note:
+        return None
+    if note.startswith("图片识别未配置"):
+        return "not_configured"
+    if note.startswith("图片识别鉴权失败"):
+        return "auth_failed"
+    if note.startswith("图片识别模型不可用"):
+        return "model_unavailable"
+    if note.startswith("图片识别调用过于频繁"):
+        return "rate_limited"
+    if note.startswith("图片识别超时"):
+        return "timeout"
+    if note.startswith("无法连接图片识别服务"):
+        return "connection_error"
+    if note.startswith("这张图里没有识别到文字"):
+        return "no_text"
+    if note.startswith("图片识别失败"):
+        return "api_error"
+    return "warning"
+
+
+def _safe_image_size(image_bytes: bytes) -> tuple[int | None, int | None]:
     with Image.open(BytesIO(image_bytes)) as image:
         image.load()
+        return image.size
+
+
+def _prepare_image_for_ocr_with_metadata(
+    image_bytes: bytes,
+    original_mime: str | None = None,
+) -> tuple[bytes, str, dict[str, Any]]:
+    with Image.open(BytesIO(image_bytes)) as image:
+        image.load()
+        original_width, original_height = image.size
         working = image.convert("RGB")
         max_side = max(working.size)
+        resized = False
         if max_side > OCR_MAX_SIDE:
             scale = OCR_MAX_SIDE / max_side
             target_size = (
@@ -43,10 +88,29 @@ def _prepare_image_for_ocr(image_bytes: bytes) -> tuple[bytes, str]:
                 max(1, int(round(working.size[1] * scale))),
             )
             working = working.resize(target_size, Image.Resampling.LANCZOS)
+            resized = True
 
+        prepared_width, prepared_height = working.size
         buffer = BytesIO()
         working.save(buffer, format="JPEG", quality=85)
-    return buffer.getvalue(), "image/jpeg"
+
+    prepared_mime = "image/jpeg"
+    metadata = {
+        "original_mime": original_mime,
+        "original_width": original_width,
+        "original_height": original_height,
+        "prepared_mime": prepared_mime,
+        "prepared_width": prepared_width,
+        "prepared_height": prepared_height,
+        "resized": resized,
+        "png_to_jpeg": original_mime == "image/png" and prepared_mime == "image/jpeg",
+    }
+    return buffer.getvalue(), prepared_mime, metadata
+
+
+def _prepare_image_for_ocr(image_bytes: bytes) -> tuple[bytes, str]:
+    prepared_bytes, prepared_mime, _ = _prepare_image_for_ocr_with_metadata(image_bytes)
+    return prepared_bytes, prepared_mime
 
 
 def _content_to_text(content: Any) -> str:
@@ -114,9 +178,20 @@ def _log_failure(exc: Exception, api_key: str) -> None:
     print(f"[ocr] failed: {type(exc).__name__}: {brief}", file=sys.stderr)
 
 
+def _build_data_url_with_metadata(
+    image_bytes: bytes,
+    mime_type: str,
+) -> tuple[str, dict[str, Any]]:
+    prepared_bytes, prepared_mime, metadata = _prepare_image_for_ocr_with_metadata(image_bytes, mime_type)
+    return (
+        f"data:{prepared_mime};base64,{base64.b64encode(prepared_bytes).decode('ascii')}",
+        metadata,
+    )
+
+
 def _build_data_url(image_bytes: bytes, mime_type: str) -> str:
-    prepared_bytes, prepared_mime = _prepare_image_for_ocr(image_bytes)
-    return f"data:{prepared_mime};base64,{base64.b64encode(prepared_bytes).decode('ascii')}"
+    data_url, _ = _build_data_url_with_metadata(image_bytes, mime_type)
+    return data_url
 
 
 def _create_completion(image_bytes: bytes, mime_type: str, api_key: str) -> Any:
@@ -145,6 +220,119 @@ def _build_diag_png_bytes() -> bytes:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def image_to_text_with_metadata(
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    evidence_id: str | None = None,
+) -> tuple[str | None, str, dict[str, Any]]:
+    data_url, metadata = _build_data_url_with_metadata(image_bytes, mime_type)
+    api_key = _current_api_key()
+    base_payload = {
+        "evidence_id": evidence_id,
+        "provider": "dashscope",
+        "model": OCR_MODEL,
+        "original_mime": metadata["original_mime"],
+        "original_width": metadata["original_width"],
+        "original_height": metadata["original_height"],
+        "prepared_mime": metadata["prepared_mime"],
+        "prepared_width": metadata["prepared_width"],
+        "prepared_height": metadata["prepared_height"],
+        "resized": metadata["resized"],
+        "png_to_jpeg": metadata["png_to_jpeg"],
+    }
+
+    _emit_image_extraction_log(
+        {
+            **base_payload,
+            "status": "started",
+            "latency_ms": 0,
+            "transcript_chars": 0,
+            "warning_types": [],
+            "error_type": None,
+        }
+    )
+
+    if not api_key:
+        note = "图片识别未配置(DASHSCOPE_API_KEY 未设置)"
+        note_type = _classify_note_type(note)
+        _emit_image_extraction_log(
+            {
+                **base_payload,
+                "status": "failed",
+                "latency_ms": 0,
+                "transcript_chars": 0,
+                "warning_types": [] if note_type is None else [note_type],
+                "error_type": None,
+            }
+        )
+        return None, note, metadata
+
+    start = time.perf_counter()
+    try:
+        client = OpenAI(api_key=api_key, base_url=OCR_BASE_URL)
+        response = client.chat.completions.create(
+            model=OCR_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": OCR_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url, "detail": "high"},
+                        },
+                    ],
+                }
+            ],
+            timeout=OCR_TIMEOUT_SECONDS,
+        )
+        text = _content_to_text(response.choices[0].message.content).strip()
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        if len(text) < 5:
+            note = "这张图里没有识别到文字,原件已完整保存"
+            note_type = _classify_note_type(note)
+            _emit_image_extraction_log(
+                {
+                    **base_payload,
+                    "status": "failed",
+                    "latency_ms": latency_ms,
+                    "transcript_chars": 0,
+                    "warning_types": [] if note_type is None else [note_type],
+                    "error_type": None,
+                }
+            )
+            return None, note, metadata
+
+        _emit_image_extraction_log(
+            {
+                **base_payload,
+                "status": "succeeded",
+                "latency_ms": latency_ms,
+                "transcript_chars": len(text),
+                "warning_types": [],
+                "error_type": None,
+            }
+        )
+        return text, "", metadata
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        _log_failure(exc, api_key)
+        note = _classify_exception(exc, api_key)
+        note_type = _classify_note_type(note)
+        _emit_image_extraction_log(
+            {
+                **base_payload,
+                "status": "failed",
+                "latency_ms": latency_ms,
+                "transcript_chars": 0,
+                "warning_types": [] if note_type is None else [note_type],
+                "error_type": type(exc).__name__,
+            }
+        )
+        return None, note, metadata
 
 
 def image_to_text(image_bytes: bytes, mime_type: str) -> tuple[str | None, str]:

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import tempfile
 import time
 import traceback
@@ -24,7 +25,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm, ocr
-from app.extract import extract_text
+from app.extract import extract_image_text_with_metadata, extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
 from app.pdf_report import PDF_FILENAME_PREFIX, build_evidence_pdf
@@ -41,7 +42,7 @@ from app.sandbox import (
 )
 from evidence_core import chain
 from evidence_core.db import init_db
-from evidence_core.extraction_store import create_extraction, get_latest_extraction
+from evidence_core.extraction_store import create_extraction, get_latest_extraction, list_extractions
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
@@ -54,6 +55,7 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_LLM_TEXT_LENGTH = 8_000
 MAX_OCR_TEXT_LENGTH = 50_000
+WORKCHAIN_DIAGNOSTICS_ENV = "WORKCHAIN_DIAGNOSTICS"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PARSE_STATUS_OCR_RUNNING = "ocr_running"
 PARSE_STATUS_LLM_RUNNING = "llm_running"
@@ -107,6 +109,70 @@ def get_conn(sandbox: SandboxContext = Depends(get_sandbox)) -> Generator[sqlite
 
 def _open_write_connection(db_path: Path) -> sqlite3.Connection:
     return init_db(db_path)
+
+
+def _diagnostics_enabled() -> bool:
+    return os.getenv(WORKCHAIN_DIAGNOSTICS_ENV, "").strip() == "1"
+
+
+def _emit_structured_log(event: str, payload: dict[str, Any]) -> None:
+    print(
+        json.dumps({"event": event, **payload}, ensure_ascii=False, separators=(",", ":")),
+        file=sys.stderr,
+    )
+
+
+def _provider_label(provider: str | None) -> str:
+    mapping = {
+        "dashscope": "DashScope",
+        "manual": "人工校正",
+        "builtin": "Builtin",
+        "deepseek": "DeepSeek",
+    }
+    if not provider:
+        return "未知来源"
+    return mapping.get(provider, provider)
+
+
+def _extraction_origin_label(origin: str | None) -> str:
+    if origin == "machine":
+        return "机器提取"
+    if origin == "user":
+        return "人工校正"
+    return "未知来源"
+
+
+def _format_extraction_item(extraction: dict[str, Any]) -> dict[str, Any]:
+    origin = extraction.get("origin")
+    provider = extraction.get("provider")
+    model = extraction.get("model")
+    created_at = extraction.get("created_at")
+    created_at_text = _format_datetime(created_at, "%Y-%m-%d %H:%M:%S") if isinstance(created_at, int) else None
+    summary = _extraction_origin_label(origin)
+    provider_label = _provider_label(provider)
+    if model:
+        summary = f"{summary} · {provider_label} / {model}"
+    elif provider:
+        summary = f"{summary} · {provider_label}"
+    return {
+        "origin": origin,
+        "origin_label": _extraction_origin_label(origin),
+        "provider": provider,
+        "provider_label": provider_label,
+        "model": model,
+        "created_at": created_at,
+        "created_at_text": created_at_text,
+        "summary": summary,
+    }
+
+
+def _production_image_pipeline_info() -> dict[str, Any]:
+    return {
+        "provider": "dashscope",
+        "provider_label": _provider_label("dashscope"),
+        "model": ocr.OCR_MODEL,
+        "route": "app.main._run_image_pipeline -> app.extract -> app.ocr",
+    }
 
 
 def _truncate_text(value: str, limit: int = 100) -> str:
@@ -683,6 +749,23 @@ def _run_parse_pipeline(
     text: str,
     counterpart: str | None,
 ) -> None:
+    log_base = {
+        "evidence_id": evidence_id,
+        "provider": "deepseek",
+        "model": llm.get_deepseek_model(),
+        "input_chars": len(text),
+    }
+    parse_start = time.perf_counter()
+    _emit_structured_log(
+        "semantic_parse",
+        {
+            **log_base,
+            "status": "started",
+            "latency_ms": 0,
+            "parse_success": False,
+            "failure_type": None,
+        },
+    )
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
         conn = init_db(sandbox_db_path)
@@ -691,6 +774,16 @@ def _run_parse_pipeline(
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
+        _emit_structured_log(
+            "semantic_parse",
+            {
+                **log_base,
+                "status": "failed",
+                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                "parse_success": False,
+                "failure_type": "not_configured",
+            },
+        )
         return
 
     allowed, reason = _consume_parse_budget(sandbox_db_path, global_meta_db_path)
@@ -701,6 +794,16 @@ def _run_parse_pipeline(
             _set_parse_detail(conn, evidence_id, reason or "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
+        _emit_structured_log(
+            "semantic_parse",
+            {
+                **log_base,
+                "status": "failed",
+                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                "parse_success": False,
+                "failure_type": "budget_exhausted",
+            },
+        )
         return
 
     context = get_settings(sandbox_db_path)
@@ -719,6 +822,16 @@ def _run_parse_pipeline(
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
+        _emit_structured_log(
+            "semantic_parse",
+            {
+                **log_base,
+                "status": "failed",
+                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                "parse_success": False,
+                "failure_type": "provider_unavailable_or_invalid_response",
+            },
+        )
         return
 
     conn = init_db(sandbox_db_path)
@@ -747,10 +860,30 @@ def _run_parse_pipeline(
         _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
         _set_parse_detail(conn, evidence_id, "")
         conn.commit()
+        _emit_structured_log(
+            "semantic_parse",
+            {
+                **log_base,
+                "status": "succeeded",
+                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                "parse_success": True,
+                "failure_type": None,
+            },
+        )
     except Exception:
         conn.rollback()
         _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
         _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
+        _emit_structured_log(
+            "semantic_parse",
+            {
+                **log_base,
+                "status": "failed",
+                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                "parse_success": False,
+                "failure_type": "persistence_error",
+            },
+        )
     finally:
         conn.close()
 
@@ -763,7 +896,11 @@ def _run_image_pipeline(
     filename: str | None,
     counterpart: str | None,
 ) -> None:
-    extracted_text, extract_status = extract_text(image_bytes, "image", filename or "")
+    extracted_text, extract_status, _ = extract_image_text_with_metadata(
+        image_bytes,
+        filename or "",
+        evidence_id=evidence_id,
+    )
     conn = init_db(sandbox_db_path)
     try:
         if extracted_text is None:
@@ -1182,6 +1319,8 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
     extracted_text = _extract_file_text(raw_text)
+    extraction_history = [_format_extraction_item(item) for item in list_extractions(conn, evidence_id)]
+    current_extraction = extraction_history[-1] if extraction_history else None
     return {
         "evidence_id": row["evidence_id"],
         "seq": row["seq"],
@@ -1209,6 +1348,44 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "is_file": row["media_type"] == "file",
         "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
         "has_extracted_text": extracted_text is not None,
+        "current_extraction": current_extraction,
+        "extraction_history": extraction_history,
+    }
+
+
+def _build_evidence_diagnostics(
+    conn: sqlite3.Connection,
+    *,
+    evidence: dict[str, Any],
+    parse_status: str,
+    parse_detail: str | None,
+) -> dict[str, Any]:
+    return {
+        "evidence_id": evidence["evidence_id"],
+        "parse_status": parse_status,
+        "parse_detail": parse_detail,
+        "extraction_history": [
+            {
+                "origin": item["origin"],
+                "origin_label": item["origin_label"],
+                "provider": item["provider"],
+                "provider_label": item["provider_label"],
+                "model": item["model"],
+                "created_at": item["created_at"],
+                "created_at_text": item["created_at_text"],
+            }
+            for item in evidence["extraction_history"]
+        ],
+        "image_pipeline": {
+            "actual_provider": _production_image_pipeline_info()["provider"],
+            "actual_provider_label": _production_image_pipeline_info()["provider_label"],
+            "actual_model": _production_image_pipeline_info()["model"],
+        },
+        "text_llm": {
+            "provider": "deepseek",
+            "provider_label": _provider_label("deepseek"),
+            "model": llm.get_deepseek_model(),
+        },
     }
 
 
@@ -1271,7 +1448,7 @@ def create_app() -> FastAPI:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": "deepseek-chat",
+                    "model": llm.get_deepseek_model(),
                     "messages": [{"role": "user", "content": "ping"}],
                     "max_tokens": 1,
                 },
@@ -1310,6 +1487,31 @@ def create_app() -> FastAPI:
     @app.get("/api/diag/ocr")
     def diag_ocr() -> dict[str, Any]:
         return ocr.diagnose_ocr()
+
+    @app.get("/api/evidence/{evidence_id}/diagnostics")
+    def evidence_diagnostics(
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> dict[str, Any]:
+        if not _diagnostics_enabled():
+            raise HTTPException(status_code=404, detail="diagnostics disabled")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            evidence = _fetch_evidence_detail(conn, evidence_id)
+            if evidence is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            extract_note = _get_extract_note(conn, evidence_id)
+            parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
+            parse_status = _get_parse_status(conn, evidence_id)
+            return _build_evidence_diagnostics(
+                conn,
+                evidence=evidence,
+                parse_status=parse_status,
+                parse_detail=parse_detail,
+            )
+        finally:
+            conn.close()
 
     @app.get("/api/evidence/{evidence_id}/status")
     def evidence_status(
@@ -1592,6 +1794,16 @@ def create_app() -> FastAPI:
             parse_detail = extract_note or _get_parse_detail(status_conn, evidence_id)
             is_verified = _is_verified(status_conn, evidence_id)
             is_ocr_corrected = _is_ocr_corrected(status_conn, evidence_id)
+            diagnostics = None
+            diagnostics_json = None
+            if _diagnostics_enabled():
+                diagnostics = _build_evidence_diagnostics(
+                    status_conn,
+                    evidence=context,
+                    parse_status=parse_status,
+                    parse_detail=parse_detail,
+                )
+                diagnostics_json = json.dumps(diagnostics, ensure_ascii=False, indent=2)
         finally:
             status_conn.close()
 
@@ -1605,6 +1817,9 @@ def create_app() -> FastAPI:
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
                 "is_ocr_corrected": is_ocr_corrected,
+                "diagnostics_enabled": _diagnostics_enabled(),
+                "diagnostics": diagnostics,
+                "diagnostics_json": diagnostics_json,
                 "current_search_q": "",
             },
         )
