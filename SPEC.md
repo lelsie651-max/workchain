@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.0 · 最后更新 2026-08-07
+> 版本 v1.1 · 最后更新 2026-08-08
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -41,12 +41,13 @@
 > 这一节最重要。后续任何人想改架构,先读这里。
 
 ### D1. 不接入任何 IM 平台 API
-**决策**:不做飞书/钉钉/企微开放平台集成。输入只有三种:截图粘贴、文字粘贴、文件上传(txt/word/pdf)。
+**决策**:不做飞书/钉钉/企微开放平台集成。输入只接受用户主动提交的原始材料:文字粘贴、截图/图片上传、文件上传(`txt / pdf / docx`)。
 
 **理由**:
 - 穷举集成是无底洞(QQ、微信、企微、Teams、邮件…)
 - 敏感权限需企业管理员审批,不可控
 - **截图是唯一的通用协议**,任何平台都能截图
+- 文件上传作为补充入口,复用同一条证据链,不另起第二套模型
 
 **代价**:每次记录有约 8-10 秒的应用切换摩擦。已知,接受。这是留存率的天花板,后续优化方向为浏览器插件 / 全局热键。
 
@@ -80,12 +81,24 @@
 
 **理由**:准确率的锅甩掉一半,且用户每次确认都是标注数据。
 
-### D5. AI 分两段,不用多模态大模型
+### D5. AI 分两段,复用同一条文本解析链
 **决策**:
-- 图 → 文:本地 OCR(PaddleOCR,离线免费,中文识别好)
-- 文 → 槽位:DeepSeek API(deepseek-chat,纯文本)
+- 图 → 文:阿里云百炼 `vanchin/deepseek-ocr`(OpenAI 兼容接口)
+- 文档 → 文:`pypdf` / `python-docx` / 文本解码
+- 文 → 槽位:DeepSeek `deepseek-chat`(纯文本)
 
-**理由**:DeepSeek 主力 API 不支持图像输入。两段式反而更可控,且 OCR 本地化符合"数据不出本机"的隐私卖点。
+**理由**:
+- OCR 模型只负责把图片转成文字,不负责理解业务语义
+- 文档提取与 OCR 产物统一落到 `raw_text`,后续搜索、导出、详情页、LLM 槽位抽取全部复用同一链路
+- 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
+
+### D6. 访客沙箱优先于账号体系
+**决策**:当前阶段不引入登录系统。每个访客通过 `wc_sid` cookie 获得一个独立沙箱(SQLite + blobs 副本),24 小时后自动清理。
+
+**理由**:
+- 演示与真实试用可以共存,且互不影响
+- 避免在早期阶段把精力耗在账号、权限、找回、风控上
+- 让"先试一下"的成本最低,适合演示和评审
 
 ---
 
@@ -137,7 +150,7 @@
 | **原始载荷** | | |
 | media_type | TEXT NOT NULL | image / text / file |
 | blob_path | TEXT | 内容寻址路径 |
-| raw_text | TEXT | OCR 结果或粘贴原文 |
+| raw_text | TEXT | 原文 / 文档提取文本 / OCR 文本 / 人工校正后的 OCR 文本 |
 | source_hint | TEXT | 如"飞书群-项目A" |
 | **五槽位** | | 全部可空,空即未识别 |
 | slot_requester | TEXT | actor_id |
@@ -180,6 +193,30 @@
 | `overdue` | 超期未交付 | 中 |
 | `unconfirmed` | 变更后 7 天内无 confirm | **最高(演示王牌)** |
 
+### 3.6 meta(KV 元信息)
+
+`meta` 表除 `schema_version` 外,还承载运行态与配置态信息。当前工程中已实际使用以下键约定:
+
+| key 模式 | value | 用途 |
+|---|---|---|
+| `schema_version` | `1` | schema 版本 |
+| `parse_status:{evidence_id}` | `ocr_running / llm_running / done / failed / unsupported` | 解析状态机 |
+| `parse_detail:{evidence_id}` | TEXT | 解析失败或降级说明 |
+| `extract_note:{evidence_id}` | TEXT | 文档提取 / OCR 的具体失败原因 |
+| `verified:{evidence_id}` | `1` | 用户人工确认标记 |
+| `ocr_corrected:{evidence_id}` | `0/1` | OCR 文本是否被人工校正 |
+| `parse_count:{YYYY-MM-DD}` | 整数 | 沙箱内每日 LLM 解析计数 |
+| `global_parse_count:{YYYY-MM-DD}` | 整数 | 全站每日 LLM 解析计数 |
+| `ocr_count:{YYYY-MM-DD}` | 整数 | 沙箱内每日 OCR 计数 |
+| `global_ocr_count:{YYYY-MM-DD}` | 整数 | 全站每日 OCR 计数 |
+| `settings:self_names` | JSON 数组 | 访客身份称呼 |
+| `settings:glossary` | JSON 数组 | 访客私人词典 |
+
+其中 `parse_status` 当前约定:
+- `ocr_running`: 正在读取图片中的文字
+- `llm_running`: 正在理解这段对话
+- `done / failed / unsupported`: 含义保持不变
+
 ---
 
 ## 4. 哈希链算法(核心)
@@ -220,13 +257,16 @@ chain_hash    = SHA256((prev_hash + record_digest).encode('ascii')).hexdigest()
 
 ```
 export/
-  manifest.json   # {version, generated_at, records:[...], checkpoints:[...]}
+  manifest.json         # {version, generated_at, records:[...], checkpoints:[...]}
   blobs/
-  verify.py       # 独立验证器,自包含
+  verify.py             # 独立验证器,自包含
+  workchain-记录-*.pdf   # 给人读的 PDF
+  怎么验证这份材料.txt    # 大白话说明
 ```
 
 - manifest 每条 record 含:7 个摘要字段 + record_digest + prev_hash + chain_hash + blob 相对路径
-- **不含任何 slot_* / plain_summary / caveats**(举证包不携带 AI 解读)
+- **manifest 不含任何 slot_* / plain_summary / caveats**(举证包的机器校验部分不携带 AI 解读)
+- PDF 允许包含 plain_summary / deliverable / due / caveats,因为 PDF 的定位是"给人读"
 
 ### 4.5 verify.py 要求
 
@@ -259,47 +299,57 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 语言 | Python 3.11+ | |
 | 存储 | SQLite | 无 ORM,直接 sqlite3 |
 | 哈希 | hashlib 标准库 | |
-| OCR | PaddleOCR | 本地离线,中文优先 |
-| LLM | DeepSeek `deepseek-chat` | 纯文本,不支持图像 |
-| 后端 | FastAPI | 第二阶段引入 |
-| 前端 | 待定 | 第三阶段 |
+| OCR | DashScope `vanchin/deepseek-ocr` | OpenAI 兼容接口;仅做图转文 |
+| 文档提取 | `pypdf` / `python-docx` | PDF / docx / txt |
+| LLM | DeepSeek `deepseek-chat` | 纯文本槽位抽取 |
+| 后端 | FastAPI | 已落地 |
+| 前端 | Jinja2 Templates + 原生 JS + Tailwind CDN | 已落地 |
 | 测试 | pytest | |
+| PDF 导出 | reportlab + pypdf | 生成与中文可读回验证 |
 
-密钥管理:`.env`(必须写入 `.gitignore`),变量名 `DEEPSEEK_API_KEY`。
+密钥管理:`.env`(必须写入 `.gitignore`),当前变量:
+- `DEEPSEEK_API_KEY`
+- `DASHSCOPE_API_KEY`
 
 ---
 
-## 6. 阶段规划
+## 6. 当前实现进度
 
-### 阶段一:数据层 + 哈希链(当前)
-产出:`evidence_core/` + `verify.py` + 完整测试
-**禁止**:任何 UI、任何 LLM 调用、任何 Web 框架、任何 OCR
-
-拆分为 6 个 IDE 指令:
-1. 工程初始化 + `canonical.py`
-2. `db.py` schema
-3. `chain.py`
-4. `store.py`
-5. `export.py` + `verify.py`
-6. 全量测试
-
-**必须通过的测试**:
-1. 连续写入 100 条,verify_chain 返回 True
-2. 篡改任意 blob 字节 → 验证失败且定位到正确 seq
-3. 直接改库里某条 occurred_at → 验证失败
-4. 删除中间一条 → 检出 seq 缺口
-5. **改全部槽位与 plain_summary → 全链仍通过**(证明 D2 正确实现)
-6. canonical_json 确定性:含中文/null/键序打乱的等价输入,输出 bytes 完全一致
-7. 导出后在临时目录跑 verify.py,exit code 为 0
+### 阶段一:数据层 + 哈希链
+**已完成**
+- `evidence_core/` 的 canonical / schema / chain / store / export 全链路
+- 独立 `verify.py`
+- checkpoint 校验
 
 ### 阶段二:AI 解析
-OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正交互
+**已完成首版**
+- DeepSeek 文本槽位抽取
+- PDF / docx / txt 文档提取
+- 图片 OCR → 文本 → 现有槽位抽取链路
+- 身份设置(`self_names`)与私人词典(`glossary`)
+- 人工槽位修正
+- OCR 文字人工校正后重新解析
 
 ### 阶段三:归并与检测
-实体对齐(人名消解)→ 事项线归并三路打分 → 变更检测与 risk_flags
+**已完成首版**
+- Actor 归一与词典辅助别名回写
+- 事项线展示
+- 风险标签与变更提示
+- 搜索覆盖 `raw_text` / `plain_summary` / actor 关联信息
 
-### 阶段四:界面与演示
-粘贴入口 → 事项线时间轴("职场连续剧"视觉)→ 举证包导出 → 演示数据准备
+### 阶段四:界面与导出
+**已完成首版**
+- FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
+- 访客沙箱(`wc_sid`)与 24 小时过期清理
+- 图片/文档上传、预览、Lightbox
+- PDF 导出
+- 完整举证包 zip 导出(全链)
+- `/api/diag/llm` 与 `/api/diag/ocr` 连通性自检
+
+### 下一阶段
+- TSA/外部时间锚点,进一步补强 checkpoint 之后的链尾截断问题
+- 更稳健的事项线自动归并策略
+- 更细的权限/账号体系(若未来从访客模式转正)
 
 ---
 
@@ -311,6 +361,10 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 | 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |
 | 2026-08-07 | 新增 export.py 与独立 verify.py | 阶段一收尾 |
+| 2026-08-07 | Web 应用、访客沙箱、搜索、帮助页与导出入口落地 | 项目已进入可演示可试用状态 |
+| 2026-08-07 | 新增 PDF / docx / txt 提取链路 | 文件类证据需进入统一解析与搜索链路 |
+| 2026-08-08 | 图片 OCR 改为 DashScope `vanchin/deepseek-ocr`;新增 `/api/diag/ocr` | 当前工程已不再使用本地 PaddleOCR 方案 |
+| 2026-08-08 | 新增 `ocr_running` / `llm_running` 状态、OCR 文本人工校正、举证包附带 PDF 与说明文件 | 让处理过程可见、结果可追溯,并与现有导出物保持一致 |
 
 ---
 
@@ -339,3 +393,5 @@ OCR 接入 → DeepSeek 槽位抽取 → plain_summary 生成 → 槽位校正�
 - checkpoints 表本身若被一并删除,verify_chain 无法检测。
   自持有数据无法自我封堵此风险;缓解方式是举证包一经导出交付,
   对方持有的 manifest 即成为外部锚点。彻底方案为 TSA 时间戳。
+- OCR 与 LLM 当前都依赖外部 API,未配置 key 时系统会优雅降级,但不会自动解析图片或文本。
+- `raw_text` 承担搜索、展示与后续解析输入;它允许文档提取文本、OCR 文本和人工校正文本覆盖展示层,但这类变化都不进入摘要计算,见 D2。
