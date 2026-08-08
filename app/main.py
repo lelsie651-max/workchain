@@ -23,7 +23,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import llm
+from app import llm, ocr
 from app.extract import extract_text
 from app.labels import KIND, RISK, STATUS, source_badge_class, source_label, thread_headline
 from app.labels import SOURCE_PRESETS
@@ -127,14 +127,14 @@ def _format_bytes(size: int) -> str:
 
 
 def _extract_filename(raw_text: str | None) -> str | None:
-    if not raw_text or not raw_text.startswith("[文件] "):
+    if not raw_text or not (raw_text.startswith("[文件] ") or raw_text.startswith("[图片] ")):
         return None
     first_line = raw_text.splitlines()[0]
     return first_line[5:]
 
 
 def _extract_file_text(raw_text: str | None) -> str | None:
-    if not raw_text or not raw_text.startswith("[文件] "):
+    if not raw_text or not (raw_text.startswith("[文件] ") or raw_text.startswith("[图片] ")):
         return None
     parts = raw_text.split("\n\n", 1)
     if len(parts) != 2:
@@ -233,9 +233,10 @@ def _ensure_upload_budget(conn: sqlite3.Connection, blobs_root: Path, blob_bytes
         raise HTTPException(status_code=400, detail="这个沙箱累计上传已超过 50 MB")
 
 
-def _build_file_label(filename: str | None) -> str:
+def _build_attachment_label(media_type: str, filename: str | None) -> str:
     clean_name = (filename or "未命名文件").strip() or "未命名文件"
-    return f"[文件] {clean_name}"
+    prefix = "[图片]" if media_type == "image" else "[文件]"
+    return f"{prefix} {clean_name}"
 
 
 def _build_content_disposition(disposition: str, filename: str | None) -> str:
@@ -271,6 +272,8 @@ def _llm_input_text(text: str) -> str:
 
 
 def _saved_original_detail(note: str) -> str:
+    if "原件已完整保存" in note:
+        return note
     note = note.rstrip("。")
     return f"{note}。原件已完整保存。"
 
@@ -407,6 +410,14 @@ def _global_parse_count_key(today: str) -> str:
     return f"global_parse_count:{today}"
 
 
+def _ocr_count_key(today: str) -> str:
+    return f"ocr_count:{today}"
+
+
+def _global_ocr_count_key(today: str) -> str:
+    return f"global_ocr_count:{today}"
+
+
 def _set_parse_status(conn: sqlite3.Connection, evidence_id: str, status: str) -> None:
     _set_meta_value(conn, _parse_status_key(evidence_id), status)
     conn.commit()
@@ -514,35 +525,69 @@ def _try_increment_meta_counter(conn: sqlite3.Connection, key: str, limit: int) 
         raise
 
 
-def _consume_parse_budget(sandbox_db_path: Path, global_meta_db_path: Path) -> tuple[bool, str | None]:
-    today = _today_str()
+def _rollback_meta_counter(db_path: Path, key: str, *, global_meta: bool = False) -> None:
+    conn = _open_meta_connection(db_path) if global_meta else init_db(db_path)
+    try:
+        current_raw = _get_meta_value(conn, key)
+        current = 0 if current_raw is None else int(current_raw)
+        _set_meta_value(conn, key, str(max(0, current - 1)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _consume_daily_budget(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    *,
+    sandbox_key: str,
+    global_key: str,
+    sandbox_limit: int,
+    global_limit: int,
+    failure_detail: str,
+) -> tuple[bool, str | None]:
     sandbox_conn = init_db(sandbox_db_path)
     try:
-        if not _try_increment_meta_counter(sandbox_conn, _parse_count_key(today), 20):
-            return False, "今日解析次数已用完,记录仍已保存"
+        if not _try_increment_meta_counter(sandbox_conn, sandbox_key, sandbox_limit):
+            return False, failure_detail
     finally:
         sandbox_conn.close()
 
     global_conn = _open_meta_connection(global_meta_db_path)
     try:
-        if not _try_increment_meta_counter(global_conn, _global_parse_count_key(today), 300):
-            sandbox_rollback_conn = init_db(sandbox_db_path)
-            try:
-                sandbox_conn_value = _get_meta_value(sandbox_rollback_conn, _parse_count_key(today))
-                current = 0 if sandbox_conn_value is None else int(sandbox_conn_value)
-                _set_meta_value(
-                    sandbox_rollback_conn,
-                    _parse_count_key(today),
-                    str(max(0, current - 1)),
-                )
-                sandbox_rollback_conn.commit()
-            finally:
-                sandbox_rollback_conn.close()
-            return False, "今日解析次数已用完,记录仍已保存"
+        if not _try_increment_meta_counter(global_conn, global_key, global_limit):
+            _rollback_meta_counter(sandbox_db_path, sandbox_key)
+            return False, failure_detail
     finally:
         global_conn.close()
 
     return True, None
+
+
+def _consume_parse_budget(sandbox_db_path: Path, global_meta_db_path: Path) -> tuple[bool, str | None]:
+    today = _today_str()
+    return _consume_daily_budget(
+        sandbox_db_path,
+        global_meta_db_path,
+        sandbox_key=_parse_count_key(today),
+        global_key=_global_parse_count_key(today),
+        sandbox_limit=20,
+        global_limit=300,
+        failure_detail="今日解析次数已用完,记录仍已保存",
+    )
+
+
+def _consume_ocr_budget(sandbox_db_path: Path, global_meta_db_path: Path) -> tuple[bool, str | None]:
+    today = _today_str()
+    return _consume_daily_budget(
+        sandbox_db_path,
+        global_meta_db_path,
+        sandbox_key=_ocr_count_key(today),
+        global_key=_global_ocr_count_key(today),
+        sandbox_limit=20,
+        global_limit=300,
+        failure_detail="今日图片识别次数已用完,原件已完整保存",
+    )
 
 
 def _final_kind(parsed: dict[str, Any], slot_requester: str | None, slot_owner: str | None, slot_due: int | None) -> str:
@@ -703,6 +748,7 @@ def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, 
         "filename": filename,
         "is_image": row["media_type"] == "image",
         "is_file": row["media_type"] == "file",
+        "has_extracted_text": extracted_text is not None,
     }
 
 
@@ -1042,6 +1088,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "is_image": row["media_type"] == "image",
         "is_file": row["media_type"] == "file",
         "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
+        "has_extracted_text": extracted_text is not None,
     }
 
 
@@ -1528,14 +1575,33 @@ def create_app() -> FastAPI:
                 media_type = upload_media_type
                 append_payload = file_bytes
                 filename = upload.filename if upload is not None else None
-                raw_text_override = _build_file_label(filename)
+                raw_text_override = _build_attachment_label(media_type, filename)
                 if media_type == "image":
-                    parse_status = "unsupported"
-                    parse_detail = _unsupported_detail(media_type)
+                    if not ocr.is_configured():
+                        parse_status = "unsupported"
+                        extract_note = "图片识别未配置"
+                        parse_detail = _saved_original_detail(extract_note)
+                    else:
+                        allowed, reason = _consume_ocr_budget(sandbox.db_path, request.app.state.global_meta_db_path)
+                        if allowed:
+                            extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
+                            if extracted_text is not None:
+                                raw_text_override = f"{_build_attachment_label(media_type, filename)}\n\n{extracted_text}"
+                                extracted_for_parse = extracted_text
+                                parse_status = "pending"
+                                parse_detail = ""
+                            else:
+                                parse_status = "unsupported"
+                                extract_note = extract_status
+                                parse_detail = _saved_original_detail(extract_status)
+                        else:
+                            parse_status = "unsupported"
+                            extract_note = reason
+                            parse_detail = _saved_original_detail(reason or "图片识别暂不可用")
                 else:
                     extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
                     if extracted_text is not None:
-                        raw_text_override = f"{_build_file_label(filename)}\n\n{extracted_text}"
+                        raw_text_override = f"{_build_attachment_label(media_type, filename)}\n\n{extracted_text}"
                         extracted_for_parse = extracted_text
                         parse_status = "pending"
                         parse_detail = ""

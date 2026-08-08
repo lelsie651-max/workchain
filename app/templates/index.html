@@ -318,6 +318,19 @@
                             >
                         </button>
                         <p class="mt-2 text-xs text-slate-500">{{ item.filename or "未命名图片" }}</p>
+                        {% if item.has_extracted_text %}
+                        <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-3">
+                            <p class="text-xs text-slate-400">识别到的文字</p>
+                            <p
+                                data-raw-preview
+                                class="mt-2 {% if item.is_long_text %}{% else %}hidden{% endif %}"
+                            >{{ item.raw_text_preview }}</p>
+                            <div
+                                data-raw-full
+                                class="mt-2 {% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
+                            >{{ item.display_text }}</div>
+                        </div>
+                        {% endif %}
                         {% elif item.is_file %}
                         <div class="space-y-3">
                             <a
@@ -350,7 +363,7 @@
                         {% endif %}
                     </div>
                     <div class="mt-3 flex flex-wrap items-center gap-3">
-                        {% if item.is_long_text and not item.is_image %}
+                        {% if item.is_long_text and (not item.is_image or item.has_extracted_text) %}
                         <button
                             type="button"
                             data-toggle-fulltext
@@ -368,7 +381,7 @@
                     </div>
                     <div class="mt-3 text-sm text-slate-300" data-parse-body>
                         {% if item.parse_status == "pending" %}
-                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>解析中…</p>
+                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>{% if item.is_image %}正在识别图片中的文字…{% else %}解析中…{% endif %}</p>
                         {% elif item.parse_status == "done" %}
                         {% if item.plain_summary %}
                         <p class="text-slate-200">{{ item.plain_summary }}</p>
@@ -390,7 +403,7 @@
                         {% endif %}
                         <p class="mt-2 text-slate-400">
                             {% if item.extract_note %}
-                            {{ item.extract_note }}。原件已完整保存。
+                            {{ item.extract_note }}
                             {% else %}
                             {{ item.parse_detail or "解析暂不可用,记录已完整保存" }}
                             {% endif %}

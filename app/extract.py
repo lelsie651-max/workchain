@@ -5,8 +5,23 @@ from io import BytesIO
 from docx import Document
 from pypdf import PdfReader
 
+from app import ocr
+
 
 MAX_EXTRACTED_TEXT_LENGTH = 50_000
+
+
+def _detect_image_mime_type(payload: bytes, filename: str) -> str:
+    lower_name = (filename or "").lower()
+    if payload.startswith(b"\x89PNG\r\n\x1a\n") or lower_name.endswith(".png"):
+        return "image/png"
+    if payload.startswith(b"\xff\xd8\xff") or lower_name.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if payload.startswith((b"GIF87a", b"GIF89a")) or lower_name.endswith(".gif"):
+        return "image/gif"
+    if (len(payload) >= 12 and payload.startswith(b"RIFF") and payload[8:12] == b"WEBP") or lower_name.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
 
 
 def _limit_text(text: str) -> tuple[str, str]:
@@ -72,7 +87,7 @@ def extract_text(payload: bytes, media_type: str, filename: str) -> tuple[str | 
     try:
         lower_name = (filename or "").lower()
         if media_type == "image":
-            return None, "图片内容识别暂未开放"
+            return ocr.image_to_text(payload, _detect_image_mime_type(payload, filename))
         if lower_name.endswith(".pdf"):
             return _extract_pdf_text(payload)
         if lower_name.endswith(".docx"):

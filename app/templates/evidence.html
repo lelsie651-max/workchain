@@ -44,6 +44,12 @@
             </a>
         </div>
         {% endif %}
+        {% if evidence.is_image and evidence.has_extracted_text %}
+        <div class="mb-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+            <p class="text-sm text-slate-300">识别到的文字</p>
+            <p class="mt-2 text-xs leading-6 text-slate-500">文字由图片自动识别,可能存在误差。原始图片已完整保存,识别结果不影响完整性校验。</p>
+        </div>
+        {% endif %}
         <pre class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.display_text }}</pre>
     </div>
 

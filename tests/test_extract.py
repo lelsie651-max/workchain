@@ -78,8 +78,9 @@ def test_extract_broken_pdf_returns_note_without_raising():
     assert "这份 PDF 暂时无法读取" in note
 
 
-def test_extract_image_returns_not_supported_note():
+def test_extract_image_without_ocr_config_returns_configured_note(monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     text, note = extract_text(PNG_BYTES, "image", "demo.png")
 
     assert text is None
-    assert note == "图片内容识别暂未开放"
+    assert note == "图片识别未配置"

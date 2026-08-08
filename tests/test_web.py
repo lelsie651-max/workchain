@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 from docx import Document
 from fastapi.testclient import TestClient
 import httpx
+from PIL import Image
 from pypdf import PdfReader
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -32,6 +33,18 @@ from evidence_core.store import verify_chain
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ioAAAAASUVORK5CYII="
 )
+
+
+def _disable_external_ai(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+
+def _build_png_bytes(width: int, height: int, color: tuple[int, int, int] = (32, 96, 160)) -> bytes:
+    image = Image.new("RGB", (width, height), color)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def _build_pdf_bytes(text: str | None = None, *, image_only: bool = False) -> bytes:
@@ -728,6 +741,7 @@ def test_export_pdf_thread_route_returns_404_across_sandboxes(tmp_path, monkeypa
 
 
 def test_upload_png_returns_image_media_type_and_verify_chain_passes(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -746,13 +760,14 @@ def test_upload_png_returns_image_media_type_and_verify_chain_passes(tmp_path, m
             (payload["evidence_id"],),
         ).fetchone()
         assert row["media_type"] == "image"
-        assert row["raw_text"] == "[文件] screen.png"
+        assert row["raw_text"] == "[图片] screen.png"
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()
 
 
 def test_same_image_upload_twice_reuses_blob_but_creates_two_evidence_rows(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -826,6 +841,7 @@ def test_unsupported_file_type_is_rejected(tmp_path, monkeypatch):
 
 
 def test_blob_route_returns_content_type_and_nosniff_header(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -841,6 +857,7 @@ def test_blob_route_returns_content_type_and_nosniff_header(tmp_path, monkeypatc
 
 
 def test_blob_route_returns_404_across_sandboxes(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     demo_dir = tmp_path / "web_demo_data"
     sandbox_root = tmp_path / "sandboxes"
     monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
@@ -857,7 +874,8 @@ def test_blob_route_returns_404_across_sandboxes(tmp_path, monkeypatch):
     assert blob_response.status_code == 404
 
 
-def test_image_upload_sets_unsupported_and_does_not_call_llm(tmp_path, monkeypatch):
+def test_image_upload_without_ocr_config_sets_unsupported_and_does_not_call_llm(tmp_path, monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
@@ -870,6 +888,7 @@ def test_image_upload_sets_unsupported_and_does_not_call_llm(tmp_path, monkeypat
     assert create_response.status_code == 200
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "unsupported"
+    assert "图片识别未配置" in status_response.json()["detail"]
     mock_extract.assert_not_called()
 
     db_path = _sandbox_db_path(client, sandbox_root)
@@ -884,7 +903,8 @@ def test_image_upload_sets_unsupported_and_does_not_call_llm(tmp_path, monkeypat
         conn.close()
 
 
-def test_image_upload_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
+def test_image_upload_without_ocr_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
@@ -896,15 +916,20 @@ def test_image_upload_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
     try:
+        ocr_counter = conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'ocr_count:%'"
+        ).fetchone()
         parse_counter = conn.execute(
             "SELECT value FROM meta WHERE key LIKE 'parse_count:%'"
         ).fetchone()
+        assert ocr_counter is None
         assert parse_counter is None
     finally:
         conn.close()
 
 
 def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -920,7 +945,7 @@ def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypa
             (evidence_id,),
         ).fetchone()
         assert row["media_type"] == "image"
-        assert row["raw_text"] == "[文件] annotated.png"
+        assert row["raw_text"] == "[图片] annotated.png"
         assert row["plain_summary"] == "这是我补充的说明"
     finally:
         conn.close()
@@ -1080,6 +1105,7 @@ def test_broken_pdf_upload_still_succeeds_and_marks_unsupported(tmp_path, monkey
 
 
 def test_multipart_file_only_submission_returns_200(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -1094,6 +1120,7 @@ def test_multipart_file_only_submission_returns_200(tmp_path, monkeypatch):
 
 
 def test_multipart_text_and_file_submission_returns_200(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -1115,6 +1142,183 @@ def test_multipart_text_and_file_submission_returns_200(tmp_path, monkeypatch):
         assert row["plain_summary"] == "说明"
     finally:
         conn.close()
+
+
+def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchable(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+            with client:
+                response = _upload_png(client, filename="ocr-success.png")
+                evidence_id = response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
+                search_response = client.get("/search", params={"q": "审批通过"})
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "pending"
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "done"
+    mock_extract.assert_called_once()
+    assert search_response.status_code == 200
+    assert "审批通过" in search_response.text
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT raw_text FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert row["raw_text"].startswith("[图片] ocr-success.png\n\n")
+        assert "审批通过,周五前交付渠道复盘数据" in row["raw_text"]
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_image_upload_ocr_timeout_still_succeeds_and_marks_unsupported(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = Mock(completions=Mock(create=Mock(side_effect=httpx.TimeoutException("boom"))))
+
+    with patch("app.ocr.OpenAI", FakeOpenAI):
+        with patch("app.main.llm.extract_slots") as mock_extract:
+            with client:
+                response = _upload_png(client, filename="ocr-timeout.png")
+                evidence_id = response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "unsupported"
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert "TimeoutException" in status_response.json()["detail"]
+    mock_extract.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        assert row["raw_text"] == "[图片] ocr-timeout.png"
+    finally:
+        conn.close()
+
+
+def test_image_upload_with_short_ocr_text_marks_unsupported_and_skips_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.extract.ocr.image_to_text", return_value=(None, "这张图里没有识别到文字,原件已完整保存")):
+        with patch("app.main.llm.extract_slots") as mock_extract:
+            with client:
+                response = _upload_png(client, filename="ocr-short.png")
+                evidence_id = response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "unsupported"
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert status_response.json()["detail"] == "这张图里没有识别到文字,原件已完整保存"
+    mock_extract.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute("SELECT raw_text FROM evidence WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        assert row["raw_text"] == "[图片] ocr-short.png"
+    finally:
+        conn.close()
+
+
+def test_large_image_is_resized_for_ocr_but_original_blob_bytes_are_preserved(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    large_png = _build_png_bytes(4000, 3000)
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = Mock(completions=Mock(create=self._create))
+
+        def _create(self, **kwargs):
+            data_url = kwargs["messages"][0]["content"][1]["image_url"]["url"]
+            prepared_bytes = base64.b64decode(data_url.split(",", 1)[1])
+            with Image.open(BytesIO(prepared_bytes)) as prepared_image:
+                captured["prepared_size"] = prepared_image.size
+                captured["prepared_format"] = prepared_image.format
+            return Mock(choices=[Mock(message=Mock(content="渠道复盘数据"))])
+
+    with patch("app.ocr.OpenAI", FakeOpenAI):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("huge.png", large_png, "image/png")},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "pending"
+    assert captured["prepared_size"] == (2000, 1500)
+    assert captured["prepared_format"] == "JPEG"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        row = conn.execute(
+            "SELECT blob_path FROM evidence WHERE evidence_id = ?",
+            (response.json()["evidence_id"],),
+        ).fetchone()
+        blob_path = db_path.parent / "blobs" / row["blob_path"]
+        blob_bytes = blob_path.read_bytes()
+        assert blob_bytes == large_png
+        with Image.open(BytesIO(blob_bytes)) as original_image:
+            assert original_image.size == (4000, 3000)
+    finally:
+        conn.close()
+
+
+def test_image_upload_ocr_limit_marks_21st_record_unsupported(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.extract.ocr.image_to_text", return_value=("渠道复盘数据", "")):
+        with client:
+            for idx in range(20):
+                response = _upload_png(client, filename=f"quota-{idx}.png")
+                assert response.status_code == 200
+                assert response.json()["parse_status"] == "pending"
+
+            last_response = _upload_png(client, filename="quota-21.png")
+            evidence_id = last_response.json()["evidence_id"]
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+
+    assert last_response.status_code == 200
+    assert last_response.json()["parse_status"] == "unsupported"
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "unsupported"
+    assert status_response.json()["detail"] == "今日图片识别次数已用完,原件已完整保存"
 
 
 def test_multipart_text_only_submission_returns_200(tmp_path, monkeypatch):
