@@ -98,7 +98,7 @@
 - 生产图片提取:默认使用 DashScope OCR,可通过 `WORKCHAIN_IMAGE_EXTRACTION_PROVIDER=ark_vision` 切到 Ark Vision 优先,并在 Ark 失败时按配置与 OCR 配额决定是否回退到 DashScope OCR
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
 - `Evidence -> Extraction(transcript + visual observations) -> Fact -> Event`
-- 文 → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
+- Extraction(`transcript + visual observations`) → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
 - Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
 - Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
 
@@ -108,7 +108,9 @@
 - Ark Vision 可同时产出 `transcript + observations`;其中 transcript 可作为旧文本解析链输入,observations 只进入 Extraction 层,不得混入 `raw_text`
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
+- Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
+- Observation 可以支持 Fact / Interpretation 生成,但不得越过“画面直接可观察事实”边界;若与 transcript 冲突,应显式保留 uncertainty / ambiguity,不得静默脑补
 - 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
 
@@ -487,7 +489,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 ### 阶段二:AI 解析
 **已完成首版**
 - DeepSeek 文本槽位抽取
-- Semantic Parser V2:文本 → Fact / Interpretation
+- Semantic Parser V2.2:Extraction transcript + visual observations → Fact / Interpretation
 - PDF / docx / txt 文档提取
 - 图片 OCR → 文本 → 现有槽位抽取链路
 - 身份设置(`self_names`)与私人词典(`glossary`)
@@ -542,6 +544,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | diagnostics 入口加开关保护,并新增 Ark Vision 只读实验对照接口 | 避免真实模型调用裸露对外,同时支持同 Evidence 的安全 A/B 视觉提取诊断 |
 | 2026-08-08 | Ark diagnostics Extraction 使用 disabled thinking,并拆分 text/vision 独立 timeout | 单独验证视觉 timeout 与推理开关对 Ark 实验提取成功率的影响,不改其它请求变量 |
 | 2026-08-08 | 生产图片 Extraction 改为 provider-aware 路由:默认 OCR,可切 Ark Vision,失败后按 OCR 配置与配额 fallback | 保持默认行为稳定,同时让 transcript 与 observations 分离落库并保留真实 provenance |
+| 2026-08-08 | Semantic Parser V2.2 支持同时消费 transcript + visual observations | 让语义解析可以基于文字与画面直接可观察事实共同生成 Fact / Interpretation,同时保持 Observation 边界与冲突显式化 |
 
 ---
 
