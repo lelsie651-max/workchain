@@ -7,7 +7,7 @@
 
 ## 0. 一句话定义
 
-**WorkChain 是一个职场证据链工具:你把聊天截图/文字粘进来,它自动读懂"谁在什么时候要求你做什么",生成不可篡改的证据链,并把散落的记录自动串成一条可追溯的"事项线"。**
+**WorkChain 是一个职场证据链工具:你把聊天截图/文字粘进来,它中立记录"谁对谁表达了什么、后来发生了什么变化",生成不可篡改的证据链,并把散落的记录自动串成一条可追溯的"事项线"。**
 
 演示话术(30 秒):
 > 老板说"这不是我要的"。你点开事项线:3月5日他的原话、你的确认回复、3月20日他改需求的截图、你产出的文件——一条完整的链,哈希校验通过,时间戳齐全。
@@ -31,7 +31,8 @@
 | **变更检测** | "需求改了 2 次,你没确认过" | 版本比对 + 风险标记 |
 
 ### 1.3 核心差异点
-- 市面所有 todo 工具只记"我欠别人什么";WorkChain 同时记 **"别人欠我什么"**
+- WorkChain 的核心对象不是"我的待办",而是**可验证的事实记录与变化过程**
+- "我的待办"只是基于可选身份(`self_names` / `is_self`)生成的一种视图,不是底层事实模型
 - 市面所有笔记工具的记录可随意篡改;WorkChain 的记录 **可被第三方独立验证**
 
 ---
@@ -59,22 +60,25 @@
 
 **验证方式**:测试用例 5 —— 修改全部槽位后全链验证仍须通过。
 
-### D3. 用"槽位填充"而非"二分类"判断是否为待办
-**决策**:不训练/不 prompt 一个"这是不是 todo"的分类器。改为抽取五个槽位,按填充数判定。
+### D3. 用槽位记录事实,而不是把底层记录直接做成"我的待办"
+**决策**:不训练/不 prompt 一个"这是不是 todo"的分类器。底层先抽取结构化槽位,用于还原对话中的关系、交付物、时间与变化;任何"我的待办"都只是后续视图层的投影。
 
 五槽位:
 1. **requester** 委托方
 2. **owner** 受托方
 3. **deliverable** 交付物
 4. **due** 时限
-5. **direction** 方向性(i_owe / owed_to_me / none)
+5. **direction** 面向当前身份视角的可选投影(i_owe / owed_to_me / none)
 
-**判定规则**:`slots_filled >= 3 且 direction != none` → 进待办;否则 `kind = reference`(参考信息,如八卦、通知)。
+**当前规则**:
+- 底层记录始终优先表达"发生了什么"
+- `kind` 用于区分 `request / confirm / change / deliver / dispute / reference`
+- `"我的待办"` 如需展示,应基于 `self_names / is_self + slot_* + kind` 在视图层派生,而不是反过来驱动事实层建模
 
 **理由**:
-- 八卦天然填不满槽位(无受托方、无交付物),不需要判断
-- **可解释**:用户看到的是"未识别到交付物和时限",而非"AI 觉得这不是待办"
-- 用户可手动补槽,立刻转为待办
+- 先记录事实,可以同时兼容"我视角""对方视角""第三方回放视角"
+- **可解释**:用户看到的是"系统识别到谁说了什么、谁确认了什么、哪里发生了变更",而不是"AI 觉得这是不是我的活"
+- 身份缺失、身份变化或多人协作场景下,底层模型仍然稳定
 
 ### D4. 归并不追求全自动
 **决策**:高分自动归并,中间地带出建议由用户一键确认,低分开新线。
@@ -121,7 +125,7 @@
 
 约束:`is_self = 1` 的行最多一条(partial unique index)。
 
-> `is_self` 是关键字段,`slot_direction` 由它推导,无需额外存储逻辑。
+> `is_self` 与 `self_names` 主要服务于"我的待办"这类视图层能力,不应反过来定义事实层本身。
 
 ### 3.2 threads(事项线)
 
@@ -130,8 +134,8 @@
 | thread_id | TEXT PK | `thr_xxx` |
 | title | TEXT | AI 生成,用户可改 |
 | status | TEXT NOT NULL | open / delivered / closed / disputed / abandoned |
-| owner_actor_id | TEXT | 当前受托方 |
-| requester_actor_id | TEXT | 委托方 |
+| owner_actor_id | TEXT | 当前主要受托方 |
+| requester_actor_id | TEXT | 当前主要委托方 |
 | current_deliverable | TEXT | 最新版交付物描述 |
 | current_due | INTEGER | 最新版时限 |
 | version | INTEGER NOT NULL | 变更次数,初始 1(即"第几集") |
@@ -158,7 +162,7 @@
 | slot_deliverable | TEXT | |
 | slot_due | INTEGER | 解析后时间戳 |
 | slot_due_raw | TEXT | "下周五"原文,保留歧义 |
-| slot_direction | TEXT | i_owe / owed_to_me / none |
+| slot_direction | TEXT | 面向当前身份视角的可选投影:i_owe / owed_to_me / none |
 | slots_filled | INTEGER NOT NULL | 0-4 |
 | **解读层** | | |
 | plain_summary | TEXT | 一句话:这段在要求你做什么 |
@@ -216,6 +220,8 @@
 - `ocr_running`: 正在读取图片中的文字
 - `llm_running`: 正在理解这段对话
 - `done / failed / unsupported`: 含义保持不变
+
+> `parse_status` 描述的是处理阶段,不是业务判断结果;业务展示应优先回到 `kind + slot_* + plain_summary + 变更链路` 这一层。
 
 ---
 
@@ -365,6 +371,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-07 | 新增 PDF / docx / txt 提取链路 | 文件类证据需进入统一解析与搜索链路 |
 | 2026-08-08 | 图片 OCR 改为 DashScope `vanchin/deepseek-ocr`;新增 `/api/diag/ocr` | 当前工程已不再使用本地 PaddleOCR 方案 |
 | 2026-08-08 | 新增 `ocr_running` / `llm_running` 状态、OCR 文本人工校正、举证包附带 PDF 与说明文件 | 让处理过程可见、结果可追溯,并与现有导出物保持一致 |
+| 2026-08-08 | 核心定位从"谁欠谁"调整为"中立记录谁对谁表达了什么、发生了什么变化" | `"我的待办"`降级为可选身份视图,不再作为底层事实模型的核心差异点 |
 
 ---
 
