@@ -137,6 +137,19 @@ def _multipart_request(
     )
 
 
+def _semantic_result(
+    *,
+    facts: list[dict[str, object]] | None = None,
+    interpretations: list[dict[str, object]] | None = None,
+    ambiguities: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "facts": facts or [],
+        "interpretations": interpretations or [],
+        "ambiguities": ambiguities or [],
+    }
+
+
 def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -490,7 +503,7 @@ def test_search_hits_extracted_document_text(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
     pdf_bytes = _build_pdf_bytes("独特关键词甲乙丙")
 
-    with patch("app.main.llm.extract_slots", return_value=None):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
         with client:
             upload_response = client.post(
                 "/api/evidence",
@@ -931,7 +944,7 @@ def test_image_upload_without_ocr_config_sets_unsupported_and_does_not_call_llm(
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
-    with patch("app.main.llm.extract_slots") as mock_extract:
+    with patch("app.main.semantic_llm.extract_semantics") as mock_extract:
         with client:
             create_response = _upload_png(client, filename="no-llm.png")
             evidence_id = create_response.json()["evidence_id"]
@@ -1013,20 +1026,32 @@ def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monk
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": "张总",
-        "owner_name": "我",
-        "deliverable": "渠道复盘数据",
-        "due_raw": "周五前",
-        "due_date": "2026-08-08",
-        "direction": "i_owe",
-        "kind": "request",
-        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
-        "caveats": ["先核对金额"],
-    }
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "有人要求在周五前交付渠道复盘数据。",
+                "actors": [{"name": "张总", "role": "requester"}],
+                "due_raw": "周五前",
+                "due_date": "2026-08-08",
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.91,
+            }
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "explanation",
+                "content": "这里的复盘指渠道复盘数据。",
+                "confidence": 0.8,
+            }
+        ],
+        ambiguities=["金额口径还需要人工核对。"],
+    )
 
     with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="ordered.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -1035,14 +1060,13 @@ def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monk
 
     assert index_response.status_code == 200
     assert detail_response.status_code == 200
-    assert index_response.text.index("图片里写着周五前交付渠道复盘数据。") < index_response.text.index("看看系统读到了什么")
-    assert detail_response.text.index("图片里写着周五前交付渠道复盘数据。") < detail_response.text.index("看看系统读到了什么")
-    index_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", index_response.text)
     detail_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", detail_response.text)
-    assert index_details is not None
     assert detail_details is not None
-    assert "open" not in index_details.group(0)
     assert "open" not in detail_details.group(0)
+    assert detail_response.text.index("事实整理") < detail_response.text.index("看看系统读到了什么")
+    assert detail_response.text.index("有人要求在周五前交付渠道复盘数据。") < detail_response.text.index("看看系统读到了什么")
+    assert "AI帮你理解" in detail_response.text
+    assert "金额口径还需要人工核对。" in detail_response.text
 
 
 def test_image_upload_without_ocr_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
@@ -1098,7 +1122,7 @@ def test_pdf_upload_extracts_text_into_raw_text_and_preserves_original_hash(tmp_
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     pdf_bytes = _build_pdf_bytes("渠道复盘数据")
 
-    with patch("app.main.llm.extract_slots", return_value=None):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
         with client:
             response = client.post(
                 "/api/evidence",
@@ -1128,7 +1152,7 @@ def test_docx_upload_extracts_paragraph_text(tmp_path, monkeypatch):
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     docx_bytes = _build_docx_bytes("第一段内容", "第二段内容")
 
-    with patch("app.main.llm.extract_slots", return_value=None):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
         with client:
             response = client.post(
                 "/api/evidence",
@@ -1152,7 +1176,7 @@ def test_txt_upload_extracts_utf8_and_gbk_text(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
-    with patch("app.main.llm.extract_slots", return_value=None):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
         with client:
             utf8_response = client.post(
                 "/api/evidence",
@@ -1186,7 +1210,7 @@ def test_image_only_pdf_upload_marks_unsupported_and_stores_extract_note(tmp_pat
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     image_pdf = _build_pdf_bytes(image_only=True)
 
-    with patch("app.main.llm.extract_slots") as mock_extract:
+    with patch("app.main.semantic_llm.extract_semantics") as mock_extract:
         with client:
             response = client.post(
                 "/api/evidence",
@@ -1221,7 +1245,7 @@ def test_broken_pdf_upload_still_succeeds_and_marks_unsupported(tmp_path, monkey
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     broken_pdf = b"%PDF-broken"
 
-    with patch("app.main.llm.extract_slots") as mock_extract:
+    with patch("app.main.semantic_llm.extract_semantics") as mock_extract:
         with client:
             response = client.post(
                 "/api/evidence",
@@ -1303,7 +1327,7 @@ def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchab
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_extract:
             with client:
                 response = _upload_png(client, filename="ocr-success.png")
                 evidence_id = response.json()["evidence_id"]
@@ -1351,7 +1375,7 @@ def test_image_upload_defaults_to_ocr_when_provider_not_configured(tmp_path, mon
 
     with patch("app.extract.ocr.image_to_text", return_value=("默认 OCR 文字", "")) as mock_ocr:
         with patch("app.vision_provider.extract_visual_evidence") as mock_vision:
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 with client:
                     response = _upload_png(client, filename="default-provider.png")
                     evidence_id = response.json()["evidence_id"]
@@ -1369,17 +1393,21 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
     monkeypatch.setenv("ARK_API_KEY", "ark-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": None,
-        "owner_name": None,
-        "deliverable": "渠道复盘数据",
-        "due_raw": "周五前",
-        "due_date": "2026-08-08",
-        "direction": "none",
-        "kind": "reference",
-        "plain_summary": "Ark transcript 进入旧文本解析链。",
-        "caveats": [],
-    }
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "reference",
+                "content": "画面文字提到渠道复盘数据。",
+                "actors": [],
+                "due_raw": "周五前",
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.72,
+            }
+        ],
+        ambiguities=["画面里只看到点赞反应,无法确认具体身份。"],
+    )
     ark_extraction = {
         "transcript": "Ark transcript",
         "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}],
@@ -1390,7 +1418,7 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
         with patch("app.extract.ocr.image_to_text") as mock_ocr:
-            with patch("app.main.llm.extract_slots", return_value=parsed) as mock_llm:
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
                 with client:
                     response = _upload_png(client, filename="ark-success.png")
                     evidence_id = response.json()["evidence_id"]
@@ -1403,6 +1431,10 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
     mock_ocr.assert_not_called()
     mock_llm.assert_called_once()
     assert mock_llm.call_args.args[0] == main_module._llm_input_text("Ark transcript")
+    assert mock_llm.call_args.kwargs["observations"] == [
+        {"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}
+    ]
+    assert mock_llm.call_args.kwargs["anchor_date"] is None
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
@@ -1427,6 +1459,21 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
         assert extraction_row["transcript"] == "Ark transcript"
         assert json.loads(extraction_row["observations"]) == [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}]
         assert json.loads(extraction_row["warnings"]) == ["局部遮挡"]
+        semantic_run = conn.execute(
+            """
+            SELECT sr.provider, sr.model, sr.parser_version, sri.extraction_id
+            FROM semantic_runs sr
+            JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+            WHERE sri.evidence_id = ?
+            ORDER BY sr.created_at DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert semantic_run["provider"] == "deepseek"
+        assert semantic_run["model"] == "deepseek-v4-flash"
+        assert semantic_run["parser_version"] == "2.2"
+        assert semantic_run["extraction_id"] is not None
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()
@@ -1452,7 +1499,7 @@ def test_ark_provider_falls_back_to_ocr_and_consumes_budget_only_on_fallback(tmp
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=None) as mock_vision:
         with patch("app.extract.ocr.image_to_text", return_value=("Fallback OCR transcript", "")) as mock_ocr:
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 with client:
                     response = _upload_png(client, filename="ark-fallback.png")
                     evidence_id = response.json()["evidence_id"]
@@ -1496,7 +1543,7 @@ def test_ark_provider_failure_without_ocr_fallback_still_keeps_original(tmp_path
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=None):
-        with patch("app.main.llm.extract_slots") as mock_llm:
+        with patch("app.main.semantic_llm.extract_semantics") as mock_llm:
             with client:
                 response = _upload_png(client, filename="ark-no-fallback.png")
                 evidence_id = response.json()["evidence_id"]
@@ -1525,9 +1572,10 @@ def test_ark_provider_failure_without_ocr_fallback_still_keeps_original(tmp_path
         conn.close()
 
 
-def test_ark_provider_observations_only_does_not_call_old_text_llm(tmp_path, monkeypatch):
+def test_ark_provider_observations_only_enters_semantic_pipeline(tmp_path, monkeypatch):
     monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
     monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     ark_extraction = {
         "transcript": None,
@@ -1538,16 +1586,36 @@ def test_ark_provider_observations_only_does_not_call_old_text_llm(tmp_path, mon
     }
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
-        with patch("app.main.llm.extract_slots") as mock_llm:
+        with patch(
+            "app.main.semantic_llm.extract_semantics",
+            return_value=_semantic_result(
+                facts=[
+                    {
+                        "fact_type": "reference",
+                        "content": "画面显示该消息存在点赞反应。",
+                        "actors": [],
+                        "due_raw": None,
+                        "due_date": None,
+                        "due_anchor_date": None,
+                        "occurred_date": None,
+                        "confidence": 0.7,
+                    }
+                ]
+            ),
+        ) as mock_llm:
             with client:
                 response = _upload_png(client, filename="ark-observation-only.png")
                 evidence_id = response.json()["evidence_id"]
                 status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
     assert response.status_code == 200
-    assert status_response.json()["parse_status"] == "unsupported"
-    assert "可观察界面事实" in status_response.json()["detail"]
-    mock_llm.assert_not_called()
+    assert status_response.json()["parse_status"] == "done"
+    mock_llm.assert_called_once()
+    assert mock_llm.call_args.args[0] is None
+    assert mock_llm.call_args.kwargs["observations"] == [
+        {"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}
+    ]
+    assert mock_llm.call_args.kwargs["anchor_date"] is None
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
@@ -1560,6 +1628,10 @@ def test_ark_provider_observations_only_does_not_call_old_text_llm(tmp_path, mon
         assert row["raw_text"] == "[图片] ark-observation-only.png"
         assert extraction_row["transcript"] is None
         assert json.loads(extraction_row["observations"]) == [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}]
+        fact_row = conn.execute(
+            "SELECT content FROM facts WHERE semantic_run_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert fact_row["content"] == "画面显示该消息存在点赞反应。"
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()
@@ -1575,7 +1647,7 @@ def test_image_upload_ocr_timeout_still_succeeds_and_marks_unsupported(tmp_path,
             self.chat = Mock(completions=Mock(create=Mock(side_effect=httpx.TimeoutException("boom"))))
 
     with patch("app.ocr.OpenAI", FakeOpenAI):
-        with patch("app.main.llm.extract_slots") as mock_extract:
+        with patch("app.main.semantic_llm.extract_semantics") as mock_extract:
             with client:
                 response = _upload_png(client, filename="ocr-timeout.png")
                 evidence_id = response.json()["evidence_id"]
@@ -1603,7 +1675,7 @@ def test_image_upload_with_short_ocr_text_marks_unsupported_and_skips_llm(tmp_pa
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with patch("app.extract.ocr.image_to_text", return_value=(None, "这张图里没有识别到文字,原件已完整保存")):
-        with patch("app.main.llm.extract_slots") as mock_extract:
+        with patch("app.main.semantic_llm.extract_semantics") as mock_extract:
             with client:
                 response = _upload_png(client, filename="ocr-short.png")
                 evidence_id = response.json()["evidence_id"]
@@ -1700,17 +1772,20 @@ def test_image_upload_status_sequence_includes_ocr_running_then_llm_running(tmp_
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": "张总",
-        "owner_name": "我",
-        "deliverable": "渠道复盘数据",
-        "due_raw": "周五前",
-        "due_date": "2026-08-08",
-        "direction": "i_owe",
-        "kind": "request",
-        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
-        "caveats": [],
-    }
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "有人要求交付渠道复盘数据。",
+                "actors": [],
+                "due_raw": "周五前",
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.83,
+            }
+        ]
+    )
     seen_statuses: list[str] = []
     original_set_parse_status = main_module._set_parse_status
 
@@ -1720,7 +1795,7 @@ def test_image_upload_status_sequence_includes_ocr_running_then_llm_running(tmp_
 
     with patch("app.main._set_parse_status", side_effect=wrapped_set_parse_status):
         with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 with client:
                     response = _upload_png(client, filename="sequence.png")
 
@@ -1734,17 +1809,7 @@ def test_image_upload_status_sequence_includes_ocr_running_then_llm_running(tmp_
 def test_text_upload_status_sequence_does_not_pass_through_ocr_running(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": None,
-        "owner_name": None,
-        "deliverable": None,
-        "due_raw": None,
-        "due_date": None,
-        "direction": "none",
-        "kind": "reference",
-        "plain_summary": "只是留档。",
-        "caveats": [],
-    }
+    parsed = _semantic_result()
     seen_statuses: list[str] = []
     original_set_parse_status = main_module._set_parse_status
 
@@ -1753,7 +1818,7 @@ def test_text_upload_status_sequence_does_not_pass_through_ocr_running(tmp_path,
         return original_set_parse_status(conn, evidence_id, status)
 
     with patch("app.main._set_parse_status", side_effect=wrapped_set_parse_status):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 response = client.post(
                     "/api/evidence",
@@ -1975,7 +2040,7 @@ def test_patch_ocr_text_updates_raw_text_without_changing_hashes_and_keeps_verif
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="correctable.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -1990,7 +2055,7 @@ def test_patch_ocr_text_updates_raw_text_without_changing_hashes_and_keeps_verif
     finally:
         conn.close()
 
-    with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_extract:
         with client:
             patch_response = client.patch(
                 f"/api/evidence/{evidence_id}/ocr_text",
@@ -2038,12 +2103,12 @@ def test_patch_ocr_text_triggers_reparse_without_consuming_ocr_quota(tmp_path, m
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="quota-stable.png")
                 evidence_id = create_response.json()["evidence_id"]
 
-    with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_extract:
         with client:
             response = client.patch(
                 f"/api/evidence/{evidence_id}/ocr_text",
@@ -2087,7 +2152,7 @@ def test_patch_ocr_text_returns_404_for_other_sandbox(tmp_path, monkeypatch):
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client_a, client_b:
                 create_response = _upload_png(client_a, filename="cross-sandbox.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2116,7 +2181,7 @@ def test_patch_ocr_text_returns_403_for_demo_record(tmp_path, monkeypatch):
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="demo-like.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2124,8 +2189,13 @@ def test_patch_ocr_text_returns_403_for_demo_record(tmp_path, monkeypatch):
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
     try:
-        conn.execute("DELETE FROM evidence_extractions WHERE evidence_id = ?", (evidence_id,))
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            "UPDATE evidence_extractions SET evidence_id = ? WHERE evidence_id = ?",
+            ("ev_demo_ocr_text", evidence_id),
+        )
         conn.execute("UPDATE evidence SET evidence_id = ? WHERE evidence_id = ?", ("ev_demo_ocr_text", evidence_id))
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
     finally:
         conn.close()
@@ -2157,7 +2227,7 @@ def test_image_ocr_success_persists_machine_extraction_history(tmp_path, monkeyp
 
     with client:
         with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 response = _upload_png(client, filename="tracked-ocr.png")
 
     assert response.status_code == 200
@@ -2189,7 +2259,7 @@ def test_pdf_upload_persists_machine_extraction_history(tmp_path, monkeypatch):
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
-        with patch("app.main.llm.extract_slots", return_value=None):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=None):
             response = client.post(
                 "/api/evidence",
                 data={"text": "", "source": "飞书", "source_detail": "项目复盘群"},
@@ -2219,9 +2289,51 @@ def test_pdf_upload_persists_machine_extraction_history(tmp_path, monkeypatch):
         conn.close()
 
 
+def test_text_evidence_creates_builtin_extraction_and_semantic_input_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=_semantic_result()):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                json={"text": "直接粘贴的一段原始文字。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = response.json()["evidence_id"]
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        extraction_row = conn.execute(
+            """
+            SELECT extraction_id, origin, provider, model, transcript, observations
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        input_row = conn.execute(
+            """
+            SELECT extraction_id
+            FROM semantic_run_inputs
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert extraction_row["origin"] == "machine"
+        assert extraction_row["provider"] == "builtin"
+        assert extraction_row["model"] is None
+        assert extraction_row["transcript"] == "直接粘贴的一段原始文字。"
+        assert json.loads(extraction_row["observations"]) == []
+        assert input_row["extraction_id"] == extraction_row["extraction_id"]
+    finally:
+        conn.close()
+
+
 def test_patch_ocr_text_persists_user_extraction_superseding_machine_history(tmp_path, monkeypatch):
-    _disable_external_ai(monkeypatch)
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     parsed = {
         "requester_name": None,
@@ -2236,11 +2348,11 @@ def test_patch_ocr_text_persists_user_extraction_superseding_machine_history(tmp
 
     with client:
         with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 create_response = _upload_png(client, filename="tracked-correction.png")
 
         evidence_id = create_response.json()["evidence_id"]
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             patch_response = client.patch(
                 f"/api/evidence/{evidence_id}/ocr_text",
                 json={"text": "人工修正后的识别文字"},
@@ -2268,8 +2380,118 @@ def test_patch_ocr_text_persists_user_extraction_superseding_machine_history(tmp
         assert rows[1]["provider"] == "manual"
         assert rows[1]["transcript"] == "人工修正后的识别文字"
         assert rows[1]["supersedes_extraction_id"] == rows[0]["extraction_id"]
+        runs = conn.execute(
+            """
+            SELECT semantic_run_id, status, supersedes_run_id
+            FROM semantic_runs
+            ORDER BY created_at ASC, semantic_run_id ASC
+            """
+        ).fetchall()
+        assert len(runs) == 2
+        assert runs[0]["status"] == "succeeded"
+        assert runs[1]["status"] == "succeeded"
+        assert runs[1]["supersedes_run_id"] == runs[0]["semantic_run_id"]
     finally:
         conn.close()
+
+
+def test_failed_reparse_keeps_previous_succeeded_semantic_run_and_detail_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    first_result = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "有人要求在周五前交付渠道复盘数据。",
+                "actors": [],
+                "due_raw": "周五前",
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.9,
+            }
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "uncertainty",
+                "content": "金额口径仍需确认。",
+                "confidence": 0.5,
+            }
+        ],
+    )
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=first_result):
+            with client:
+                create_response = _upload_png(client, filename="reparse-fail.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
+        with client:
+            patch_response = client.patch(
+                f"/api/evidence/{evidence_id}/ocr_text",
+                json={"text": "人工修正后的识别文字"},
+            )
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+            detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert patch_response.status_code == 200
+    assert status_response.json()["parse_status"] == "failed"
+    assert "有人要求在周五前交付渠道复盘数据。" in detail_response.text
+    assert "金额口径仍需确认。" in detail_response.text
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        runs = conn.execute(
+            """
+            SELECT semantic_run_id, status, supersedes_run_id
+            FROM semantic_runs
+            ORDER BY created_at ASC, semantic_run_id ASC
+            """
+        ).fetchall()
+        facts = conn.execute("SELECT COUNT(*) AS count FROM facts").fetchone()
+        assert len(runs) == 2
+        assert runs[0]["status"] == "succeeded"
+        assert runs[1]["status"] == "failed"
+        assert runs[1]["supersedes_run_id"] == runs[0]["semantic_run_id"]
+        assert facts["count"] == 1
+    finally:
+        conn.close()
+
+
+def test_detail_page_keeps_legacy_summary_when_no_semantic_run_exists(tmp_path, monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "先存一条旧兼容记录。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+        patch_response = client.patch(
+            f"/api/evidence/{evidence_id}/slots",
+            json={
+                "slot_deliverable": "渠道复盘数据",
+                "slot_due_raw": "下周五",
+                "slot_due_date": "2026-08-08",
+                "slot_direction": "i_owe",
+                "kind": "request",
+                "plain_summary": "这是旧兼容摘要。",
+                "caveats": ["先按旧口径展示"],
+            },
+        )
+        detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert patch_response.status_code == 200
+    assert "这是旧兼容摘要。" in detail_response.text
+    assert "渠道复盘数据" in detail_response.text
+    assert "先按旧口径展示" in detail_response.text
+    assert "事实整理" not in detail_response.text
 
 
 def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monkeypatch):
@@ -2288,7 +2510,7 @@ def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monk
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="provider-visible.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2315,7 +2537,7 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="diag-off.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2358,7 +2580,7 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
         with patch("app.extract.ocr.image_to_text") as mock_ocr:
-            with patch("app.main.llm.extract_slots", return_value=parsed):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 with client:
                     create_response = _upload_png(client, filename="diag-on.png")
                     evidence_id = create_response.json()["evidence_id"]
@@ -2382,7 +2604,8 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
         "route": "app.main._run_image_pipeline -> app.evidence_extractor.run_production_image_extraction",
     }
     assert payload["text_llm"]["provider"] == "deepseek"
-    assert payload["text_llm"]["model"] == main_module.llm.get_deepseek_model()
+    assert payload["text_llm"]["model"] == main_module.get_text_model()
+    assert payload["text_llm"]["parser_version"] == "2.2"
     assert payload["extraction_history"] == [
         {
             "origin": "machine",
@@ -2420,7 +2643,7 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="ark-diag.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2606,7 +2829,7 @@ def test_ark_vision_diagnostic_returns_clear_failure_when_ark_key_missing(tmp_pa
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="ark-no-key.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2641,7 +2864,7 @@ def test_ark_vision_diagnostic_distinguishes_text_preflight_success_and_vision_f
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="ark-provider-fail.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2724,7 +2947,7 @@ def test_ark_vision_timeout_response_reports_visual_timeout_limit(tmp_path, monk
     }
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
-        with patch("app.main.llm.extract_slots", return_value=parsed):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
                 create_response = _upload_png(client, filename="ark-timeout.png")
                 evidence_id = create_response.json()["evidence_id"]
@@ -2907,7 +3130,7 @@ def test_parse_none_still_keeps_evidence_and_marks_failed(tmp_path, monkeypatch)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
-    with patch("app.main.llm.extract_slots", return_value=None):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
         with client:
             create_response = client.post(
                 "/api/evidence",
@@ -2923,89 +3146,181 @@ def test_parse_none_still_keeps_evidence_and_marks_failed(tmp_path, monkeypatch)
     assert payload["slots_filled"] == 0
 
 
-def test_successful_parse_writes_slots_and_chain_stays_valid(tmp_path, monkeypatch):
+def test_successful_parse_persists_semantic_run_and_facts_and_chain_stays_valid(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": "张总",
-        "owner_name": "我",
-        "deliverable": "渠道复盘数据",
-        "due_raw": "下周五",
-        "due_date": "2026-08-08",
-        "direction": "i_owe",
-        "kind": "request",
-        "plain_summary": "张总要求你下周五前给渠道复盘数据。",
-        "caveats": ["日期按 today 推算"],
-    }
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "张伟要求下周五前提交渠道复盘数据。",
+                "actors": [{"name": "活爹", "role": "requester"}, {"name": "我", "role": "owner"}],
+                "due_raw": "下周五",
+                "due_date": "2026-08-08",
+                "due_anchor_date": "2026-08-08",
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "explanation",
+                "content": "这里的活爹是对张伟的别称。",
+                "confidence": 0.8,
+            }
+        ],
+        ambiguities=["没有看到明确交付格式。"],
+    )
 
-    with patch("app.main.llm.extract_slots", return_value=parsed):
-        with client:
-            create_response = client.post(
-                "/api/evidence",
-                json={"text": "张总:下周五前把渠道复盘数据给我。", "source": "飞书", "source_detail": "项目复盘群"},
-            )
-            evidence_id = create_response.json()["evidence_id"]
-            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+    with client:
+        client.post(
+            "/api/settings",
+            json={
+                "self_names": ["热心市民小李"],
+                "glossary": [{"term": "活爹", "kind": "person", "meaning": "张伟"}],
+            },
+        )
+    with patch("app.main.update_slots") as mock_update_slots:
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "活爹:下周五前把渠道复盘数据给我。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
     assert create_response.status_code == 200
     payload = status_response.json()
     assert payload["parse_status"] == "done"
-    assert payload["slots_filled"] == 4
-    assert payload["plain_summary"] == "张总要求你下周五前给渠道复盘数据。"
-    assert payload["deliverable"] == "渠道复盘数据"
-    assert payload["caveats"] == ["日期按 today 推算"]
+    assert payload["slots_filled"] == 0
+    mock_update_slots.assert_not_called()
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
     try:
-        row = conn.execute(
+        evidence_row = conn.execute(
             """
-            SELECT kind, slot_direction, slot_requester, slot_owner
+            SELECT kind, slot_direction
             FROM evidence WHERE evidence_id = ?
             """,
             (evidence_id,),
         ).fetchone()
-        assert row["kind"] == "request"
-        assert row["slot_direction"] == "i_owe"
-        assert row["slot_requester"] == "act_zhang"
-        assert row["slot_owner"] == "act_self"
+        run_row = conn.execute(
+            """
+            SELECT sr.semantic_run_id, sr.status, sr.provider, sr.model, sr.parser_version,
+                   sr.anchor_date, sri.extraction_id
+            FROM semantic_runs sr
+            JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+            WHERE sri.evidence_id = ?
+            ORDER BY sr.created_at DESC, sr.semantic_run_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        fact_row = conn.execute(
+            """
+            SELECT fact_id, fact_type, content, due_at, due_raw, due_anchor_at,
+                   event_assignment, origin, review_status, semantic_run_id
+            FROM facts
+            WHERE semantic_run_id = ?
+            """,
+            (run_row["semantic_run_id"],),
+        ).fetchone()
+        interpretation_rows = conn.execute(
+            """
+            SELECT kind, content, fact_id, evidence_id, semantic_run_id
+            FROM interpretations
+            WHERE semantic_run_id = ?
+            ORDER BY kind ASC
+            """,
+            (run_row["semantic_run_id"],),
+        ).fetchall()
+        actor_row = conn.execute(
+            """
+            SELECT a.canonical_name, fa.role
+            FROM fact_actors fa
+            JOIN actors a ON a.actor_id = fa.actor_id
+            WHERE fa.fact_id = ?
+            ORDER BY fa.role ASC
+            """,
+            (fact_row["fact_id"],),
+        ).fetchone()
+        assert evidence_row["kind"] == "reference"
+        assert evidence_row["slot_direction"] is None
+        assert run_row["status"] == "succeeded"
+        assert run_row["provider"] == "deepseek"
+        assert run_row["model"] == "deepseek-v4-flash"
+        assert run_row["parser_version"] == "2.2"
+        assert run_row["anchor_date"] is None
+        assert run_row["extraction_id"] is not None
+        assert fact_row["fact_type"] == "request"
+        assert fact_row["content"] == "张伟要求下周五前提交渠道复盘数据。"
+        assert fact_row["due_raw"] == "下周五"
+        assert fact_row["due_at"] == main_module.llm.due_date_to_millis("2026-08-08")
+        assert fact_row["due_anchor_at"] == main_module.llm.due_date_to_millis("2026-08-08")
+        assert fact_row["event_assignment"] == "unassigned"
+        assert fact_row["origin"] == "ai"
+        assert fact_row["review_status"] == "unreviewed"
+        assert fact_row["semantic_run_id"] == run_row["semantic_run_id"]
+        assert actor_row["canonical_name"] == "张伟"
+        assert actor_row["role"] == "requester"
+        assert {(row["kind"], row["semantic_run_id"]) for row in interpretation_rows} == {
+            ("explanation", run_row["semantic_run_id"]),
+            ("uncertainty", run_row["semantic_run_id"]),
+        }
+        assert any(row["fact_id"] == fact_row["fact_id"] for row in interpretation_rows if row["kind"] == "explanation")
+        assert any(row["evidence_id"] == evidence_id for row in interpretation_rows if row["kind"] == "uncertainty")
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()
 
 
-def test_invalid_direction_falls_back_to_none(tmp_path, monkeypatch):
+def test_unstable_pronouns_do_not_create_permanent_actor(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": "张总",
-        "owner_name": "我",
-        "deliverable": "渠道复盘数据",
-        "due_raw": None,
-        "due_date": None,
-        "direction": "随便",
-        "kind": "request",
-        "plain_summary": "张总说要一个复盘。",
-        "caveats": [],
-    }
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "有人要求补一份复盘。",
+                "actors": [{"name": "我", "role": "owner"}, {"name": "对方", "role": "requester"}],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.66,
+            }
+        ]
+    )
 
-    with patch("app.main.llm.extract_slots", return_value=parsed):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
         with client:
             create_response = client.post(
                 "/api/evidence",
-                json={"text": "张总:给我一个复盘。", "source": "飞书", "source_detail": "项目复盘群"},
+                json={"text": "你把复盘给我。", "source": "飞书", "source_detail": "项目复盘群"},
             )
             evidence_id = create_response.json()["evidence_id"]
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
     try:
+        fact_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM facts WHERE semantic_run_id IS NOT NULL"
+        ).fetchone()
         row = conn.execute(
-            "SELECT kind, slot_direction FROM evidence WHERE evidence_id = ?",
+            """
+            SELECT COUNT(*) AS count
+            FROM fact_actors fa
+            JOIN facts f ON f.fact_id = fa.fact_id
+            JOIN fact_evidence fe ON fe.fact_id = f.fact_id
+            WHERE fe.evidence_id = ?
+            """,
             (evidence_id,),
         ).fetchone()
-        assert row["slot_direction"] == "none"
-        assert row["kind"] == "reference"
+        assert fact_count["count"] == 1
+        assert row["count"] == 0
     finally:
         conn.close()
 
@@ -3014,7 +3329,7 @@ def test_parse_timeout_exception_marks_failed_without_breaking_post(tmp_path, mo
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
-    with patch("app.main.llm.extract_slots", side_effect=httpx.TimeoutException("boom")):
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=httpx.TimeoutException("boom")):
         with client:
             create_response = client.post(
                 "/api/evidence",
@@ -3031,19 +3346,9 @@ def test_parse_timeout_exception_marks_failed_without_breaking_post(tmp_path, mo
 def test_parse_limit_marks_21st_record_failed(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": "张总",
-        "owner_name": "我",
-        "deliverable": "渠道复盘数据",
-        "due_raw": "周五",
-        "due_date": "2026-08-08",
-        "direction": "i_owe",
-        "kind": "request",
-        "plain_summary": "张总要求你给渠道复盘数据。",
-        "caveats": [],
-    }
+    parsed = _semantic_result()
 
-    with patch("app.main.llm.extract_slots", return_value=parsed):
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
         with client:
             for idx in range(20):
                 response = client.post(
@@ -3064,24 +3369,18 @@ def test_parse_limit_marks_21st_record_failed(tmp_path, monkeypatch):
     assert status_response.json()["detail"] == "今日解析次数已用完,记录仍已保存"
 
 
-def test_parse_pipeline_passes_context_from_settings_and_counterpart(tmp_path, monkeypatch):
+def test_parse_pipeline_passes_glossary_source_hint_and_anchor_none(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
     captured = {}
 
-    def fake_extract(text, today, context=None):
-        captured["context"] = context
-        return {
-            "requester_name": "活爹",
-            "owner_name": "我",
-            "deliverable": "复盘",
-            "due_raw": None,
-            "due_date": None,
-            "direction": "none",
-            "kind": "request",
-            "plain_summary": "先记一下。",
-            "caveats": [],
-        }
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        captured["text"] = text
+        captured["observations"] = observations
+        captured["anchor_date"] = anchor_date
+        captured["glossary"] = glossary
+        captured["source_hint"] = source_hint
+        return _semantic_result()
 
     with client:
         client.post(
@@ -3091,7 +3390,7 @@ def test_parse_pipeline_passes_context_from_settings_and_counterpart(tmp_path, m
                 "glossary": [{"term": "活爹", "kind": "person", "meaning": "张伟"}],
             },
         )
-        with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+        with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
             response = client.post(
                 "/api/evidence",
                 json={
@@ -3103,44 +3402,42 @@ def test_parse_pipeline_passes_context_from_settings_and_counterpart(tmp_path, m
             )
 
     assert response.status_code == 200
-    assert captured["context"]["self_names"] == ["热心市民小李"]
-    assert captured["context"]["glossary"] == [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
-    assert captured["context"]["counterpart"] == "冯云生(师父)"
+    assert captured["text"] == "活爹说先记一下。"
+    assert captured["observations"] == []
+    assert captured["anchor_date"] is None
+    assert captured["glossary"] == [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
+    assert captured["source_hint"] == "飞书-项目复盘群"
 
 
-def test_parse_pipeline_passes_empty_self_names_without_error(tmp_path, monkeypatch):
+def test_parse_pipeline_does_not_pass_self_names_or_counterpart(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
     captured = {}
 
-    def fake_extract(text, today, context=None):
-        captured["context"] = context
-        return {
-            "requester_name": None,
-            "owner_name": None,
-            "deliverable": None,
-            "due_raw": None,
-            "due_date": None,
-            "direction": "none",
-            "kind": "reference",
-            "plain_summary": "只是留档。",
-            "caveats": [],
-        }
+    def fake_extract(text, **kwargs):
+        captured["kwargs"] = kwargs
+        return _semantic_result()
 
     with client:
-        with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+        client.post(
+            "/api/settings",
+            json={"self_names": ["热心市民小李"], "glossary": []},
+        )
+        with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
             response = client.post(
                 "/api/evidence",
                 json={
                     "text": "先留个底。",
                     "source": "飞书",
                     "source_detail": "项目复盘群",
+                    "counterpart": "冯云生(师父)",
                 },
             )
 
     assert response.status_code == 200
-    assert captured["context"]["self_names"] == []
-    assert captured["context"]["glossary"] == []
+    assert "self_names" not in captured["kwargs"]
+    assert "counterpart" not in captured["kwargs"]
+    assert captured["kwargs"]["glossary"] == []
 
 
 def test_document_text_is_truncated_before_sending_to_llm(tmp_path, monkeypatch):
@@ -3149,11 +3446,11 @@ def test_document_text_is_truncated_before_sending_to_llm(tmp_path, monkeypatch)
     captured = {}
     long_text = "很长的文档内容" * 1200
 
-    def fake_extract(text, today, context=None):
+    def fake_extract(text, **kwargs):
         captured["text"] = text
         return None
 
-    with patch("app.main.llm.extract_slots", side_effect=fake_extract):
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
         with client:
             response = client.post(
                 "/api/evidence",

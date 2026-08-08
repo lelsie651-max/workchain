@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import traceback
+import uuid
 import zipfile
 from collections.abc import Iterable
 from contextlib import asynccontextmanager
@@ -24,7 +25,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import llm, ocr, vision_provider
+from app import llm, ocr, semantic_llm, vision_provider
+from app.ai_provider import get_text_model
 from app.evidence_extractor import (
     ARK_FALLBACK_WARNING,
     get_image_extraction_provider,
@@ -50,6 +52,14 @@ from app.sandbox import (
 from evidence_core import chain
 from evidence_core.db import init_db
 from evidence_core.extraction_store import create_extraction, get_latest_extraction, list_extractions
+from evidence_core.semantic_store import (
+    create_semantic_run,
+    get_latest_semantic_run_for_evidence,
+    list_facts_for_semantic_run,
+    list_interpretations_for_semantic_run,
+    mark_semantic_run_failed,
+    persist_semantic_run_result,
+)
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
@@ -446,6 +456,269 @@ def _can_run_text_parse(transcript: str | None) -> bool:
     return isinstance(transcript, str) and bool(transcript.strip())
 
 
+_UNSTABLE_ACTOR_NAMES = {
+    "我",
+    "你",
+    "他",
+    "她",
+    "它",
+    "ta",
+    "TA",
+    "你们",
+    "我们",
+    "他们",
+    "她们",
+    "对方",
+    "本人",
+    "自己",
+    "未知",
+    "unknown",
+    "actor unknown",
+    "某人",
+    "有人",
+}
+
+
+def _can_run_semantic_parse(transcript: str | None, observations: list[dict[str, Any]] | None) -> bool:
+    return _can_run_text_parse(transcript) or bool(observations)
+
+
+def _date_to_millis(value: str | None) -> int | None:
+    return llm.due_date_to_millis(value)
+
+
+def _person_glossary_map(glossary: list[dict[str, Any]] | None) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in glossary or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") != "person":
+            continue
+        term = item.get("term")
+        meaning = item.get("meaning")
+        if isinstance(term, str) and term.strip() and isinstance(meaning, str) and meaning.strip():
+            mapping[term.strip()] = meaning.strip()
+    return mapping
+
+
+def _normalize_semantic_actor_name(
+    name: str | None,
+    person_glossary: dict[str, str],
+) -> tuple[str | None, str | None]:
+    if not isinstance(name, str):
+        return None, None
+    raw = name.strip()
+    if not raw:
+        return None, None
+    canonical = person_glossary.get(raw, raw).strip()
+    lowered = canonical.lower()
+    if raw in _UNSTABLE_ACTOR_NAMES or canonical in _UNSTABLE_ACTOR_NAMES:
+        return None, None
+    if lowered in _UNSTABLE_ACTOR_NAMES or "未知" in canonical or "unknown" in lowered:
+        return None, None
+    alias = raw if raw != canonical else None
+    return canonical, alias
+
+
+def _resolve_semantic_actor_id(
+    conn: sqlite3.Connection,
+    *,
+    name: str | None,
+    person_glossary: dict[str, str],
+    created_at: int,
+) -> str | None:
+    canonical_name, alias = _normalize_semantic_actor_name(name, person_glossary)
+    if canonical_name is None:
+        return None
+
+    rows = conn.execute(
+        "SELECT actor_id, canonical_name, aliases FROM actors ORDER BY created_at ASC, actor_id ASC"
+    ).fetchall()
+    for row in rows:
+        aliases = json.loads(row["aliases"]) if row["aliases"] else []
+        if row["canonical_name"] == canonical_name or canonical_name in aliases or (alias and alias in aliases):
+            actor_id = row["actor_id"]
+            updated_aliases = list(aliases)
+            for candidate in (alias, canonical_name):
+                if candidate and candidate != row["canonical_name"] and candidate not in updated_aliases:
+                    updated_aliases.append(candidate)
+            if updated_aliases != aliases:
+                conn.execute(
+                    "UPDATE actors SET aliases = ? WHERE actor_id = ?",
+                    (json.dumps(updated_aliases, ensure_ascii=False, separators=(",", ":")), actor_id),
+                    )
+            return actor_id
+
+    actor_id = f"act_{uuid.uuid4().hex[:12]}"
+    aliases = [] if alias is None else [alias]
+    conn.execute(
+        """
+        INSERT INTO actors (
+            actor_id, canonical_name, aliases, org, role_hint,
+            is_self, confidence, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            actor_id,
+            canonical_name,
+            json.dumps(aliases, ensure_ascii=False, separators=(",", ":")),
+            None,
+            None,
+            0,
+            0.5,
+            created_at,
+        ),
+    )
+    return actor_id
+
+
+def _semantic_actor_roles(
+    conn: sqlite3.Connection,
+    *,
+    actors: list[dict[str, Any]] | None,
+    glossary: list[dict[str, Any]] | None,
+    created_at: int,
+) -> list[tuple[str, str]]:
+    person_glossary = _person_glossary_map(glossary)
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in actors or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if not isinstance(role, str) or not role.strip():
+            continue
+        actor_id = _resolve_semantic_actor_id(
+            conn,
+            name=item.get("name"),
+            person_glossary=person_glossary,
+            created_at=created_at,
+        )
+        if actor_id is None:
+            continue
+        key = (actor_id, role.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized
+
+
+def _semantic_fact_payloads(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    semantics: dict[str, Any],
+    glossary: list[dict[str, Any]] | None,
+    created_at: int,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for fact in semantics.get("facts", []):
+        if not isinstance(fact, dict):
+            continue
+        payloads.append(
+            {
+                "fact_type": fact.get("fact_type"),
+                "content": fact.get("content"),
+                "evidence_ids": [evidence_id],
+                "occurred_at": _date_to_millis(fact.get("occurred_date")),
+                "due_at": _date_to_millis(fact.get("due_date")),
+                "due_raw": fact.get("due_raw"),
+                "due_anchor_at": _date_to_millis(fact.get("due_anchor_date")),
+                "confidence": fact.get("confidence"),
+                "event_assignment": "unassigned",
+                "origin": "ai",
+                "review_status": "unreviewed",
+                "actor_roles": _semantic_actor_roles(
+                    conn,
+                    actors=fact.get("actors"),
+                    glossary=glossary,
+                    created_at=created_at,
+                ),
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+        )
+    return payloads
+
+
+def _semantic_interpretation_payloads(
+    evidence_id: str,
+    semantics: dict[str, Any],
+    *,
+    created_at: int,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for interpretation in semantics.get("interpretations", []):
+        if not isinstance(interpretation, dict):
+            continue
+        payloads.append(
+            {
+                "fact_index": interpretation.get("fact_index"),
+                "kind": interpretation.get("kind"),
+                "content": interpretation.get("content"),
+                "confidence": interpretation.get("confidence"),
+                "created_at": created_at,
+            }
+        )
+    for ambiguity in semantics.get("ambiguities", []):
+        if isinstance(ambiguity, str) and ambiguity.strip():
+            payloads.append(
+                {
+                    "evidence_id": evidence_id,
+                    "kind": "uncertainty",
+                    "content": ambiguity.strip(),
+                    "confidence": None,
+                    "created_at": created_at,
+                }
+            )
+    return payloads
+
+
+def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[str, Any] | None:
+    run = get_latest_semantic_run_for_evidence(conn, evidence_id, status="succeeded")
+    if run is None:
+        return None
+
+    facts = list_facts_for_semantic_run(conn, run["semantic_run_id"], evidence_id=evidence_id)
+    interpretations = list_interpretations_for_semantic_run(
+        conn,
+        run["semantic_run_id"],
+        evidence_id=evidence_id,
+    )
+    fact_map = {fact["fact_id"]: fact for fact in facts}
+    help_items = []
+    for item in interpretations:
+        help_items.append(
+            {
+                "kind": item["kind"],
+                "content": item["content"],
+                "confidence": item["confidence"],
+                "is_uncertainty": item["kind"] == "uncertainty",
+                "fact_content": None if item["fact_id"] is None else fact_map.get(item["fact_id"], {}).get("content"),
+            }
+        )
+
+    return {
+        "semantic_run_id": run["semantic_run_id"],
+        "provider": run["provider"],
+        "provider_label": _provider_label(run["provider"]),
+        "model": run["model"],
+        "parser_version": run["parser_version"],
+        "created_at": run["created_at"],
+        "created_at_text": _format_datetime(run["created_at"], "%Y-%m-%d %H:%M:%S"),
+        "facts": [
+            {
+                "fact_id": fact["fact_id"],
+                "fact_type": fact["fact_type"],
+                "content": fact["content"],
+            }
+            for fact in facts
+        ],
+        "help_items": help_items,
+    }
+
+
 def _export_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M")
 
@@ -772,20 +1045,73 @@ def _run_parse_pipeline(
     sandbox_db_path: Path,
     global_meta_db_path: Path,
     evidence_id: str,
-    text: str,
-    counterpart: str | None,
 ) -> None:
+    conn = init_db(sandbox_db_path)
+    semantic_run_id: str | None = None
+    parse_start = time.perf_counter()
+    evidence_row = None
+    extraction = None
+    transcript = None
+    observations: list[dict[str, Any]] = []
+    glossary: list[dict[str, Any]] = []
+    try:
+        evidence_row = conn.execute(
+            "SELECT evidence_id, source_hint FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        extraction = get_latest_extraction(conn, evidence_id)
+        if evidence_row is not None:
+            glossary = get_settings(sandbox_db_path).get("glossary", [])
+        if extraction is not None:
+            transcript = extraction.get("transcript")
+            observations = extraction.get("observations") if isinstance(extraction.get("observations"), list) else []
+    finally:
+        conn.close()
+
     log_base = {
         "evidence_id": evidence_id,
         "provider": "deepseek",
-        "model": llm.get_deepseek_model(),
-        "input_chars": len(text),
+        "model": get_text_model(),
+        "input_chars": len(transcript or ""),
+        "observation_count": len(observations),
     }
-    parse_start = time.perf_counter()
+    if evidence_row is None:
+        return
+    should_call_model = _can_run_semantic_parse(transcript, observations)
+
+    previous_run = None
+    conn = init_db(sandbox_db_path)
+    try:
+        previous_run = get_latest_semantic_run_for_evidence(conn, evidence_id)
+        if extraction is None:
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
+            _set_parse_detail(conn, evidence_id, "解析缺少提取版本,记录已完整保存")
+            return
+
+        semantic_run = create_semantic_run(
+            conn,
+            provider="deepseek",
+            model=get_text_model(),
+            parser_version=semantic_llm.SEMANTIC_PARSER_VERSION,
+            anchor_date=None,
+            supersedes_run_id=None if previous_run is None else previous_run["semantic_run_id"],
+            inputs=[
+                {
+                    "evidence_id": evidence_id,
+                    "extraction_id": extraction["extraction_id"],
+                    "position": 0,
+                }
+            ],
+        )
+        semantic_run_id = semantic_run["semantic_run_id"]
+    finally:
+        conn.close()
+
     _emit_structured_log(
         "semantic_parse",
         {
             **log_base,
+            "semantic_run_id": semantic_run_id,
             "status": "started",
             "latency_ms": 0,
             "parse_success": False,
@@ -793,9 +1119,80 @@ def _run_parse_pipeline(
         },
     )
     api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if not should_call_model:
+        conn = init_db(sandbox_db_path)
+        try:
+            fact_payloads = _semantic_fact_payloads(
+                conn,
+                evidence_id=evidence_id,
+                semantics={"facts": [], "interpretations": [], "ambiguities": []},
+                glossary=glossary,
+                created_at=int(time.time() * 1000),
+            )
+            interpretation_payloads = _semantic_interpretation_payloads(
+                evidence_id,
+                {"facts": [], "interpretations": [], "ambiguities": []},
+                created_at=int(time.time() * 1000),
+            )
+            persist_semantic_run_result(
+                conn,
+                semantic_run_id=semantic_run_id,
+                facts=fact_payloads,
+                interpretations=interpretation_payloads,
+            )
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
+            _set_parse_detail(conn, evidence_id, "")
+        except Exception:
+            try:
+                if semantic_run_id is not None:
+                    mark_semantic_run_failed(
+                        conn,
+                        semantic_run_id=semantic_run_id,
+                        failure_type="persistence_error",
+                    )
+            except Exception:
+                pass
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
+            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
+            _emit_structured_log(
+                "semantic_parse",
+                {
+                    **log_base,
+                    "semantic_run_id": semantic_run_id,
+                    "status": "failed",
+                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                    "parse_success": False,
+                    "failure_type": "persistence_error",
+                },
+            )
+        else:
+            _emit_structured_log(
+                "semantic_parse",
+                {
+                    **log_base,
+                    "semantic_run_id": semantic_run_id,
+                    "status": "succeeded",
+                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                    "parse_success": True,
+                    "failure_type": None,
+                },
+            )
+        finally:
+            conn.close()
+        return
+
     if not api_key:
         conn = init_db(sandbox_db_path)
         try:
+            if semantic_run_id is not None:
+                try:
+                    mark_semantic_run_failed(
+                        conn,
+                        semantic_run_id=semantic_run_id,
+                        failure_type="not_configured",
+                    )
+                except Exception:
+                    pass
             _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
@@ -804,6 +1201,7 @@ def _run_parse_pipeline(
             "semantic_parse",
             {
                 **log_base,
+                "semantic_run_id": semantic_run_id,
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
@@ -816,6 +1214,15 @@ def _run_parse_pipeline(
     if not allowed:
         conn = init_db(sandbox_db_path)
         try:
+            if semantic_run_id is not None:
+                try:
+                    mark_semantic_run_failed(
+                        conn,
+                        semantic_run_id=semantic_run_id,
+                        failure_type="budget_exhausted",
+                    )
+                except Exception:
+                    pass
             _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, reason or "解析暂不可用,记录已完整保存")
         finally:
@@ -824,6 +1231,7 @@ def _run_parse_pipeline(
             "semantic_parse",
             {
                 **log_base,
+                "semantic_run_id": semantic_run_id,
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
@@ -832,18 +1240,28 @@ def _run_parse_pipeline(
         )
         return
 
-    context = get_settings(sandbox_db_path)
-    if counterpart:
-        context["counterpart"] = counterpart
-
     try:
-        parsed = llm.extract_slots(_llm_input_text(text), _today_str(), context=context)
+        parsed = semantic_llm.extract_semantics(
+            _llm_input_text(transcript) if transcript is not None else None,
+            observations=observations,
+            anchor_date=None,
+            glossary=glossary,
+            source_hint=evidence_row["source_hint"],
+        )
     except Exception:
         parsed = None
-    parsed = llm.normalize_slots(parsed)
     if parsed is None:
         conn = init_db(sandbox_db_path)
         try:
+            if semantic_run_id is not None:
+                try:
+                    mark_semantic_run_failed(
+                        conn,
+                        semantic_run_id=semantic_run_id,
+                        failure_type="provider_unavailable_or_invalid_response",
+                    )
+                except Exception:
+                    pass
             _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
@@ -852,6 +1270,7 @@ def _run_parse_pipeline(
             "semantic_parse",
             {
                 **log_base,
+                "semantic_run_id": semantic_run_id,
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
@@ -862,34 +1281,31 @@ def _run_parse_pipeline(
 
     conn = init_db(sandbox_db_path)
     try:
-        glossary = context.get("glossary", [])
-        requester_id = llm.resolve_actor_with_glossary(conn, parsed.get("requester_name"), glossary)
-        owner_id = llm.resolve_actor_with_glossary(conn, parsed.get("owner_name"), glossary)
-        slot_due = llm.due_date_to_millis(parsed.get("due_date"))
-
-        update_slots(
+        fact_payloads = _semantic_fact_payloads(
             conn,
-            evidence_id,
-            slot_requester=requester_id,
-            slot_owner=owner_id,
-            slot_deliverable=parsed.get("deliverable"),
-            slot_due=slot_due,
-            slot_due_raw=parsed.get("due_raw"),
-            slot_direction=parsed.get("direction"),
-            plain_summary=parsed.get("plain_summary"),
-            caveats=parsed.get("caveats", []),
+            evidence_id=evidence_id,
+            semantics=parsed,
+            glossary=glossary,
+            created_at=int(time.time() * 1000),
         )
-        conn.execute(
-            "UPDATE evidence SET kind = ? WHERE evidence_id = ?",
-            (_final_kind(parsed, requester_id, owner_id, slot_due), evidence_id),
+        interpretation_payloads = _semantic_interpretation_payloads(
+            evidence_id,
+            parsed,
+            created_at=int(time.time() * 1000),
+        )
+        persist_semantic_run_result(
+            conn,
+            semantic_run_id=semantic_run_id,
+            facts=fact_payloads,
+            interpretations=interpretation_payloads,
         )
         _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
         _set_parse_detail(conn, evidence_id, "")
-        conn.commit()
         _emit_structured_log(
             "semantic_parse",
             {
                 **log_base,
+                "semantic_run_id": semantic_run_id,
                 "status": "succeeded",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": True,
@@ -897,13 +1313,22 @@ def _run_parse_pipeline(
             },
         )
     except Exception:
-        conn.rollback()
+        try:
+            if semantic_run_id is not None:
+                mark_semantic_run_failed(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    failure_type="persistence_error",
+                )
+        except Exception:
+            pass
         _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
         _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         _emit_structured_log(
             "semantic_parse",
             {
                 **log_base,
+                "semantic_run_id": semantic_run_id,
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
@@ -962,8 +1387,8 @@ def _run_image_pipeline(
             (_build_attachment_raw_text("image", filename, transcript), evidence_id),
         )
         _clear_extract_note(conn, evidence_id)
-        if not _can_run_text_parse(transcript):
-            note = "图片已完成视觉提取,记录了可观察界面事实,但没有识别到可供文本解析的文字"
+        if not _can_run_semantic_parse(transcript, observations):
+            note = "图片提取未产生可供语义解析的 transcript 或 observations"
             _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
             _set_parse_detail(conn, evidence_id, _saved_original_detail(note))
             _set_extract_note(conn, evidence_id, note)
@@ -981,8 +1406,6 @@ def _run_image_pipeline(
         sandbox_db_path,
         global_meta_db_path,
         evidence_id,
-        transcript,
-        counterpart,
     )
 
 
@@ -1380,6 +1803,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
             "observations": latest_extraction.get("observations") if isinstance(latest_extraction.get("observations"), list) else [],
             "warnings": latest_extraction.get("warnings") if isinstance(latest_extraction.get("warnings"), list) else [],
         }
+    semantic_result = _build_semantic_result(conn, evidence_id)
     return {
         "evidence_id": row["evidence_id"],
         "seq": row["seq"],
@@ -1409,6 +1833,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "has_extracted_text": extracted_text is not None,
         "current_extraction": current_extraction,
         "extraction_history": extraction_history,
+        "semantic_result": semantic_result,
     }
 
 
@@ -1440,7 +1865,8 @@ def _build_evidence_diagnostics(
         "text_llm": {
             "provider": "deepseek",
             "provider_label": _provider_label("deepseek"),
-            "model": llm.get_deepseek_model(),
+            "model": get_text_model(),
+            "parser_version": semantic_llm.SEMANTIC_PARSER_VERSION,
         },
     }
 
@@ -1938,8 +2364,6 @@ def create_app() -> FastAPI:
             sandbox.db_path,
             request.app.state.global_meta_db_path,
             evidence_id,
-            corrected_text,
-            None,
         )
         response = JSONResponse(
             {
@@ -2239,15 +2663,16 @@ def create_app() -> FastAPI:
             raw_text_override = None
             parse_status = PARSE_STATUS_LLM_RUNNING
             parse_detail = ""
-            extracted_for_parse = text
             extract_note = None
             image_pipeline_args = None
+            extracted_transcript = text if media_type == "text" else None
             if file_bytes is not None and upload_media_type is not None:
                 _ensure_upload_budget(conn, sandbox.blobs_root, file_bytes)
                 media_type = upload_media_type
                 append_payload = file_bytes
                 filename = upload.filename if upload is not None else None
                 raw_text_override = _build_attachment_raw_text(media_type, filename)
+                extracted_transcript = None
                 if media_type == "image":
                     image_startup = get_image_extraction_startup()
                     if not image_startup["supported"] or not image_startup["configured"]:
@@ -2272,7 +2697,7 @@ def create_app() -> FastAPI:
                     extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
                     if extracted_text is not None:
                         raw_text_override = _build_attachment_raw_text(media_type, filename, extracted_text)
-                        extracted_for_parse = extracted_text
+                        extracted_transcript = extracted_text
                         parse_status = PARSE_STATUS_LLM_RUNNING
                         parse_detail = ""
                     else:
@@ -2290,16 +2715,27 @@ def create_app() -> FastAPI:
                 source_hint=source_hint,
                 kind="reference",
             )
+            if media_type == "text" and text:
+                _record_machine_extraction(
+                    conn,
+                    evidence_id=row["evidence_id"],
+                    transcript=text,
+                    observations=[],
+                    provider="builtin",
+                    model=None,
+                    warnings=[],
+                    created_at=now_ms,
+                )
             if raw_text_override is not None:
                 conn.execute(
                     "UPDATE evidence SET raw_text = ?, plain_summary = ? WHERE evidence_id = ?",
                     (raw_text_override, text or None, row["evidence_id"]),
                 )
-                if media_type != "image" and extracted_for_parse:
+                if media_type != "image" and extracted_transcript:
                     _record_machine_extraction(
                         conn,
                         evidence_id=row["evidence_id"],
-                        transcript=extracted_for_parse,
+                        transcript=extracted_transcript,
                         observations=[],
                         provider="builtin",
                         model=None,
@@ -2321,8 +2757,6 @@ def create_app() -> FastAPI:
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 row["evidence_id"],
-                extracted_for_parse,
-                counterpart,
             )
         elif parse_status == PARSE_STATUS_OCR_RUNNING and image_pipeline_args is not None:
             background_tasks.add_task(

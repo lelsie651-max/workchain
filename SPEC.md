@@ -105,14 +105,17 @@
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
 - 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
-- Ark Vision 可同时产出 `transcript + observations`;其中 transcript 可作为旧文本解析链输入,observations 只进入 Extraction 层,不得混入 `raw_text`
+- Ark Vision 可同时产出 `transcript + observations`;其中 transcript 进入 production semantic route,observations 只进入 Extraction 层与 Semantic Parser 输入,不得混入 `raw_text`
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
+- 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
+- production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date=None`;不传 `self_names`,也不使用 `counterpart` 参与事实判断
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - Observation 可以支持 Fact / Interpretation 生成,但不得越过“画面直接可观察事实”边界;若与 transcript 冲突,应显式保留 uncertainty / ambiguity,不得静默脑补
-- Semantic Run 记录一次具体语义解析所使用的 provider / model / parser_version 以及精确 Evidence / Extraction 输入,供 Fact / Interpretation provenance 追溯
+- Semantic Run 记录一次具体语义解析所使用的 provider / model / parser_version 以及精确 Evidence / Extraction 输入,供 Fact / Interpretation provenance 追溯;run 生命周期为 `running -> succeeded/failed`,新的 run 通过 `supersedes_run_id` 保留历史
 - 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
+- Facts / Interpretations 采用整批原子落库;provider、解析或持久化失败时不得留下半套新语义结果
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
 
 ### D6. 访客沙箱优先于账号体系
@@ -263,7 +266,7 @@ V2 的目标底层关系为:
 - `llm_running`: 正在理解这段对话
 - `done / failed / unsupported`: 含义保持不变
 
-> `parse_status` 描述的是处理阶段,不是业务判断结果;业务展示应优先回到 `kind + slot_* + plain_summary + 变更链路` 这一层。
+> `parse_status` 描述的是处理阶段,不是业务判断结果;若存在成功的 Semantic Run,详情页优先展示该 run 的 Facts / Interpretations。没有 Semantic Run 的旧记录,继续回退到 `kind + slot_* + plain_summary + 变更链路` 兼容层。
 
 ### 3.7 V2 语义层新增表
 
@@ -532,10 +535,11 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - Semantic Parser V2.2:Extraction transcript + visual observations → Fact / Interpretation
 - Semantic Run provenance:Fact / Interpretation 可追溯到具体 parser run 与输入 Evidence / Extraction
 - PDF / docx / txt 文档提取
-- 图片 OCR → 文本 → 现有槽位抽取链路
+- text / file / image 新记录都会先落 Extraction provenance,再由 production semantic route 读取 latest Extraction 进入 V2.2
+- 图片链路:OCR 或 Ark Vision 提取 `transcript + observations` 后直接进入 production semantic route
 - 身份设置(`self_names`)与私人词典(`glossary`)
 - 人工槽位修正
-- OCR 文字人工校正后重新解析
+- OCR 文字人工校正后会生成新的 user extraction,并触发 superseding semantic run
 
 ### 阶段三:归并与检测
 **已完成首版**
@@ -587,6 +591,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 生产图片 Extraction 改为 provider-aware 路由:默认 OCR,可切 Ark Vision,失败后按 OCR 配置与配额 fallback | 保持默认行为稳定,同时让 transcript 与 observations 分离落库并保留真实 provenance |
 | 2026-08-08 | Semantic Parser V2.2 支持同时消费 transcript + visual observations | 让语义解析可以基于文字与画面直接可观察事实共同生成 Fact / Interpretation,同时保持 Observation 边界与冲突显式化 |
 | 2026-08-08 | V6 新增 Semantic Run / Fact Extraction Provenance | 让 Fact / Interpretation 能追溯到具体 parser run、模型版本与精确 Evidence / Extraction 输入,同时继续保持其在哈希链之外 |
+| 2026-08-08 | Production Semantic Pipeline V2 接管旧 `extract_slots`,详情页最小展示最新 Semantic Run 结果 | 新 Evidence 的生产语义入口已统一切到 latest Extraction -> Semantic Parser V2.2,旧 slot 字段降级为兼容展示层 |
 
 ---
 

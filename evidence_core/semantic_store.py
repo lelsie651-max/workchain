@@ -320,6 +320,70 @@ def _load_interpretation(conn: sqlite3.Connection, interpretation_id: str) -> di
     return dict(row)
 
 
+def get_latest_semantic_run_for_evidence(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT sr.semantic_run_id
+        FROM semantic_runs sr
+        JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+        WHERE sri.evidence_id = ?
+    """
+    params: list[Any] = [evidence_id]
+    if status is not None:
+        query += " AND sr.status = ?"
+        params.append(status)
+    query += " ORDER BY sr.created_at DESC, sr.semantic_run_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_semantic_run(conn, row["semantic_run_id"])
+
+
+def list_facts_for_semantic_run(
+    conn: sqlite3.Connection,
+    semantic_run_id: str,
+    *,
+    evidence_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = """
+        SELECT DISTINCT f.fact_id
+        FROM facts f
+        LEFT JOIN fact_evidence fe ON fe.fact_id = f.fact_id
+        WHERE f.semantic_run_id = ?
+    """
+    params: list[Any] = [semantic_run_id]
+    if evidence_id is not None:
+        query += " AND fe.evidence_id = ?"
+        params.append(evidence_id)
+    query += " ORDER BY f.created_at ASC, f.fact_id ASC"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    return [_load_fact(conn, row["fact_id"]) for row in rows]
+
+
+def list_interpretations_for_semantic_run(
+    conn: sqlite3.Connection,
+    semantic_run_id: str,
+    *,
+    evidence_id: str | None = None,
+) -> list[dict[str, Any]]:
+    query = """
+        SELECT interpretation_id
+        FROM interpretations
+        WHERE semantic_run_id = ?
+    """
+    params: list[Any] = [semantic_run_id]
+    if evidence_id is not None:
+        query += " AND (evidence_id = ? OR fact_id IN (SELECT fact_id FROM fact_evidence WHERE evidence_id = ?))"
+        params.extend([evidence_id, evidence_id])
+    query += " ORDER BY created_at ASC, interpretation_id ASC"
+    rows = conn.execute(query, tuple(params)).fetchall()
+    return [_load_interpretation(conn, row["interpretation_id"]) for row in rows]
+
+
 def _replace_fact_actors(
     conn: sqlite3.Connection,
     *,
@@ -465,8 +529,11 @@ def create_semantic_run(
     semantic_run_id = semantic_run_id or _new_id("srun")
     normalized_inputs = _normalize_semantic_run_inputs(inputs)
 
+    started_transaction = not conn.in_transaction
+
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         if supersedes_run_id is not None:
             _get_semantic_run_row(conn, supersedes_run_id)
         _validate_semantic_run_inputs(conn, inputs=normalized_inputs)
@@ -506,10 +573,12 @@ def create_semantic_run(
                 ),
             )
         result = _load_semantic_run(conn, semantic_run_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 
@@ -520,9 +589,11 @@ def mark_semantic_run_succeeded(
     completed_at: int | None = None,
 ) -> dict[str, Any]:
     completed_at = _now_ms() if completed_at is None else completed_at
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         current = _get_semantic_run_row(conn, semantic_run_id)
         if current["status"] != "running":
             raise SemanticStoreError("semantic run is not running")
@@ -535,10 +606,12 @@ def mark_semantic_run_succeeded(
             ("succeeded", completed_at, None, semantic_run_id),
         )
         result = _load_semantic_run(conn, semantic_run_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 
@@ -551,9 +624,11 @@ def mark_semantic_run_failed(
 ) -> dict[str, Any]:
     completed_at = _now_ms() if completed_at is None else completed_at
     failure_type = _coerce_optional_text(failure_type)
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         current = _get_semantic_run_row(conn, semantic_run_id)
         if current["status"] != "running":
             raise SemanticStoreError("semantic run is not running")
@@ -566,10 +641,12 @@ def mark_semantic_run_failed(
             ("failed", completed_at, failure_type, semantic_run_id),
         )
         result = _load_semantic_run(conn, semantic_run_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 
@@ -616,9 +693,11 @@ def create_fact(
     created_at = _now_ms() if created_at is None else created_at
     updated_at = created_at if updated_at is None else updated_at
     fact_id = fact_id or _new_id("fact")
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         _ensure_evidence_exists(conn, normalized_evidence_ids)
         if event_id is not None:
             _ensure_event_exists(conn, event_id)
@@ -671,10 +750,12 @@ def create_fact(
                 (fact_id, item["actor_id"], item["role"]),
             )
         result = _load_fact(conn, fact_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 
@@ -695,9 +776,11 @@ def create_interpretation(
 
     interpretation_id = interpretation_id or _new_id("itp")
     created_at = _now_ms() if created_at is None else created_at
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         fact_row = None
         if fact_id is not None:
             fact_row = _get_fact_row(conn, fact_id)
@@ -739,10 +822,76 @@ def create_interpretation(
             ),
         )
         result = _load_interpretation(conn, interpretation_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def persist_semantic_run_result(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str,
+    facts: Sequence[Mapping[str, Any]],
+    interpretations: Sequence[Mapping[str, Any]],
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    created_fact_ids: list[str] = []
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
+        _get_semantic_run_row(conn, semantic_run_id)
+
+        created_facts: list[dict[str, Any]] = []
+        for item in facts:
+            payload = dict(item)
+            payload["semantic_run_id"] = semantic_run_id
+            created = create_fact(conn, **payload)
+            created_facts.append(created)
+            created_fact_ids.append(created["fact_id"])
+
+        created_interpretations: list[dict[str, Any]] = []
+        for item in interpretations:
+            payload = dict(item)
+            fact_index = payload.pop("fact_index", None)
+            if fact_index is not None:
+                if not isinstance(fact_index, int) or isinstance(fact_index, bool):
+                    raise SemanticStoreError("interpretation fact_index must be an integer")
+                if fact_index < 0 or fact_index >= len(created_fact_ids):
+                    raise SemanticStoreError("interpretation fact_index is out of range")
+                payload["fact_id"] = created_fact_ids[fact_index]
+            payload["semantic_run_id"] = semantic_run_id
+            created_interpretations.append(create_interpretation(conn, **payload))
+
+        run = mark_semantic_run_succeeded(
+            conn,
+            semantic_run_id=semantic_run_id,
+            completed_at=completed_at,
+        )
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        return {
+            "semantic_run": run,
+            "facts": created_facts,
+            "interpretations": created_interpretations,
+        }
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
         raise
 
 
