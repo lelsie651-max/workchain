@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.2 · 最后更新 2026-08-08
+> 版本 v1.3 · 最后更新 2026-08-08
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -111,6 +111,7 @@
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - Observation 可以支持 Fact / Interpretation 生成,但不得越过“画面直接可观察事实”边界;若与 transcript 冲突,应显式保留 uncertainty / ambiguity,不得静默脑补
+- Semantic Run 记录一次具体语义解析所使用的 provider / model / parser_version 以及精确 Evidence / Extraction 输入,供 Fact / Interpretation provenance 追溯
 - 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
 
@@ -244,7 +245,7 @@ V2 的目标底层关系为:
 
 | key 模式 | value | 用途 |
 |---|---|---|
-| `schema_version` | `1/2/3/4/5` | schema 版本 |
+| `schema_version` | `1/2/3/4/5/6` | schema 版本 |
 | `parse_status:{evidence_id}` | `ocr_running / llm_running / done / failed / unsupported` | 解析状态机 |
 | `parse_detail:{evidence_id}` | TEXT | 解析失败或降级说明 |
 | `extract_note:{evidence_id}` | TEXT | 文档提取 / OCR 的具体失败原因 |
@@ -314,6 +315,7 @@ V2 的目标底层关系为:
 | event_assignment_confidence | REAL NULL | Event 归属置信度,0..1,与 `confidence` 分离 |
 | origin | TEXT NOT NULL DEFAULT `ai` | ai / user,标记该 Fact 当前结果来源 |
 | review_status | TEXT NOT NULL DEFAULT `unreviewed` | unreviewed / confirmed / corrected |
+| semantic_run_id | TEXT NULL | 生成该 Fact 的 Semantic Run |
 | created_at | INTEGER NOT NULL | 创建时间 |
 | updated_at | INTEGER NOT NULL | 更新时间 |
 
@@ -344,6 +346,7 @@ V2 的目标底层关系为:
 | kind | TEXT NOT NULL | explanation / term / action_hint / uncertainty |
 | content | TEXT NOT NULL | 解释内容 |
 | confidence | REAL NULL | 0..1 |
+| semantic_run_id | TEXT NULL | 生成该 Interpretation 的 Semantic Run |
 | created_at | INTEGER NOT NULL | 创建时间 |
 
 约束:
@@ -354,7 +357,43 @@ V2 的目标底层关系为:
 - Interpretation 不得反向改写 Fact 的原始抽取结果
 - Evidence 始终代表原始证据,解释层变化不改变 Evidence 的完整性语义
 
-### 3.8 V4 提取层新增表
+### 3.8 V6 语义解析履历新增表
+
+#### semantic_runs
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| semantic_run_id | TEXT PK | 一次语义解析运行 |
+| provider | TEXT NOT NULL | 文本模型供应方 |
+| model | TEXT NOT NULL | 模型名 |
+| parser_version | TEXT NOT NULL | 解析器版本,如 `2.2` |
+| status | TEXT NOT NULL | running / succeeded / failed |
+| anchor_date | TEXT NULL | 本次解析显式使用的日期锚点 |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| completed_at | INTEGER NULL | 完成时间 |
+| failure_type | TEXT NULL | 失败类型 |
+| supersedes_run_id | TEXT NULL | 指向被 supersede 的旧 run |
+
+#### semantic_run_inputs
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| semantic_run_id | TEXT NOT NULL | 所属 Semantic Run |
+| evidence_id | TEXT NOT NULL | 本次 run 消费的 Evidence |
+| extraction_id | TEXT NULL | 若非空,指向本次 run 实际消费的 Extraction 版本 |
+| position | INTEGER NOT NULL | 多 Evidence 输入顺序 |
+
+约束:
+- PK `(semantic_run_id, evidence_id)`
+- UNIQUE `(semantic_run_id, position)`
+- 若 `extraction_id` 非空,必须属于同一个 `evidence_id`
+
+语义边界:
+- Fact / Interpretation 可以通过 `semantic_run_id` 追溯到具体 Semantic Run
+- Semantic Run 必须记录精确输入 Evidence / Extraction,而不是只记录"模型跑过一次"
+- Semantic 履历不进入 Evidence 原件哈希链,不改变 `content_hash / chain_hash`
+
+### 3.9 V4 提取层新增表
 
 #### evidence_extractions
 
@@ -381,6 +420,7 @@ V2 的目标底层关系为:
 - 图片类 Evidence 的 `raw_text` 仅保留 transcript 兼容层,不得把 observations 混入原文
 - 当前 `raw_text` 仍保留为兼容层展示 / 搜索 / 解析输入,但机器或用户提取历史应落入 `evidence_extractions`
 - `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
+- `semantic_runs / semantic_run_inputs / facts.semantic_run_id / interpretations.semantic_run_id` 同样不进入 Evidence 哈希链
 
 ---
 
@@ -490,6 +530,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 **已完成首版**
 - DeepSeek 文本槽位抽取
 - Semantic Parser V2.2:Extraction transcript + visual observations → Fact / Interpretation
+- Semantic Run provenance:Fact / Interpretation 可追溯到具体 parser run 与输入 Evidence / Extraction
 - PDF / docx / txt 文档提取
 - 图片 OCR → 文本 → 现有槽位抽取链路
 - 身份设置(`self_names`)与私人词典(`glossary`)
@@ -545,6 +586,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | Ark diagnostics Extraction 使用 disabled thinking,并拆分 text/vision 独立 timeout | 单独验证视觉 timeout 与推理开关对 Ark 实验提取成功率的影响,不改其它请求变量 |
 | 2026-08-08 | 生产图片 Extraction 改为 provider-aware 路由:默认 OCR,可切 Ark Vision,失败后按 OCR 配置与配额 fallback | 保持默认行为稳定,同时让 transcript 与 observations 分离落库并保留真实 provenance |
 | 2026-08-08 | Semantic Parser V2.2 支持同时消费 transcript + visual observations | 让语义解析可以基于文字与画面直接可观察事实共同生成 Fact / Interpretation,同时保持 Observation 边界与冲突显式化 |
+| 2026-08-08 | V6 新增 Semantic Run / Fact Extraction Provenance | 让 Fact / Interpretation 能追溯到具体 parser run、模型版本与精确 Evidence / Extraction 输入,同时继续保持其在哈希链之外 |
 
 ---
 

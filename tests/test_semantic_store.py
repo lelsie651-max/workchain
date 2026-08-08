@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from app.semantic_llm import SEMANTIC_PARSER_VERSION
 from evidence_core.db import init_db
+from evidence_core.extraction_store import create_extraction
 from evidence_core.semantic_store import (
     ProtectedFactError,
     SemanticStoreError,
@@ -12,8 +14,12 @@ from evidence_core.semantic_store import (
     create_event,
     create_fact,
     create_interpretation,
+    create_semantic_run,
     create_submission,
     correct_fact_by_user,
+    get_semantic_run,
+    mark_semantic_run_failed,
+    mark_semantic_run_succeeded,
     set_event_assignment_by_ai,
     set_event_assignment_by_user,
     update_fact_by_ai,
@@ -62,6 +68,28 @@ def _count(conn, table: str) -> int:
     return row["count"]
 
 
+def _create_machine_extraction(
+    conn,
+    *,
+    evidence_id: str,
+    extraction_id: str,
+    transcript: str = "原始识别文字",
+    created_at: int = 1723000000,
+):
+    return create_extraction(
+        conn,
+        evidence_id=evidence_id,
+        extraction_id=extraction_id,
+        origin="machine",
+        provider="dashscope",
+        model="vanchin/deepseek-ocr",
+        transcript=transcript,
+        observations=[],
+        warnings=[],
+        created_at=created_at,
+    )
+
+
 def test_create_submission_keeps_evidence_order(db_file, blobs_root):
     conn = init_db(db_file)
     ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
@@ -78,6 +106,79 @@ def test_create_submission_keeps_evidence_order(db_file, blobs_root):
     assert created["submission_id"] == "sub-1"
     assert created["created_at"] == 10
     assert [row["evidence_id"] for row in created["evidence"]] == ["ev-2", "ev-1"]
+
+
+def test_create_semantic_run_supports_single_and_multiple_inputs(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    ev2 = _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    ext1 = _create_machine_extraction(conn, evidence_id=ev1["evidence_id"], extraction_id="ext-1")
+
+    created = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        anchor_date="2026-08-08",
+        inputs=[
+            {"evidence_id": ev2["evidence_id"], "position": 1},
+            {
+                "evidence_id": ev1["evidence_id"],
+                "extraction_id": ext1["extraction_id"],
+                "position": 0,
+            },
+        ],
+        created_at=10,
+    )
+
+    loaded = get_semantic_run(conn, "srun-1")
+
+    assert created["status"] == "running"
+    assert created["provider"] == "deepseek"
+    assert created["parser_version"] == SEMANTIC_PARSER_VERSION
+    assert created["inputs"] == [
+        {
+            "semantic_run_id": "srun-1",
+            "evidence_id": "ev-1",
+            "extraction_id": "ext-1",
+            "position": 0,
+        },
+        {
+            "semantic_run_id": "srun-1",
+            "evidence_id": "ev-2",
+            "extraction_id": None,
+            "position": 1,
+        },
+    ]
+    assert loaded == created
+
+
+def test_create_semantic_run_rejects_cross_evidence_extraction_and_rolls_back(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    ev2 = _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    ext1 = _create_machine_extraction(conn, evidence_id=ev1["evidence_id"], extraction_id="ext-1")
+
+    with pytest.raises(SemanticStoreError, match="same evidence_id"):
+        create_semantic_run(
+            conn,
+            semantic_run_id="srun-1",
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            parser_version=SEMANTIC_PARSER_VERSION,
+            inputs=[
+                {
+                    "evidence_id": ev2["evidence_id"],
+                    "extraction_id": ext1["extraction_id"],
+                    "position": 0,
+                }
+            ],
+            created_at=10,
+        )
+
+    assert _count(conn, "semantic_runs") == 0
+    assert _count(conn, "semantic_run_inputs") == 0
 
 
 @pytest.mark.parametrize(
@@ -178,6 +279,80 @@ def test_create_fact_supports_many_to_many_and_multiple_actor_roles(db_file, blo
         ("ev-1",),
     ).fetchone()
     assert linked_facts["count"] == 2
+
+
+def test_create_fact_can_bind_to_semantic_run(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+
+    fact = create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="statement",
+        content="原始事实",
+        evidence_ids=[ev1["evidence_id"]],
+        semantic_run_id=run["semantic_run_id"],
+        created_at=11,
+        updated_at=12,
+    )
+
+    assert fact["semantic_run_id"] == "srun-1"
+
+
+def test_create_fact_rejects_evidence_outside_semantic_run_and_rolls_back(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    ev2 = _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+
+    with pytest.raises(SemanticStoreError, match="semantic run does not include evidence"):
+        create_fact(
+            conn,
+            fact_id="fact-1",
+            fact_type="statement",
+            content="原始事实",
+            evidence_ids=[ev2["evidence_id"]],
+            semantic_run_id="srun-1",
+            created_at=11,
+            updated_at=12,
+        )
+
+    assert _count(conn, "facts") == 0
+    assert _count(conn, "fact_evidence") == 0
+
+
+def test_create_fact_without_semantic_run_id_stays_backward_compatible(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+
+    fact = create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="statement",
+        content="旧调用仍可创建事实",
+        evidence_ids=[ev1["evidence_id"]],
+        created_at=10,
+        updated_at=11,
+    )
+
+    assert fact["semantic_run_id"] is None
 
 
 def test_create_fact_rolls_back_when_any_association_is_invalid(db_file, blobs_root):
@@ -399,6 +574,7 @@ def test_create_interpretation_validates_parent_records(db_file, blobs_root):
 
     assert interpretation["interpretation_id"] == "itp-1"
     assert interpretation["fact_id"] == "fact-1"
+    assert interpretation["semantic_run_id"] is None
 
     with pytest.raises(SemanticStoreError, match="requires fact_id or evidence_id"):
         create_interpretation(conn, kind="term", content="缺父节点")
@@ -413,6 +589,152 @@ def test_create_interpretation_validates_parent_records(db_file, blobs_root):
         )
 
 
+def test_create_interpretation_enforces_semantic_run_consistency(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    ev2 = _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+    fact = create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="statement",
+        content="原始事实",
+        evidence_ids=[ev1["evidence_id"]],
+        semantic_run_id=run["semantic_run_id"],
+        created_at=11,
+        updated_at=11,
+    )
+
+    interpretation = create_interpretation(
+        conn,
+        interpretation_id="itp-1",
+        fact_id=fact["fact_id"],
+        evidence_id=ev1["evidence_id"],
+        semantic_run_id=run["semantic_run_id"],
+        kind="uncertainty",
+        content="这条事实仍需补上下文",
+        created_at=12,
+    )
+
+    assert interpretation["semantic_run_id"] == "srun-1"
+
+    other_run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-2",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev2["evidence_id"], "position": 0}],
+        created_at=14,
+    )
+    with pytest.raises(SemanticStoreError, match="must match fact semantic_run_id"):
+        create_interpretation(
+            conn,
+            interpretation_id="itp-3",
+            fact_id=fact["fact_id"],
+            semantic_run_id=other_run["semantic_run_id"],
+            kind="explanation",
+            content="run 不一致",
+            created_at=15,
+        )
+    with pytest.raises(SemanticStoreError, match="does not include evidence"):
+        create_interpretation(
+            conn,
+            interpretation_id="itp-4",
+            evidence_id=ev2["evidence_id"],
+            semantic_run_id=run["semantic_run_id"],
+            kind="explanation",
+            content="run 未消费该 evidence",
+            created_at=16,
+        )
+
+
+def test_create_interpretation_rejects_run_provenance_when_fact_has_no_run(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="statement",
+        content="原始事实",
+        evidence_ids=[ev1["evidence_id"]],
+        created_at=10,
+        updated_at=10,
+    )
+    create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+
+    with pytest.raises(SemanticStoreError, match="requires fact semantic_run_id to be set"):
+        create_interpretation(
+            conn,
+            interpretation_id="itp-1",
+            fact_id="fact-1",
+            semantic_run_id="srun-1",
+            kind="explanation",
+            content="不能伪造 provenance",
+            created_at=12,
+        )
+
+
+def test_semantic_run_lifecycle_and_supersedes_history(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+
+    first = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+    succeeded = mark_semantic_run_succeeded(conn, semantic_run_id=first["semantic_run_id"], completed_at=11)
+
+    second = create_semantic_run(
+        conn,
+        semantic_run_id="srun-2",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=12,
+        supersedes_run_id=first["semantic_run_id"],
+    )
+    failed = mark_semantic_run_failed(
+        conn,
+        semantic_run_id=second["semantic_run_id"],
+        failure_type="provider_timeout",
+        completed_at=13,
+    )
+
+    assert succeeded["status"] == "succeeded"
+    assert succeeded["completed_at"] == 11
+    assert failed["status"] == "failed"
+    assert failed["failure_type"] == "provider_timeout"
+    assert failed["supersedes_run_id"] == "srun-1"
+    assert get_semantic_run(conn, "srun-1")["status"] == "succeeded"
+    assert get_semantic_run(conn, "srun-2")["status"] == "failed"
+
+    with pytest.raises(SemanticStoreError, match="not running"):
+        mark_semantic_run_succeeded(conn, semantic_run_id="srun-2", completed_at=14)
+
+
 def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):
     conn = init_db(db_file)
     _insert_actor(conn, "act-1")
@@ -424,15 +746,28 @@ def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):
 
     create_submission(conn, submission_id="sub-1", created_at=10, evidence_ids=["ev-2", "ev-1"])
     create_event(conn, event_id="evt-1", title="事件一", created_at=11)
+    create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[
+            {"evidence_id": "ev-1", "position": 0},
+            {"evidence_id": "ev-2", "position": 1},
+        ],
+        created_at=12,
+    )
     create_fact(
         conn,
         fact_id="fact-1",
         fact_type="request",
         content="请补一份渠道复盘",
         evidence_ids=["ev-1", "ev-2"],
+        semantic_run_id="srun-1",
         actor_roles=[("act-1", "requester"), ("act-2", "owner")],
-        created_at=12,
-        updated_at=12,
+        created_at=13,
+        updated_at=13,
     )
     set_event_assignment_by_ai(
         conn,
@@ -440,15 +775,16 @@ def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):
         event_id="evt-1",
         assignment="auto",
         event_assignment_confidence=0.8,
-        updated_at=13,
+        updated_at=14,
     )
     create_interpretation(
         conn,
         interpretation_id="itp-1",
         fact_id="fact-1",
+        semantic_run_id="srun-1",
         kind="uncertainty",
         content="交付时间仍需确认",
-        created_at=14,
+        created_at=15,
     )
     correct_fact_by_user(
         conn,
@@ -456,8 +792,9 @@ def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):
         due_raw="下下周五",
         due_anchor_at=12,
         actor_roles=[("act-2", "owner")],
-        updated_at=15,
+        updated_at=16,
     )
+    mark_semantic_run_succeeded(conn, semantic_run_id="srun-1", completed_at=17)
 
     after = verify_chain(conn, blobs_root=blobs_root)
 

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -308,6 +308,72 @@ def _create_v5_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _create_v6_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS semantic_runs (
+            semantic_run_id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+            anchor_date TEXT,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            failure_type TEXT,
+            supersedes_run_id TEXT,
+            FOREIGN KEY (supersedes_run_id) REFERENCES semantic_runs(semantic_run_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS semantic_run_inputs (
+            semantic_run_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            extraction_id TEXT,
+            position INTEGER NOT NULL CHECK (position >= 0),
+            PRIMARY KEY (semantic_run_id, evidence_id),
+            UNIQUE (semantic_run_id, position),
+            FOREIGN KEY (semantic_run_id) REFERENCES semantic_runs(semantic_run_id) ON DELETE RESTRICT,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT,
+            FOREIGN KEY (extraction_id) REFERENCES evidence_extractions(extraction_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_runs_supersedes
+            ON semantic_runs(supersedes_run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_semantic_run_inputs_evidence_id
+            ON semantic_run_inputs(evidence_id);
+        """
+    )
+
+    if not _column_exists(conn, "facts", "semantic_run_id"):
+        conn.execute(
+            """
+            ALTER TABLE facts
+            ADD COLUMN semantic_run_id TEXT REFERENCES semantic_runs(semantic_run_id) ON DELETE RESTRICT
+            """
+        )
+    if not _column_exists(conn, "interpretations", "semantic_run_id"):
+        conn.execute(
+            """
+            ALTER TABLE interpretations
+            ADD COLUMN semantic_run_id TEXT REFERENCES semantic_runs(semantic_run_id) ON DELETE RESTRICT
+            """
+        )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_facts_semantic_run_id
+            ON facts(semantic_run_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_interpretations_semantic_run_id
+            ON interpretations(semantic_run_id)
+        """
+    )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -348,6 +414,11 @@ def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 5)
 
 
+def _migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    _create_v6_schema(conn)
+    _set_schema_version(conn, 6)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -372,6 +443,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v3_schema(conn)
         _create_v4_schema(conn)
         _create_v5_schema(conn)
+        _create_v6_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -389,30 +461,42 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v2_to_v3(conn)
         _migrate_v3_to_v4(conn)
         _migrate_v4_to_v5(conn)
+        _migrate_v5_to_v6(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _migrate_v2_to_v3(conn)
         _migrate_v3_to_v4(conn)
         _migrate_v4_to_v5(conn)
+        _migrate_v5_to_v6(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _create_v3_schema(conn)
         _migrate_v3_to_v4(conn)
         _migrate_v4_to_v5(conn)
+        _migrate_v5_to_v6(conn)
     elif schema_version == 4:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _create_v3_schema(conn)
         _create_v4_schema(conn)
         _migrate_v4_to_v5(conn)
+        _migrate_v5_to_v6(conn)
     elif schema_version == 5:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _create_v3_schema(conn)
         _create_v4_schema(conn)
         _create_v5_schema(conn)
+        _migrate_v5_to_v6(conn)
+    elif schema_version == 6:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
+        _create_v5_schema(conn)
+        _create_v6_schema(conn)
     else:
         conn.close()
         raise ValueError(

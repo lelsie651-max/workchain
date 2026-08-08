@@ -44,6 +44,22 @@ def _begin(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
 
 
+def _coerce_optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SemanticStoreError("text fields must be strings or None")
+    value = value.strip()
+    return value or None
+
+
+def _coerce_required_text(name: str, value: Any) -> str:
+    normalized = _coerce_optional_text(value)
+    if normalized is None:
+        raise SemanticStoreError(f"{name} must be a non-empty string")
+    return normalized
+
+
 def _normalize_non_empty_ids(name: str, values: Sequence[str]) -> list[str]:
     normalized = list(values)
     if not normalized:
@@ -121,11 +137,112 @@ def _ensure_event_exists(conn: sqlite3.Connection, event_id: str) -> None:
         raise SemanticStoreError(f"event not found: {event_id}")
 
 
+def _get_extraction_row(conn: sqlite3.Connection, extraction_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM evidence_extractions WHERE extraction_id = ?",
+        (extraction_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"extraction not found: {extraction_id}")
+    return row
+
+
 def _get_fact_row(conn: sqlite3.Connection, fact_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM facts WHERE fact_id = ?", (fact_id,)).fetchone()
     if row is None:
         raise SemanticStoreError(f"fact not found: {fact_id}")
     return row
+
+
+def _get_semantic_run_row(conn: sqlite3.Connection, semantic_run_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM semantic_runs WHERE semantic_run_id = ?",
+        (semantic_run_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"semantic run not found: {semantic_run_id}")
+    return row
+
+
+def _normalize_semantic_run_inputs(
+    inputs: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if not inputs:
+        raise SemanticStoreError("inputs must contain at least one item")
+
+    normalized: list[dict[str, Any]] = []
+    seen_evidence_ids: set[str] = set()
+    seen_positions: set[int] = set()
+    for index, item in enumerate(inputs):
+        if not isinstance(item, Mapping):
+            raise SemanticStoreError("each semantic run input must be an object")
+        evidence_id = _coerce_required_text("evidence_id", item.get("evidence_id"))
+        extraction_id = _coerce_optional_text(item.get("extraction_id"))
+        raw_position = item.get("position", index)
+        if not isinstance(raw_position, int) or isinstance(raw_position, bool) or raw_position < 0:
+            raise SemanticStoreError("input position must be an integer >= 0")
+        if evidence_id in seen_evidence_ids:
+            raise SemanticStoreError("inputs must not contain duplicate evidence_id")
+        if raw_position in seen_positions:
+            raise SemanticStoreError("inputs must not contain duplicate position")
+        seen_evidence_ids.add(evidence_id)
+        seen_positions.add(raw_position)
+        normalized.append(
+            {
+                "evidence_id": evidence_id,
+                "extraction_id": extraction_id,
+                "position": raw_position,
+            }
+        )
+    return sorted(normalized, key=lambda item: item["position"])
+
+
+def _validate_semantic_run_inputs(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str | None = None,
+    inputs: Sequence[dict[str, Any]],
+) -> None:
+    _ensure_evidence_exists(conn, [item["evidence_id"] for item in inputs])
+    for item in inputs:
+        extraction_id = item.get("extraction_id")
+        if extraction_id is None:
+            continue
+        extraction = _get_extraction_row(conn, extraction_id)
+        if extraction["evidence_id"] != item["evidence_id"]:
+            raise SemanticStoreError(
+                "extraction_id must belong to the same evidence_id"
+            )
+
+    if semantic_run_id is not None:
+        _get_semantic_run_row(conn, semantic_run_id)
+
+
+def _semantic_run_input_evidence_ids(conn: sqlite3.Connection, semantic_run_id: str) -> set[str]:
+    rows = conn.execute(
+        """
+        SELECT evidence_id
+        FROM semantic_run_inputs
+        WHERE semantic_run_id = ?
+        """,
+        (semantic_run_id,),
+    ).fetchall()
+    return {row["evidence_id"] for row in rows}
+
+
+def _ensure_semantic_run_covers_evidence_ids(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str,
+    evidence_ids: Sequence[str],
+) -> None:
+    _get_semantic_run_row(conn, semantic_run_id)
+    allowed = _semantic_run_input_evidence_ids(conn, semantic_run_id)
+    missing = [evidence_id for evidence_id in evidence_ids if evidence_id not in allowed]
+    if missing:
+        raise SemanticStoreError(
+            "semantic run does not include evidence: " + ", ".join(missing)
+        )
 
 
 def _load_submission(conn: sqlite3.Connection, submission_id: str) -> dict[str, Any]:
@@ -147,6 +264,22 @@ def _load_submission(conn: sqlite3.Connection, submission_id: str) -> dict[str, 
     ).fetchall()
     result = dict(submission)
     result["evidence"] = [dict(row) for row in evidence_rows]
+    return result
+
+
+def _load_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any]:
+    run = _get_semantic_run_row(conn, semantic_run_id)
+    input_rows = conn.execute(
+        """
+        SELECT semantic_run_id, evidence_id, extraction_id, position
+        FROM semantic_run_inputs
+        WHERE semantic_run_id = ?
+        ORDER BY position ASC, evidence_id ASC
+        """,
+        (semantic_run_id,),
+    ).fetchall()
+    result = dict(run)
+    result["inputs"] = [dict(row) for row in input_rows]
     return result
 
 
@@ -311,12 +444,152 @@ def create_event(
         raise
 
 
+def create_semantic_run(
+    conn: sqlite3.Connection,
+    *,
+    provider: str,
+    model: str,
+    parser_version: str,
+    inputs: Sequence[Mapping[str, Any]],
+    semantic_run_id: str | None = None,
+    anchor_date: str | None = None,
+    created_at: int | None = None,
+    supersedes_run_id: str | None = None,
+) -> dict[str, Any]:
+    provider = _coerce_required_text("provider", provider)
+    model = _coerce_required_text("model", model)
+    parser_version = _coerce_required_text("parser_version", parser_version)
+    anchor_date = _coerce_optional_text(anchor_date)
+    supersedes_run_id = _coerce_optional_text(supersedes_run_id)
+    created_at = _now_ms() if created_at is None else created_at
+    semantic_run_id = semantic_run_id or _new_id("srun")
+    normalized_inputs = _normalize_semantic_run_inputs(inputs)
+
+    try:
+        _begin(conn)
+        if supersedes_run_id is not None:
+            _get_semantic_run_row(conn, supersedes_run_id)
+        _validate_semantic_run_inputs(conn, inputs=normalized_inputs)
+
+        conn.execute(
+            """
+            INSERT INTO semantic_runs (
+                semantic_run_id, provider, model, parser_version, status,
+                anchor_date, created_at, completed_at, failure_type, supersedes_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                semantic_run_id,
+                provider,
+                model,
+                parser_version,
+                "running",
+                anchor_date,
+                created_at,
+                None,
+                None,
+                supersedes_run_id,
+            ),
+        )
+        for item in normalized_inputs:
+            conn.execute(
+                """
+                INSERT INTO semantic_run_inputs (
+                    semantic_run_id, evidence_id, extraction_id, position
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    semantic_run_id,
+                    item["evidence_id"],
+                    item["extraction_id"],
+                    item["position"],
+                ),
+            )
+        result = _load_semantic_run(conn, semantic_run_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def mark_semantic_run_succeeded(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str,
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+
+    try:
+        _begin(conn)
+        current = _get_semantic_run_row(conn, semantic_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("semantic run is not running")
+        conn.execute(
+            """
+            UPDATE semantic_runs
+            SET status = ?, completed_at = ?, failure_type = ?
+            WHERE semantic_run_id = ?
+            """,
+            ("succeeded", completed_at, None, semantic_run_id),
+        )
+        result = _load_semantic_run(conn, semantic_run_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def mark_semantic_run_failed(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str,
+    failure_type: str | None = None,
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    failure_type = _coerce_optional_text(failure_type)
+
+    try:
+        _begin(conn)
+        current = _get_semantic_run_row(conn, semantic_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("semantic run is not running")
+        conn.execute(
+            """
+            UPDATE semantic_runs
+            SET status = ?, completed_at = ?, failure_type = ?
+            WHERE semantic_run_id = ?
+            """,
+            ("failed", completed_at, failure_type, semantic_run_id),
+        )
+        result = _load_semantic_run(conn, semantic_run_id)
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT semantic_run_id FROM semantic_runs WHERE semantic_run_id = ?",
+        (semantic_run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _load_semantic_run(conn, semantic_run_id)
+
+
 def create_fact(
     conn: sqlite3.Connection,
     *,
     fact_type: str,
     content: str,
     evidence_ids: Sequence[str],
+    semantic_run_id: str | None = None,
     event_id: str | None = None,
     occurred_at: int | None = None,
     due_at: int | None = None,
@@ -349,6 +622,12 @@ def create_fact(
         _ensure_evidence_exists(conn, normalized_evidence_ids)
         if event_id is not None:
             _ensure_event_exists(conn, event_id)
+        if semantic_run_id is not None:
+            _ensure_semantic_run_covers_evidence_ids(
+                conn,
+                semantic_run_id=semantic_run_id,
+                evidence_ids=normalized_evidence_ids,
+            )
         if normalized_actor_roles:
             _ensure_actors_exist(
                 conn, [item["actor_id"] for item in normalized_actor_roles]
@@ -359,8 +638,8 @@ def create_fact(
             INSERT INTO facts (
                 fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
                 confidence, event_assignment, created_at, updated_at,
-                due_anchor_at, event_assignment_confidence, origin, review_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                due_anchor_at, event_assignment_confidence, origin, review_status, semantic_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fact_id,
@@ -378,6 +657,7 @@ def create_fact(
                 event_assignment_confidence,
                 origin,
                 review_status,
+                semantic_run_id,
             ),
         )
         for evidence_id in normalized_evidence_ids:
@@ -405,6 +685,7 @@ def create_interpretation(
     content: str,
     fact_id: str | None = None,
     evidence_id: str | None = None,
+    semantic_run_id: str | None = None,
     confidence: float | None = None,
     interpretation_id: str | None = None,
     created_at: int | None = None,
@@ -417,17 +698,45 @@ def create_interpretation(
 
     try:
         _begin(conn)
+        fact_row = None
         if fact_id is not None:
-            _get_fact_row(conn, fact_id)
+            fact_row = _get_fact_row(conn, fact_id)
         if evidence_id is not None:
             _ensure_evidence_exists(conn, [evidence_id])
+        if semantic_run_id is not None:
+            _get_semantic_run_row(conn, semantic_run_id)
+            if evidence_id is not None:
+                _ensure_semantic_run_covers_evidence_ids(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    evidence_ids=[evidence_id],
+                )
+            if fact_row is not None:
+                fact_semantic_run_id = fact_row["semantic_run_id"]
+                if fact_semantic_run_id is None:
+                    raise SemanticStoreError(
+                        "interpretation semantic_run_id requires fact semantic_run_id to be set"
+                    )
+                if fact_semantic_run_id != semantic_run_id:
+                    raise SemanticStoreError(
+                        "interpretation semantic_run_id must match fact semantic_run_id"
+                    )
         conn.execute(
             """
             INSERT INTO interpretations (
-                interpretation_id, fact_id, evidence_id, kind, content, confidence, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                interpretation_id, fact_id, evidence_id, kind, content, confidence, created_at, semantic_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (interpretation_id, fact_id, evidence_id, kind, content, confidence, created_at),
+            (
+                interpretation_id,
+                fact_id,
+                evidence_id,
+                kind,
+                content,
+                confidence,
+                created_at,
+                semantic_run_id,
+            ),
         )
         result = _load_interpretation(conn, interpretation_id)
         conn.commit()
@@ -678,4 +987,3 @@ def update_fact_by_ai(
     except Exception:
         conn.rollback()
         raise
-

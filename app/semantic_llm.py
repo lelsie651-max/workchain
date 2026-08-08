@@ -7,6 +7,9 @@ from typing import Any
 
 from app.ai_provider import chat_json
 from evidence_core.extraction_contract import normalize_observations
+
+SEMANTIC_PARSER_VERSION = "2.2"
+
 FACT_TYPES = {
     "request",
     "commitment",

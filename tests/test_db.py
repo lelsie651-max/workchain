@@ -131,6 +131,21 @@ def _make_v3_db(path):
         conn.close()
 
 
+def _make_v5_db(path):
+    conn = db_module._connect(path)
+    try:
+        db_module._ensure_meta_table(conn)
+        db_module._create_v1_schema(conn)
+        db_module._create_v2_schema(conn)
+        db_module._create_v3_schema(conn)
+        db_module._create_v4_schema(conn)
+        db_module._create_v5_schema(conn)
+        db_module._set_schema_version(conn, 5)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def db_file(tmp_path):
     return tmp_path / "workchain.db"
@@ -146,7 +161,7 @@ def test_init_db_creates_all_tables(db_file):
             'actors', 'threads', 'evidence', 'checkpoints', 'meta',
             'submissions', 'submission_evidence', 'events', 'facts',
             'fact_evidence', 'fact_actors', 'interpretations',
-            'evidence_extractions'
+            'evidence_extractions', 'semantic_runs', 'semantic_run_inputs'
         )
         ORDER BY name
         """
@@ -163,19 +178,24 @@ def test_init_db_creates_all_tables(db_file):
         "facts",
         "interpretations",
         "meta",
+        "semantic_run_inputs",
+        "semantic_runs",
         "submission_evidence",
         "submissions",
         "threads",
     ]
-    columns = conn.execute("PRAGMA table_info(facts)").fetchall()
+    fact_columns = conn.execute("PRAGMA table_info(facts)").fetchall()
+    interpretation_columns = conn.execute("PRAGMA table_info(interpretations)").fetchall()
 
-    assert get_schema_version(conn) == 5
-    assert {column["name"] for column in columns} >= {
+    assert get_schema_version(conn) == 6
+    assert {column["name"] for column in fact_columns} >= {
         "due_anchor_at",
         "event_assignment_confidence",
         "origin",
         "review_status",
+        "semantic_run_id",
     }
+    assert {column["name"] for column in interpretation_columns} >= {"semantic_run_id"}
 
 
 def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
@@ -184,10 +204,10 @@ def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
 
     conn2 = init_db(db_file)
 
-    assert get_schema_version(conn2) == 5
+    assert get_schema_version(conn2) == 6
 
 
-def test_v1_database_is_migrated_to_v5_without_losing_existing_rows(db_file):
+def test_v1_database_is_migrated_to_v6_without_losing_existing_rows(db_file):
     _make_v1_db(db_file)
     reopened = None
     try:
@@ -218,30 +238,38 @@ def test_v1_database_is_migrated_to_v5_without_losing_existing_rows(db_file):
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_extractions'"
         ).fetchone()
 
-        assert get_schema_version(reopened) == 5
+        semantic_runs_table = reopened.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'semantic_runs'"
+        ).fetchone()
+
+        assert get_schema_version(reopened) == 6
         assert actor["actor_id"] == "act-1"
         assert thread["thread_id"] == "thr-1"
         assert evidence["evidence_id"] == "ev-1"
         assert meta_row["value"] == "kept"
         assert facts_table["name"] == "facts"
         assert extraction_table["name"] == "evidence_extractions"
+        assert semantic_runs_table["name"] == "semantic_runs"
     finally:
         if reopened is not None:
             reopened.close()
 
 
-def test_v1_to_v5_migration_is_idempotent(db_file):
+def test_v1_to_v6_migration_is_idempotent(db_file):
     _make_v1_db(db_file)
 
     first = init_db(db_file)
     first.close()
     second = init_db(db_file)
     try:
-        assert get_schema_version(second) == 5
+        assert get_schema_version(second) == 6
         tables = second.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name IN ('submissions', 'events', 'facts', 'interpretations', 'evidence_extractions')
+            WHERE type = 'table' AND name IN (
+                'submissions', 'events', 'facts', 'interpretations',
+                'evidence_extractions', 'semantic_runs', 'semantic_run_inputs'
+            )
             ORDER BY name
             """
         ).fetchall()
@@ -250,6 +278,8 @@ def test_v1_to_v5_migration_is_idempotent(db_file):
             "evidence_extractions",
             "facts",
             "interpretations",
+            "semantic_run_inputs",
+            "semantic_runs",
             "submissions",
         ]
     finally:
@@ -342,7 +372,7 @@ def test_foreign_keys_are_enabled_and_missing_thread_is_rejected(db_file):
 def test_init_db_supports_memory_database():
     conn = init_db(":memory:")
 
-    assert get_schema_version(conn) == 5
+    assert get_schema_version(conn) == 6
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'actors'").fetchone() is not None
 
 
@@ -618,7 +648,7 @@ def test_interpretations_require_parent_and_validate_constraints(db_file):
         )
 
 
-def test_v2_database_with_existing_events_and_facts_migrates_to_v5_without_data_loss(db_file):
+def test_v2_database_with_existing_events_and_facts_migrates_to_v6_without_data_loss(db_file):
     _make_v2_db(db_file)
 
     conn = db_module._connect(db_file)
@@ -669,7 +699,7 @@ def test_v2_database_with_existing_events_and_facts_migrates_to_v5_without_data_
             ("fact-1",),
         ).fetchone()
 
-        assert get_schema_version(reopened) == 5
+        assert get_schema_version(reopened) == 6
         assert row["event_id"] == "evt-1"
         assert row["fact_type"] == "deadline_change"
         assert row["content"] == "原计划下周五交付"
@@ -745,7 +775,7 @@ def test_facts_v3_defaults_and_checks_are_enforced(db_file):
         )
 
 
-def test_v3_database_migrates_to_v5_without_losing_existing_rows(db_file):
+def test_v3_database_migrates_to_v6_without_losing_existing_rows(db_file):
     _make_v3_db(db_file)
     conn = db_module._connect(db_file)
     try:
@@ -771,7 +801,7 @@ def test_v3_database_migrates_to_v5_without_losing_existing_rows(db_file):
             ("custom:v3-note",),
         ).fetchone()
 
-        assert get_schema_version(reopened) == 5
+        assert get_schema_version(reopened) == 6
         assert evidence["evidence_id"] == "ev-1"
         assert meta_row["value"] == "still-here"
         assert {column["name"] for column in extraction_columns} >= {
@@ -786,6 +816,102 @@ def test_v3_database_migrates_to_v5_without_losing_existing_rows(db_file):
             "created_at",
             "supersedes_extraction_id",
         }
+    finally:
+        reopened.close()
+
+
+def test_v5_database_migrates_to_v6_without_losing_semantic_rows(db_file):
+    _make_v5_db(db_file)
+
+    conn = db_module._connect(db_file)
+    try:
+        _insert_thread(conn)
+        _insert_evidence(conn, evidence_id="ev-1", seq=1)
+        conn.execute(
+            """
+            INSERT INTO facts (
+                fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw,
+                confidence, event_assignment, created_at, updated_at,
+                due_anchor_at, event_assignment_confidence, origin, review_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "fact-1",
+                None,
+                "statement",
+                "原有事实",
+                1,
+                None,
+                None,
+                0.4,
+                "unassigned",
+                2,
+                3,
+                None,
+                None,
+                "ai",
+                "unreviewed",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO interpretations (
+                interpretation_id, fact_id, evidence_id, kind, content, confidence, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("itp-1", "fact-1", None, "explanation", "原有解释", 0.5, 4),
+        )
+        conn.execute(
+            """
+            INSERT INTO evidence_extractions (
+                extraction_id, evidence_id, origin, provider, model,
+                transcript, observations, warnings, created_at, supersedes_extraction_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("ext-1", "ev-1", "machine", "dashscope", "ocr-v1", "原有转录", "[]", "[]", 5, None),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = init_db(db_file)
+    try:
+        fact_row = reopened.execute(
+            """
+            SELECT fact_id, semantic_run_id, origin, review_status
+            FROM facts
+            WHERE fact_id = ?
+            """,
+            ("fact-1",),
+        ).fetchone()
+        interpretation_row = reopened.execute(
+            """
+            SELECT interpretation_id, semantic_run_id, fact_id, content
+            FROM interpretations
+            WHERE interpretation_id = ?
+            """,
+            ("itp-1",),
+        ).fetchone()
+        extraction_row = reopened.execute(
+            "SELECT extraction_id, transcript, warnings FROM evidence_extractions WHERE extraction_id = ?",
+            ("ext-1",),
+        ).fetchone()
+        run_tables = reopened.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name IN ('semantic_runs', 'semantic_run_inputs')
+            ORDER BY name
+            """
+        ).fetchall()
+
+        assert get_schema_version(reopened) == 6
+        assert fact_row["fact_id"] == "fact-1"
+        assert fact_row["semantic_run_id"] is None
+        assert interpretation_row["interpretation_id"] == "itp-1"
+        assert interpretation_row["semantic_run_id"] is None
+        assert extraction_row["extraction_id"] == "ext-1"
+        assert extraction_row["transcript"] == "原有转录"
+        assert [row["name"] for row in run_tables] == ["semantic_run_inputs", "semantic_runs"]
     finally:
         reopened.close()
 
