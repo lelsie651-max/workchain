@@ -44,21 +44,80 @@
             </a>
         </div>
         {% endif %}
-        {% if evidence.is_image and evidence.has_extracted_text %}
-        <div class="mb-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-            <p class="text-sm text-slate-300">识别到的文字</p>
-            <p class="mt-2 text-xs leading-6 text-slate-500">文字由图片自动识别,可能存在误差。原始图片已完整保存,识别结果不影响完整性校验。</p>
-        </div>
-        {% endif %}
+        {% if not evidence.is_image %}
         <pre class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.display_text }}</pre>
+        {% endif %}
     </div>
 
     <div class="mt-6 grid gap-4 md:grid-cols-2">
         <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
             <h3 class="text-lg font-semibold text-white">解析结果</h3>
             <p class="mt-3 text-sm text-slate-400">状态：{{ parse_status }}</p>
-            {% if parse_status == "unsupported" %}
+            {% if parse_status == "ocr_running" %}
+            <p class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在读取图片中的文字…</p>
+            {% elif parse_status == "llm_running" or parse_status == "pending" %}
+            <p class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在理解这段对话…</p>
+            {% elif parse_status == "done" %}
+            {% if evidence.plain_summary %}
+            <p class="mt-3 text-sm leading-7 text-slate-200">{{ evidence.plain_summary }}</p>
+            {% endif %}
+            <div class="mt-3 space-y-2 text-sm text-slate-400">
+                {% if evidence.deliverable %}
+                <p>交付物：{{ evidence.deliverable }}</p>
+                {% endif %}
+                {% if evidence.due_text %}
+                <p>时限：{{ evidence.due_text }}</p>
+                {% endif %}
+                {% for caveat in evidence.caveats %}
+                <p class="text-yellow-200">{{ caveat }}</p>
+                {% endfor %}
+            </div>
+            {% elif parse_status == "unsupported" %}
             <p class="mt-3 text-sm leading-7 text-slate-300">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</p>
+            {% elif parse_status == "failed" %}
+            <p class="mt-3 text-sm text-slate-400">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</p>
+            {% endif %}
+            {% if evidence.is_image and evidence.has_extracted_text %}
+            <details class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-ocr-details>
+                <summary class="cursor-pointer list-none text-sm text-slate-200">
+                    看看系统读到了什么
+                    {% if is_ocr_corrected %}
+                    <span class="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-xs text-amber-200">已人工校正</span>
+                    {% endif %}
+                </summary>
+                <div class="mt-3 space-y-3">
+                    <p class="text-xs leading-6 text-slate-500">文字由图片自动识别,可能有误。原始图片已完整保存,识别结果不影响完整性校验。</p>
+                    <div id="ocr-text-readonly" class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.extracted_text }}</div>
+                    {% if not evidence.evidence_id.startswith("ev_demo_") %}
+                    <button
+                        id="edit-ocr-text"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        修正文字
+                    </button>
+                    <div id="ocr-text-editor" class="hidden space-y-3">
+                        <textarea id="ocr-text-input" rows="8" class="w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-400/40">{{ evidence.extracted_text }}</textarea>
+                        <div class="flex flex-wrap gap-3">
+                            <button
+                                id="save-ocr-text"
+                                type="button"
+                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                            >
+                                保存
+                            </button>
+                            <button
+                                id="cancel-ocr-text"
+                                type="button"
+                                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            >
+                                取消
+                            </button>
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+            </details>
             {% endif %}
             {% if evidence.evidence_id.startswith("ev_demo_") %}
             <p class="mt-3 text-sm leading-7 text-slate-300">演示记录不可修改。</p>
@@ -133,9 +192,6 @@
                     保存修改
                 </button>
             </form>
-            {% if parse_status == "failed" %}
-            <p class="mt-4 text-sm text-slate-400">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</p>
-            {% endif %}
         </div>
 
         <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
@@ -148,7 +204,7 @@
                 <p>保存时间：{{ evidence.captured_at_text }}</p>
                 <p>已填槽位：{{ evidence.slots_filled }}</p>
             </div>
-            <p class="mt-4 text-xs leading-6 text-slate-500">修改解析结果不会影响完整性校验 —— 校验保护的是原始记录本身,不包括对它的解读。</p>
+            <p class="mt-4 text-xs leading-6 text-slate-500">修改解析结果或校正识别文字,都不会影响完整性校验 —— 校验保护的是原始图片本身,不包括对它的解读。</p>
         </div>
     </div>
 </section>
@@ -165,6 +221,12 @@
         const caveatList = document.getElementById("caveat-list");
         const evidenceId = form.dataset.evidenceId;
         const isDemo = evidenceId.startsWith("ev_demo_");
+        const editOcrTextButton = document.getElementById("edit-ocr-text");
+        const saveOcrTextButton = document.getElementById("save-ocr-text");
+        const cancelOcrTextButton = document.getElementById("cancel-ocr-text");
+        const ocrTextReadonly = document.getElementById("ocr-text-readonly");
+        const ocrTextEditor = document.getElementById("ocr-text-editor");
+        const ocrTextInput = document.getElementById("ocr-text-input");
 
         const showFlash = (text, tone) => {
             flash.textContent = text;
@@ -175,6 +237,15 @@
                 flash.classList.add("border-red-400/30", "bg-red-400/10", "text-red-100");
             }
             flash.classList.remove("hidden");
+        };
+
+        const setOcrEditorOpen = (open) => {
+            if (!ocrTextEditor || !ocrTextReadonly || !editOcrTextButton) {
+                return;
+            }
+            ocrTextEditor.classList.toggle("hidden", !open);
+            ocrTextReadonly.classList.toggle("hidden", open);
+            editOcrTextButton.classList.toggle("hidden", open);
         };
 
         const caveatRow = (value = "") => {
@@ -252,7 +323,47 @@
             }
         });
 
+        editOcrTextButton?.addEventListener("click", () => {
+            setOcrEditorOpen(true);
+            ocrTextInput?.focus();
+        });
+
+        cancelOcrTextButton?.addEventListener("click", () => {
+            if (ocrTextInput && ocrTextReadonly) {
+                ocrTextInput.value = ocrTextReadonly.textContent || "";
+            }
+            setOcrEditorOpen(false);
+        });
+
+        saveOcrTextButton?.addEventListener("click", async () => {
+            if (!ocrTextInput) {
+                return;
+            }
+            saveOcrTextButton.disabled = true;
+            saveOcrTextButton.classList.add("opacity-60", "cursor-not-allowed");
+            try {
+                const response = await fetch(`/api/evidence/${evidenceId}/ocr_text`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ text: ocrTextInput.value }),
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    showFlash(data.detail || "保存失败", "error");
+                    return;
+                }
+                showFlash("已保存,正在重新理解这段对话…", "success");
+                window.location.reload();
+            } catch (error) {
+                showFlash("保存失败,请稍后再试", "error");
+            } finally {
+                saveOcrTextButton.disabled = false;
+                saveOcrTextButton.classList.remove("opacity-60", "cursor-not-allowed");
+            }
+        });
+
         syncDirty();
+        setOcrEditorOpen(false);
     })();
 </script>
 {% endblock %}

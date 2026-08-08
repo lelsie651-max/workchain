@@ -292,6 +292,7 @@
                     class="rounded-xl border border-slate-800 bg-slate-950/70 p-4"
                     data-evidence-id="{{ item.evidence_id }}"
                     data-parse-status="{{ item.parse_status }}"
+                    data-media-type="{{ item.media_type }}"
                 >
                     <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
                         <span>{{ item.occurred_at_text }}</span>
@@ -318,19 +319,6 @@
                             >
                         </button>
                         <p class="mt-2 text-xs text-slate-500">{{ item.filename or "未命名图片" }}</p>
-                        {% if item.has_extracted_text %}
-                        <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-                            <p class="text-xs text-slate-400">识别到的文字</p>
-                            <p
-                                data-raw-preview
-                                class="mt-2 {% if item.is_long_text %}{% else %}hidden{% endif %}"
-                            >{{ item.raw_text_preview }}</p>
-                            <div
-                                data-raw-full
-                                class="mt-2 {% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
-                            >{{ item.display_text }}</div>
-                        </div>
-                        {% endif %}
                         {% elif item.is_file %}
                         <div class="space-y-3">
                             <a
@@ -363,7 +351,7 @@
                         {% endif %}
                     </div>
                     <div class="mt-3 flex flex-wrap items-center gap-3">
-                        {% if item.is_long_text and (not item.is_image or item.has_extracted_text) %}
+                        {% if item.is_long_text and not item.is_image %}
                         <button
                             type="button"
                             data-toggle-fulltext
@@ -380,8 +368,10 @@
                         </a>
                     </div>
                     <div class="mt-3 text-sm text-slate-300" data-parse-body>
-                        {% if item.parse_status == "pending" %}
-                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>{% if item.is_image %}正在识别图片中的文字…{% else %}解析中…{% endif %}</p>
+                        {% if item.parse_status == "ocr_running" %}
+                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在读取图片中的文字…</p>
+                        {% elif item.parse_status == "llm_running" or item.parse_status == "pending" %}
+                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在理解这段对话…</p>
                         {% elif item.parse_status == "done" %}
                         {% if item.plain_summary %}
                         <p class="text-slate-200">{{ item.plain_summary }}</p>
@@ -410,6 +400,15 @@
                         </p>
                         {% endif %}
                     </div>
+                    {% if item.is_image and item.has_extracted_text %}
+                    <details class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-3" data-ocr-details>
+                        <summary class="cursor-pointer list-none text-sm text-slate-200">看看系统读到了什么</summary>
+                        <div class="mt-3 space-y-3">
+                            <p class="text-xs leading-6 text-slate-500">文字由图片自动识别,可能有误。原始图片已完整保存,识别结果不影响完整性校验。</p>
+                            <div class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-6 text-slate-200">{{ item.display_text }}</div>
+                        </div>
+                    </details>
+                    {% endif %}
                 </article>
                 {% endfor %}
             </div>
@@ -520,7 +519,9 @@
         const newGlossaryMeaning = document.getElementById("new-glossary-meaning");
         const confirmAddGlossary = document.getElementById("confirm-add-glossary");
         const cancelAddGlossary = document.getElementById("cancel-add-glossary");
-        const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status='pending']")];
+        const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status]")].filter((card) => (
+            ["pending", "ocr_running", "llm_running"].includes(card.dataset.parseStatus)
+        ));
         const toggleButtons = [...document.querySelectorAll("[data-toggle-fulltext]")];
         const lightboxButtons = [...document.querySelectorAll("[data-open-lightbox]")];
         let selfNames = {{ settings.self_names|tojson }};
@@ -735,6 +736,25 @@
             if (!target) {
                 return;
             }
+            const mediaType = payload.media_type || card.dataset.mediaType || "text";
+            if (payload.parse_status === "ocr_running") {
+                target.innerHTML = `
+                    <p class="inline-flex items-center gap-2 text-cyan-200">
+                        <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>
+                        正在读取图片中的文字…
+                    </p>
+                `;
+                return;
+            }
+            if (payload.parse_status === "llm_running" || payload.parse_status === "pending") {
+                target.innerHTML = `
+                    <p class="inline-flex items-center gap-2 text-cyan-200">
+                        <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>
+                        ${mediaType === "image" ? "正在理解这段对话…" : "正在理解这段对话…"}
+                    </p>
+                `;
+                return;
+            }
             if (payload.parse_status === "done") {
                 const caveats = (payload.caveats || []).map((item) => `<p class="text-yellow-200">${escapeHtml(item)}</p>`).join("");
                 target.innerHTML = `
@@ -764,12 +784,13 @@
                 try {
                     const response = await fetch(`/api/evidence/${evidenceId}/status`);
                     const payload = await response.json();
-                    if (payload.parse_status === "done" || payload.parse_status === "failed" || attempts >= 15) {
+                    card.dataset.parseStatus = payload.parse_status || card.dataset.parseStatus;
+                    if (payload.parse_status === "done" || payload.parse_status === "failed" || payload.parse_status === "unsupported" || attempts >= 40) {
                         window.clearInterval(timer);
                         renderParseBody(
                             card,
-                            attempts >= 15 && payload.parse_status === "pending"
-                                ? { parse_status: "failed", detail: "解析暂不可用,记录已完整保存" }
+                            attempts >= 40 && ["pending", "ocr_running", "llm_running"].includes(payload.parse_status)
+                                ? { parse_status: "failed", detail: "处理时间较长,请稍后刷新查看" }
                                 : payload,
                         );
                     }

@@ -52,7 +52,13 @@ MAX_TEXT_LENGTH = 20_000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_LLM_TEXT_LENGTH = 8_000
+MAX_OCR_TEXT_LENGTH = 50_000
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PARSE_STATUS_OCR_RUNNING = "ocr_running"
+PARSE_STATUS_LLM_RUNNING = "llm_running"
+PARSE_STATUS_DONE = "done"
+PARSE_STATUS_FAILED = "failed"
+PARSE_STATUS_UNSUPPORTED = "unsupported"
 PACKAGE_README_TEXT = (
     "这个文件夹里的记录不能被偷偷修改。\n"
     "如果你想自己确认,在装有 Python 的电脑上,\n"
@@ -141,6 +147,16 @@ def _extract_file_text(raw_text: str | None) -> str | None:
         return None
     extracted = parts[1].strip()
     return extracted or None
+
+
+def _build_attachment_raw_text(media_type: str, filename: str | None, extracted_text: str | None = None) -> str:
+    label = _build_attachment_label(media_type, filename)
+    if extracted_text is None:
+        return label
+    extracted = extracted_text.strip()
+    if not extracted:
+        return label
+    return f"{label}\n\n{extracted}"
 
 
 def _is_upload_value(value: Any) -> bool:
@@ -255,6 +271,10 @@ def _extract_note_key(evidence_id: str) -> str:
     return f"extract_note:{evidence_id}"
 
 
+def _ocr_corrected_key(evidence_id: str) -> str:
+    return f"ocr_corrected:{evidence_id}"
+
+
 def _set_extract_note(conn: sqlite3.Connection, evidence_id: str, note: str) -> None:
     _set_meta_value(conn, _extract_note_key(evidence_id), note)
     conn.commit()
@@ -262,6 +282,20 @@ def _set_extract_note(conn: sqlite3.Connection, evidence_id: str, note: str) -> 
 
 def _get_extract_note(conn: sqlite3.Connection, evidence_id: str) -> str | None:
     return _get_meta_value(conn, _extract_note_key(evidence_id))
+
+
+def _clear_extract_note(conn: sqlite3.Connection, evidence_id: str) -> None:
+    conn.execute("DELETE FROM meta WHERE key = ?", (_extract_note_key(evidence_id),))
+    conn.commit()
+
+
+def _set_ocr_corrected(conn: sqlite3.Connection, evidence_id: str, corrected: bool) -> None:
+    _set_meta_value(conn, _ocr_corrected_key(evidence_id), "1" if corrected else "0")
+    conn.commit()
+
+
+def _is_ocr_corrected(conn: sqlite3.Connection, evidence_id: str) -> bool:
+    return _get_meta_value(conn, _ocr_corrected_key(evidence_id)) == "1"
 
 
 def _llm_input_text(text: str) -> str:
@@ -429,7 +463,7 @@ def _set_parse_detail(conn: sqlite3.Connection, evidence_id: str, detail: str) -
 
 
 def _get_parse_status(conn: sqlite3.Connection, evidence_id: str) -> str:
-    return _get_meta_value(conn, _parse_status_key(evidence_id)) or "failed"
+    return _get_meta_value(conn, _parse_status_key(evidence_id)) or PARSE_STATUS_FAILED
 
 
 def _get_parse_detail(conn: sqlite3.Connection, evidence_id: str) -> str | None:
@@ -473,7 +507,7 @@ def _get_parse_status_map(conn: sqlite3.Connection, evidence_ids: Iterable[str])
     ).fetchall()
     result = {row["key"].split(":", 1)[1]: row["value"] for row in rows}
     for evidence_id in ids:
-        result.setdefault(evidence_id, "failed")
+        result.setdefault(evidence_id, PARSE_STATUS_FAILED)
     return result
 
 
@@ -611,7 +645,7 @@ def _run_parse_pipeline(
     if not api_key:
         conn = init_db(sandbox_db_path)
         try:
-            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
@@ -621,7 +655,7 @@ def _run_parse_pipeline(
     if not allowed:
         conn = init_db(sandbox_db_path)
         try:
-            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, reason or "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
@@ -639,7 +673,7 @@ def _run_parse_pipeline(
     if parsed is None:
         conn = init_db(sandbox_db_path)
         try:
-            _set_parse_status(conn, evidence_id, "failed")
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
         finally:
             conn.close()
@@ -668,15 +702,52 @@ def _run_parse_pipeline(
             "UPDATE evidence SET kind = ? WHERE evidence_id = ?",
             (_final_kind(parsed, requester_id, owner_id, slot_due), evidence_id),
         )
-        _set_parse_status(conn, evidence_id, "done")
+        _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
         _set_parse_detail(conn, evidence_id, "")
         conn.commit()
     except Exception:
         conn.rollback()
-        _set_parse_status(conn, evidence_id, "failed")
+        _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
         _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
     finally:
         conn.close()
+
+
+def _run_image_pipeline(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    evidence_id: str,
+    image_bytes: bytes,
+    filename: str | None,
+    counterpart: str | None,
+) -> None:
+    extracted_text, extract_status = extract_text(image_bytes, "image", filename or "")
+    conn = init_db(sandbox_db_path)
+    try:
+        if extracted_text is None:
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
+            _set_parse_detail(conn, evidence_id, _saved_original_detail(extract_status))
+            _set_extract_note(conn, evidence_id, extract_status)
+            return
+
+        conn.execute(
+            "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
+            (_build_attachment_raw_text("image", filename, extracted_text), evidence_id),
+        )
+        _clear_extract_note(conn, evidence_id)
+        _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+        _set_parse_detail(conn, evidence_id, "")
+        conn.commit()
+    finally:
+        conn.close()
+
+    _run_parse_pipeline(
+        sandbox_db_path,
+        global_meta_db_path,
+        evidence_id,
+        extracted_text,
+        counterpart,
+    )
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -1222,6 +1293,7 @@ def create_app() -> FastAPI:
                 "detail": parse_detail,
                 "is_verified": _is_verified(conn, evidence_id),
                 "media_type": row["media_type"],
+                "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
             }
         finally:
             conn.close()
@@ -1299,6 +1371,65 @@ def create_app() -> FastAPI:
             return response
         finally:
             conn.close()
+
+    @app.patch("/api/evidence/{evidence_id}/ocr_text")
+    async def patch_evidence_ocr_text(
+        evidence_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        corrected_text = str(payload.get("text", "")).strip()
+        if len(corrected_text) > MAX_OCR_TEXT_LENGTH:
+            raise HTTPException(status_code=400, detail="识别文字过长,请控制在 50000 字以内")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT evidence_id, raw_text, media_type, content_hash, chain_hash
+                FROM evidence
+                WHERE evidence_id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if evidence_id.startswith("ev_demo_"):
+                raise HTTPException(status_code=403, detail="演示记录不可修改")
+            if row["media_type"] != "image":
+                raise HTTPException(status_code=400, detail="只有图片记录支持校正识别文字")
+
+            filename = _extract_filename(row["raw_text"])
+            conn.execute(
+                "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
+                (_build_attachment_raw_text("image", filename, corrected_text), evidence_id),
+            )
+            _clear_extract_note(conn, evidence_id)
+            _set_ocr_corrected(conn, evidence_id, True)
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+            _set_parse_detail(conn, evidence_id, "")
+            conn.commit()
+        finally:
+            conn.close()
+
+        background_tasks.add_task(
+            _run_parse_pipeline,
+            sandbox.db_path,
+            request.app.state.global_meta_db_path,
+            evidence_id,
+            corrected_text,
+            None,
+        )
+        response = JSONResponse(
+            {
+                "evidence_id": evidence_id,
+                "parse_status": PARSE_STATUS_LLM_RUNNING,
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     @app.get("/api/settings")
     def settings_get(sandbox: SandboxContext = Depends(get_sandbox)) -> dict[str, Any]:
@@ -1406,6 +1537,7 @@ def create_app() -> FastAPI:
             extract_note = _get_extract_note(status_conn, evidence_id)
             parse_detail = extract_note or _get_parse_detail(status_conn, evidence_id)
             is_verified = _is_verified(status_conn, evidence_id)
+            is_ocr_corrected = _is_ocr_corrected(status_conn, evidence_id)
         finally:
             status_conn.close()
 
@@ -1418,6 +1550,7 @@ def create_app() -> FastAPI:
                 "parse_status": parse_status,
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
+                "is_ocr_corrected": is_ocr_corrected,
                 "current_search_q": "",
             },
         )
@@ -1572,47 +1705,41 @@ def create_app() -> FastAPI:
             media_type = "text"
             append_payload: bytes | str = text
             raw_text_override = None
-            parse_status = "pending"
+            parse_status = PARSE_STATUS_LLM_RUNNING
             parse_detail = ""
             extracted_for_parse = text
             extract_note = None
+            image_pipeline_args = None
             if file_bytes is not None and upload_media_type is not None:
                 _ensure_upload_budget(conn, sandbox.blobs_root, file_bytes)
                 media_type = upload_media_type
                 append_payload = file_bytes
                 filename = upload.filename if upload is not None else None
-                raw_text_override = _build_attachment_label(media_type, filename)
+                raw_text_override = _build_attachment_raw_text(media_type, filename)
                 if media_type == "image":
                     if not ocr.is_configured():
-                        parse_status = "unsupported"
+                        parse_status = PARSE_STATUS_UNSUPPORTED
                         extract_note = "图片识别未配置(DASHSCOPE_API_KEY 未设置)"
                         parse_detail = _saved_original_detail(extract_note)
                     else:
                         allowed, reason = _consume_ocr_budget(sandbox.db_path, request.app.state.global_meta_db_path)
                         if allowed:
-                            extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
-                            if extracted_text is not None:
-                                raw_text_override = f"{_build_attachment_label(media_type, filename)}\n\n{extracted_text}"
-                                extracted_for_parse = extracted_text
-                                parse_status = "pending"
-                                parse_detail = ""
-                            else:
-                                parse_status = "unsupported"
-                                extract_note = extract_status
-                                parse_detail = _saved_original_detail(extract_status)
+                            parse_status = PARSE_STATUS_OCR_RUNNING
+                            parse_detail = ""
+                            image_pipeline_args = (file_bytes, filename, counterpart)
                         else:
-                            parse_status = "unsupported"
+                            parse_status = PARSE_STATUS_UNSUPPORTED
                             extract_note = reason
                             parse_detail = _saved_original_detail(reason or "图片识别暂不可用")
                 else:
                     extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
                     if extracted_text is not None:
-                        raw_text_override = f"{_build_attachment_label(media_type, filename)}\n\n{extracted_text}"
+                        raw_text_override = _build_attachment_raw_text(media_type, filename, extracted_text)
                         extracted_for_parse = extracted_text
-                        parse_status = "pending"
+                        parse_status = PARSE_STATUS_LLM_RUNNING
                         parse_detail = ""
                     else:
-                        parse_status = "unsupported"
+                        parse_status = PARSE_STATUS_UNSUPPORTED
                         extract_note = extract_status
                         parse_detail = _saved_original_detail(extract_status)
 
@@ -1640,7 +1767,7 @@ def create_app() -> FastAPI:
         finally:
             conn.close()
 
-        if parse_status == "pending":
+        if parse_status == PARSE_STATUS_LLM_RUNNING:
             background_tasks.add_task(
                 _run_parse_pipeline,
                 sandbox.db_path,
@@ -1648,6 +1775,16 @@ def create_app() -> FastAPI:
                 row["evidence_id"],
                 extracted_for_parse,
                 counterpart,
+            )
+        elif parse_status == PARSE_STATUS_OCR_RUNNING and image_pipeline_args is not None:
+            background_tasks.add_task(
+                _run_image_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                row["evidence_id"],
+                image_pipeline_args[0],
+                image_pipeline_args[1],
+                image_pipeline_args[2],
             )
 
         response = JSONResponse(

@@ -24,6 +24,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen import canvas
 
+from app import main as main_module
 from app.main import create_app
 from evidence_core.chain import compute_content_hash
 from evidence_core.db import init_db
@@ -578,7 +579,7 @@ def test_post_evidence_appends_reference_record(tmp_path, monkeypatch):
     assert data["seq"] == 19
     assert data["evidence_id"].startswith("ev_")
     assert data["occurred_at"] is not None
-    assert data["parse_status"] == "pending"
+    assert data["parse_status"] == "llm_running"
     assert _sandbox_db_path(client, sandbox_root).exists()
 
 
@@ -996,6 +997,42 @@ def test_evidence_detail_uses_generic_copy_when_no_extract_note_exists(tmp_path,
     assert "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" in detail_response.text
 
 
+def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
+        "caveats": ["先核对金额"],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="ordered.png")
+                evidence_id = create_response.json()["evidence_id"]
+                index_response = client.get("/")
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert index_response.status_code == 200
+    assert detail_response.status_code == 200
+    assert index_response.text.index("图片里写着周五前交付渠道复盘数据。") < index_response.text.index("看看系统读到了什么")
+    assert detail_response.text.index("图片里写着周五前交付渠道复盘数据。") < detail_response.text.index("看看系统读到了什么")
+    index_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", index_response.text)
+    detail_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", detail_response.text)
+    assert index_details is not None
+    assert detail_details is not None
+    assert "open" not in index_details.group(0)
+    assert "open" not in detail_details.group(0)
+
+
 def test_image_upload_without_ocr_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -1262,7 +1299,7 @@ def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchab
                 search_response = client.get("/search", params={"q": "审批通过"})
 
     assert response.status_code == 200
-    assert response.json()["parse_status"] == "pending"
+    assert response.json()["parse_status"] == "ocr_running"
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "done"
     mock_extract.assert_called_once()
@@ -1300,7 +1337,7 @@ def test_image_upload_ocr_timeout_still_succeeds_and_marks_unsupported(tmp_path,
                 status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
     assert response.status_code == 200
-    assert response.json()["parse_status"] == "unsupported"
+    assert response.json()["parse_status"] == "ocr_running"
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "unsupported"
     assert status_response.json()["detail"] == "图片识别超时"
@@ -1328,7 +1365,7 @@ def test_image_upload_with_short_ocr_text_marks_unsupported_and_skips_llm(tmp_pa
                 status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
     assert response.status_code == 200
-    assert response.json()["parse_status"] == "unsupported"
+    assert response.json()["parse_status"] == "ocr_running"
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "unsupported"
     assert status_response.json()["detail"] == "这张图里没有识别到文字,原件已完整保存"
@@ -1371,7 +1408,7 @@ def test_large_image_is_resized_for_ocr_but_original_blob_bytes_are_preserved(tm
             )
 
     assert response.status_code == 200
-    assert response.json()["parse_status"] == "pending"
+    assert response.json()["parse_status"] == "ocr_running"
     assert captured["prepared_size"] == (2000, 1500)
     assert captured["prepared_format"] == "JPEG"
 
@@ -1401,7 +1438,7 @@ def test_image_upload_ocr_limit_marks_21st_record_unsupported(tmp_path, monkeypa
             for idx in range(20):
                 response = _upload_png(client, filename=f"quota-{idx}.png")
                 assert response.status_code == 200
-                assert response.json()["parse_status"] == "pending"
+                assert response.json()["parse_status"] == "ocr_running"
 
             last_response = _upload_png(client, filename="quota-21.png")
             evidence_id = last_response.json()["evidence_id"]
@@ -1412,6 +1449,76 @@ def test_image_upload_ocr_limit_marks_21st_record_unsupported(tmp_path, monkeypa
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "unsupported"
     assert status_response.json()["detail"] == "今日图片识别次数已用完,原件已完整保存"
+
+
+def test_image_upload_status_sequence_includes_ocr_running_then_llm_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
+        "caveats": [],
+    }
+    seen_statuses: list[str] = []
+    original_set_parse_status = main_module._set_parse_status
+
+    def wrapped_set_parse_status(conn, evidence_id, status):
+        seen_statuses.append(status)
+        return original_set_parse_status(conn, evidence_id, status)
+
+    with patch("app.main._set_parse_status", side_effect=wrapped_set_parse_status):
+        with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
+            with patch("app.main.llm.extract_slots", return_value=parsed):
+                with client:
+                    response = _upload_png(client, filename="sequence.png")
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "ocr_running"
+    assert "ocr_running" in seen_statuses
+    assert "llm_running" in seen_statuses
+    assert seen_statuses.index("ocr_running") < seen_statuses.index("llm_running")
+
+
+def test_text_upload_status_sequence_does_not_pass_through_ocr_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_raw": None,
+        "due_date": None,
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+    seen_statuses: list[str] = []
+    original_set_parse_status = main_module._set_parse_status
+
+    def wrapped_set_parse_status(conn, evidence_id, status):
+        seen_statuses.append(status)
+        return original_set_parse_status(conn, evidence_id, status)
+
+    with patch("app.main._set_parse_status", side_effect=wrapped_set_parse_status):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                response = client.post(
+                    "/api/evidence",
+                    json={"text": "先留个底。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+
+    assert response.status_code == 200
+    assert response.json()["parse_status"] == "llm_running"
+    assert "llm_running" in seen_statuses
+    assert "ocr_running" not in seen_statuses
 
 
 def test_multipart_text_only_submission_returns_200(tmp_path, monkeypatch):
@@ -1604,6 +1711,187 @@ def test_patch_sets_verified_flag_and_pages_show_badge(tmp_path, monkeypatch):
 
     assert "已确认" in detail_response.text
     assert "已确认" in index_response.text
+
+
+def test_patch_ocr_text_updates_raw_text_without_changing_hashes_and_keeps_verify_chain_valid(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="correctable.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        before = conn.execute(
+            "SELECT raw_text, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+        with client:
+            patch_response = client.patch(
+                f"/api/evidence/{evidence_id}/ocr_text",
+                json={"text": "人工修正后的识别文字"},
+            )
+            status_response = client.get(f"/api/evidence/{evidence_id}/status")
+            detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert patch_response.status_code == 200
+    assert patch_response.json()["parse_status"] == "llm_running"
+    assert status_response.status_code == 200
+    assert status_response.json()["parse_status"] == "done"
+    mock_extract.assert_called_once()
+
+    conn = init_db(db_path)
+    try:
+        after = conn.execute(
+            "SELECT raw_text, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        assert after["raw_text"] == "[图片] correctable.png\n\n人工修正后的识别文字"
+        assert after["content_hash"] == before["content_hash"]
+        assert after["chain_hash"] == before["chain_hash"]
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+    assert "已人工校正" in detail_response.text
+
+
+def test_patch_ocr_text_triggers_reparse_without_consuming_ocr_quota(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": "张总",
+        "owner_name": "我",
+        "deliverable": "渠道复盘数据",
+        "due_raw": "周五前",
+        "due_date": "2026-08-08",
+        "direction": "i_owe",
+        "kind": "request",
+        "plain_summary": "图片里写着周五前交付渠道复盘数据。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="quota-stable.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    with patch("app.main.llm.extract_slots", return_value=parsed) as mock_extract:
+        with client:
+            response = client.patch(
+                f"/api/evidence/{evidence_id}/ocr_text",
+                json={"text": "人工修正后的识别文字"},
+            )
+
+    assert response.status_code == 200
+    mock_extract.assert_called_once()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        ocr_counter = conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'ocr_count:%'"
+        ).fetchone()
+        assert ocr_counter is not None
+        assert ocr_counter["value"] == "1"
+    finally:
+        conn.close()
+
+
+def test_patch_ocr_text_returns_404_for_other_sandbox(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_raw": None,
+        "due_date": None,
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client_a, client_b:
+                create_response = _upload_png(client_a, filename="cross-sandbox.png")
+                evidence_id = create_response.json()["evidence_id"]
+                response = client_b.patch(
+                    f"/api/evidence/{evidence_id}/ocr_text",
+                    json={"text": "不该成功"},
+                )
+
+    assert response.status_code == 404
+
+
+def test_patch_ocr_text_returns_403_for_demo_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": None,
+        "due_raw": None,
+        "due_date": None,
+        "direction": "none",
+        "kind": "reference",
+        "plain_summary": "只是留档。",
+        "caveats": [],
+    }
+
+    with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            with client:
+                create_response = _upload_png(client, filename="demo-like.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        conn.execute("UPDATE evidence SET evidence_id = ? WHERE evidence_id = ?", ("ev_demo_ocr_text", evidence_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.patch(
+            "/api/evidence/ev_demo_ocr_text/ocr_text",
+            json={"text": "不该成功"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "演示记录不可修改"
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):
