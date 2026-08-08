@@ -83,4 +83,4 @@ def test_extract_image_without_ocr_config_returns_configured_note(monkeypatch):
     text, note = extract_text(PNG_BYTES, "image", "demo.png")
 
     assert text is None
-    assert note == "图片识别未配置"
+    assert note == "图片识别未配置(DASHSCOPE_API_KEY 未设置)"

@@ -1187,6 +1187,10 @@ def create_app() -> FastAPI:
                 "detail": _safe_diag_detail(detail, api_key),
             }
 
+    @app.get("/api/diag/ocr")
+    def diag_ocr() -> dict[str, Any]:
+        return ocr.diagnose_ocr()
+
     @app.get("/api/evidence/{evidence_id}/status")
     def evidence_status(
         evidence_id: str,
@@ -1206,7 +1210,8 @@ def create_app() -> FastAPI:
             if row is None:
                 raise HTTPException(status_code=404, detail="evidence not found")
             parse_status = _get_parse_status(conn, evidence_id)
-            parse_detail = _get_parse_detail(conn, evidence_id) or _get_extract_note(conn, evidence_id)
+            extract_note = _get_extract_note(conn, evidence_id)
+            parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
             return {
                 "parse_status": parse_status,
                 "slots_filled": row["slots_filled"],
@@ -1398,7 +1403,8 @@ def create_app() -> FastAPI:
         status_conn = init_db(sandbox.db_path)
         try:
             parse_status = _get_parse_status(status_conn, evidence_id)
-            parse_detail = _get_parse_detail(status_conn, evidence_id) or _get_extract_note(status_conn, evidence_id)
+            extract_note = _get_extract_note(status_conn, evidence_id)
+            parse_detail = extract_note or _get_parse_detail(status_conn, evidence_id)
             is_verified = _is_verified(status_conn, evidence_id)
         finally:
             status_conn.close()
@@ -1579,7 +1585,7 @@ def create_app() -> FastAPI:
                 if media_type == "image":
                     if not ocr.is_configured():
                         parse_status = "unsupported"
-                        extract_note = "图片识别未配置"
+                        extract_note = "图片识别未配置(DASHSCOPE_API_KEY 未设置)"
                         parse_detail = _saved_original_detail(extract_note)
                     else:
                         allowed, reason = _consume_ocr_budget(sandbox.db_path, request.app.state.global_meta_db_path)

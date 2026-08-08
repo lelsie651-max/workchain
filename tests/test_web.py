@@ -194,6 +194,45 @@ def test_diag_llm_response_never_contains_api_key(tmp_path, monkeypatch):
     assert fake_key not in response.text
 
 
+def test_diag_ocr_without_api_key_returns_configured_false(tmp_path, monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/api/diag/ocr")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "configured": False,
+        "reachable": None,
+        "detail": "DASHSCOPE_API_KEY not set",
+    }
+
+
+def test_diag_ocr_with_connection_error_returns_reachable_false_and_never_leaks_key(tmp_path, monkeypatch):
+    fake_key = "dashscope-visible-secret"
+    monkeypatch.setenv("DASHSCOPE_API_KEY", fake_key)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = Mock(completions=Mock(create=Mock(side_effect=httpx.ConnectError(f"boom {fake_key}"))))
+
+    with patch("app.ocr.OpenAI", FakeOpenAI):
+        with client:
+            response = client.get("/api/diag/ocr")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["configured"] is True
+    assert payload["reachable"] is False
+    assert payload["status_code"] is None
+    assert payload["model"] == "vanchin/deepseek-ocr"
+    assert "无法连接图片识别服务:ConnectError" in payload["detail"]
+    assert fake_key not in response.text
+    assert fake_key not in payload["detail"]
+
+
 def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -903,6 +942,60 @@ def test_image_upload_without_ocr_config_sets_unsupported_and_does_not_call_llm(
         conn.close()
 
 
+def test_evidence_detail_prefers_extract_note_over_generic_unsupported_copy(tmp_path, monkeypatch):
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = _upload_png(client, filename="detail-note.png")
+        evidence_id = create_response.json()["evidence_id"]
+        detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert detail_response.status_code == 200
+    assert "图片识别未配置(DASHSCOPE_API_KEY 未设置)" in detail_response.text
+    assert "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" not in detail_response.text
+
+
+def test_evidence_detail_uses_generic_copy_when_no_extract_note_exists(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        create_response = client.post(
+            "/api/evidence",
+            json={"text": "只是留档。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"parse_status:{evidence_id}", "unsupported"),
+        )
+        conn.execute(
+            """
+            INSERT INTO meta(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (f"parse_detail:{evidence_id}", ""),
+        )
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"extract_note:{evidence_id}",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert detail_response.status_code == 200
+    assert "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" in detail_response.text
+
+
 def test_image_upload_without_ocr_does_not_consume_daily_parse_quota(tmp_path, monkeypatch):
     monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -1210,7 +1303,7 @@ def test_image_upload_ocr_timeout_still_succeeds_and_marks_unsupported(tmp_path,
     assert response.json()["parse_status"] == "unsupported"
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "unsupported"
-    assert "TimeoutException" in status_response.json()["detail"]
+    assert status_response.json()["detail"] == "图片识别超时"
     mock_extract.assert_not_called()
 
     db_path = _sandbox_db_path(client, sandbox_root)
