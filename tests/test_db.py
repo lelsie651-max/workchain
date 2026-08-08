@@ -118,6 +118,19 @@ def _make_v2_db(path):
         conn.close()
 
 
+def _make_v3_db(path):
+    conn = db_module._connect(path)
+    try:
+        db_module._ensure_meta_table(conn)
+        db_module._create_v1_schema(conn)
+        db_module._create_v2_schema(conn)
+        db_module._create_v3_schema(conn)
+        db_module._set_schema_version(conn, 3)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @pytest.fixture
 def db_file(tmp_path):
     return tmp_path / "workchain.db"
@@ -132,7 +145,8 @@ def test_init_db_creates_all_tables(db_file):
         WHERE type = 'table' AND name IN (
             'actors', 'threads', 'evidence', 'checkpoints', 'meta',
             'submissions', 'submission_evidence', 'events', 'facts',
-            'fact_evidence', 'fact_actors', 'interpretations'
+            'fact_evidence', 'fact_actors', 'interpretations',
+            'evidence_extractions'
         )
         ORDER BY name
         """
@@ -143,6 +157,7 @@ def test_init_db_creates_all_tables(db_file):
         "checkpoints",
         "events",
         "evidence",
+        "evidence_extractions",
         "fact_actors",
         "fact_evidence",
         "facts",
@@ -154,7 +169,7 @@ def test_init_db_creates_all_tables(db_file):
     ]
     columns = conn.execute("PRAGMA table_info(facts)").fetchall()
 
-    assert get_schema_version(conn) == 3
+    assert get_schema_version(conn) == 4
     assert {column["name"] for column in columns} >= {
         "due_anchor_at",
         "event_assignment_confidence",
@@ -169,10 +184,10 @@ def test_init_db_is_idempotent_and_keeps_schema_version(db_file):
 
     conn2 = init_db(db_file)
 
-    assert get_schema_version(conn2) == 3
+    assert get_schema_version(conn2) == 4
 
 
-def test_v1_database_is_migrated_to_v3_without_losing_existing_rows(db_file):
+def test_v1_database_is_migrated_to_v4_without_losing_existing_rows(db_file):
     _make_v1_db(db_file)
     reopened = None
     try:
@@ -199,33 +214,44 @@ def test_v1_database_is_migrated_to_v3_without_losing_existing_rows(db_file):
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'facts'"
         ).fetchone()
 
-        assert get_schema_version(reopened) == 3
+        extraction_table = reopened.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_extractions'"
+        ).fetchone()
+
+        assert get_schema_version(reopened) == 4
         assert actor["actor_id"] == "act-1"
         assert thread["thread_id"] == "thr-1"
         assert evidence["evidence_id"] == "ev-1"
         assert meta_row["value"] == "kept"
         assert facts_table["name"] == "facts"
+        assert extraction_table["name"] == "evidence_extractions"
     finally:
         if reopened is not None:
             reopened.close()
 
 
-def test_v1_to_v3_migration_is_idempotent(db_file):
+def test_v1_to_v4_migration_is_idempotent(db_file):
     _make_v1_db(db_file)
 
     first = init_db(db_file)
     first.close()
     second = init_db(db_file)
     try:
-        assert get_schema_version(second) == 3
+        assert get_schema_version(second) == 4
         tables = second.execute(
             """
             SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name IN ('submissions', 'events', 'facts', 'interpretations')
+            WHERE type = 'table' AND name IN ('submissions', 'events', 'facts', 'interpretations', 'evidence_extractions')
             ORDER BY name
             """
         ).fetchall()
-        assert [row["name"] for row in tables] == ["events", "facts", "interpretations", "submissions"]
+        assert [row["name"] for row in tables] == [
+            "events",
+            "evidence_extractions",
+            "facts",
+            "interpretations",
+            "submissions",
+        ]
     finally:
         second.close()
 
@@ -316,7 +342,7 @@ def test_foreign_keys_are_enabled_and_missing_thread_is_rejected(db_file):
 def test_init_db_supports_memory_database():
     conn = init_db(":memory:")
 
-    assert get_schema_version(conn) == 3
+    assert get_schema_version(conn) == 4
     assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'actors'").fetchone() is not None
 
 
@@ -592,7 +618,7 @@ def test_interpretations_require_parent_and_validate_constraints(db_file):
         )
 
 
-def test_v2_database_with_existing_events_and_facts_migrates_to_v3_without_data_loss(db_file):
+def test_v2_database_with_existing_events_and_facts_migrates_to_v4_without_data_loss(db_file):
     _make_v2_db(db_file)
 
     conn = db_module._connect(db_file)
@@ -643,7 +669,7 @@ def test_v2_database_with_existing_events_and_facts_migrates_to_v3_without_data_
             ("fact-1",),
         ).fetchone()
 
-        assert get_schema_version(reopened) == 3
+        assert get_schema_version(reopened) == 4
         assert row["event_id"] == "evt-1"
         assert row["fact_type"] == "deadline_change"
         assert row["content"] == "原计划下周五交付"
@@ -717,6 +743,50 @@ def test_facts_v3_defaults_and_checks_are_enforced(db_file):
             """,
             ("fact-bad-review", None, "statement", "x", 0.5, "approved", "unassigned", 1, 1),
         )
+
+
+def test_v3_database_migrates_to_v4_without_losing_existing_rows(db_file):
+    _make_v3_db(db_file)
+    conn = db_module._connect(db_file)
+    try:
+        _insert_thread(conn)
+        _insert_evidence(conn, evidence_id="ev-1", seq=1)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            ("custom:v3-note", "still-here"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = init_db(db_file)
+    try:
+        extraction_columns = reopened.execute("PRAGMA table_info(evidence_extractions)").fetchall()
+        evidence = reopened.execute(
+            "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
+            ("ev-1",),
+        ).fetchone()
+        meta_row = reopened.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            ("custom:v3-note",),
+        ).fetchone()
+
+        assert get_schema_version(reopened) == 4
+        assert evidence["evidence_id"] == "ev-1"
+        assert meta_row["value"] == "still-here"
+        assert {column["name"] for column in extraction_columns} >= {
+            "extraction_id",
+            "evidence_id",
+            "origin",
+            "provider",
+            "model",
+            "transcript",
+            "observations",
+            "created_at",
+            "supersedes_extraction_id",
+        }
+    finally:
+        reopened.close()
 
 
 def test_fact_confidence_and_event_assignment_confidence_are_independent(db_file):

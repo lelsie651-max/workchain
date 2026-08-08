@@ -1879,6 +1879,7 @@ def test_patch_ocr_text_returns_403_for_demo_record(tmp_path, monkeypatch):
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
     try:
+        conn.execute("DELETE FROM evidence_extractions WHERE evidence_id = ?", (evidence_id,))
         conn.execute("UPDATE evidence SET evidence_id = ? WHERE evidence_id = ?", ("ev_demo_ocr_text", evidence_id))
         conn.commit()
     finally:
@@ -1892,6 +1893,138 @@ def test_patch_ocr_text_returns_403_for_demo_record(tmp_path, monkeypatch):
 
     assert response.status_code == 403
     assert response.json()["detail"] == "演示记录不可修改"
+
+
+def test_image_ocr_success_persists_machine_extraction_history(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with client:
+        with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
+            with patch("app.main.llm.extract_slots", return_value=parsed):
+                response = _upload_png(client, filename="tracked-ocr.png")
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        evidence_id = response.json()["evidence_id"]
+        row = conn.execute(
+            """
+            SELECT origin, provider, model, transcript, observations, supersedes_extraction_id
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+
+        assert row["origin"] == "machine"
+        assert row["provider"] == "dashscope"
+        assert row["model"] == "vanchin/deepseek-ocr"
+        assert row["transcript"] == "审批通过,周五前交付渠道复盘数据"
+        assert json.loads(row["observations"]) == []
+        assert row["supersedes_extraction_id"] is None
+    finally:
+        conn.close()
+
+
+def test_pdf_upload_persists_machine_extraction_history(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        with patch("app.main.llm.extract_slots", return_value=None):
+            response = client.post(
+                "/api/evidence",
+                data={"text": "", "source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("tracked.pdf", _build_pdf_bytes("渠道复盘数据"), "application/pdf")},
+            )
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        evidence_id = response.json()["evidence_id"]
+        row = conn.execute(
+            """
+            SELECT origin, provider, model, transcript, observations
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            """,
+            (evidence_id,),
+        ).fetchone()
+
+        assert row["origin"] == "machine"
+        assert row["provider"] == "builtin"
+        assert row["model"] is None
+        assert "渠道复盘数据" in row["transcript"]
+        assert json.loads(row["observations"]) == []
+    finally:
+        conn.close()
+
+
+def test_patch_ocr_text_persists_user_extraction_superseding_machine_history(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = {
+        "requester_name": None,
+        "owner_name": None,
+        "deliverable": "渠道复盘数据",
+        "due_date": "2026-08-08",
+        "due_raw": "周五前",
+        "direction": "none",
+        "plain_summary": "审批通过,周五前交付渠道复盘数据",
+        "caveats": [],
+    }
+
+    with client:
+        with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
+            with patch("app.main.llm.extract_slots", return_value=parsed):
+                create_response = _upload_png(client, filename="tracked-correction.png")
+
+        evidence_id = create_response.json()["evidence_id"]
+        with patch("app.main.llm.extract_slots", return_value=parsed):
+            patch_response = client.patch(
+                f"/api/evidence/{evidence_id}/ocr_text",
+                json={"text": "人工修正后的识别文字"},
+            )
+
+    assert patch_response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT extraction_id, origin, provider, transcript, supersedes_extraction_id
+            FROM evidence_extractions
+            WHERE evidence_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (evidence_id,),
+        ).fetchall()
+
+        assert len(rows) == 2
+        assert rows[0]["origin"] == "machine"
+        assert rows[0]["provider"] == "dashscope"
+        assert rows[0]["transcript"] == "原始识别文字"
+        assert rows[1]["origin"] == "user"
+        assert rows[1]["provider"] == "manual"
+        assert rows[1]["transcript"] == "人工修正后的识别文字"
+        assert rows[1]["supersedes_extraction_id"] == rows[0]["extraction_id"]
+    finally:
+        conn.close()
 
 
 def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatch):

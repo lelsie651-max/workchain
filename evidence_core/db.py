@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -271,6 +271,32 @@ def _create_v3_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _create_v4_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_extractions (
+            extraction_id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL,
+            origin TEXT NOT NULL CHECK (origin IN ('machine', 'user')),
+            provider TEXT NOT NULL,
+            model TEXT,
+            transcript TEXT,
+            observations TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            supersedes_extraction_id TEXT,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT,
+            FOREIGN KEY (supersedes_extraction_id) REFERENCES evidence_extractions(extraction_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_evidence_extractions_evidence_id_created_at
+            ON evidence_extractions(evidence_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_evidence_extractions_supersedes
+            ON evidence_extractions(supersedes_extraction_id);
+        """
+    )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -301,6 +327,11 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 3)
 
 
+def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    _create_v4_schema(conn)
+    _set_schema_version(conn, 4)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -323,6 +354,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _create_v3_schema(conn)
+        _create_v4_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -338,14 +370,22 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v1_schema(conn)
         _migrate_v1_to_v2(conn)
         _migrate_v2_to_v3(conn)
+        _migrate_v3_to_v4(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _migrate_v2_to_v3(conn)
+        _migrate_v3_to_v4(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
         _create_v3_schema(conn)
+        _migrate_v3_to_v4(conn)
+    elif schema_version == 4:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
     else:
         conn.close()
         raise ValueError(

@@ -41,6 +41,7 @@ from app.sandbox import (
 )
 from evidence_core import chain
 from evidence_core.db import init_db
+from evidence_core.extraction_store import create_extraction, get_latest_extraction
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots, verify_chain
 from scripts.seed_demo import seed_demo_data
@@ -286,7 +287,48 @@ def _get_extract_note(conn: sqlite3.Connection, evidence_id: str) -> str | None:
 
 def _clear_extract_note(conn: sqlite3.Connection, evidence_id: str) -> None:
     conn.execute("DELETE FROM meta WHERE key = ?", (_extract_note_key(evidence_id),))
-    conn.commit()
+
+
+def _record_machine_extraction(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    transcript: str,
+    provider: str,
+    model: str | None,
+    created_at: int | None = None,
+) -> None:
+    create_extraction(
+        conn,
+        evidence_id=evidence_id,
+        origin="machine",
+        provider=provider,
+        model=model,
+        transcript=transcript,
+        observations=[],
+        created_at=created_at,
+    )
+
+
+def _record_user_extraction(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    transcript: str,
+    created_at: int | None = None,
+) -> None:
+    latest = get_latest_extraction(conn, evidence_id)
+    create_extraction(
+        conn,
+        evidence_id=evidence_id,
+        origin="user",
+        provider="manual",
+        model=None,
+        transcript=transcript,
+        observations=[],
+        created_at=created_at,
+        supersedes_extraction_id=None if latest is None else latest["extraction_id"],
+    )
 
 
 def _set_ocr_corrected(conn: sqlite3.Connection, evidence_id: str, corrected: bool) -> None:
@@ -733,6 +775,13 @@ def _run_image_pipeline(
         conn.execute(
             "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
             (_build_attachment_raw_text("image", filename, extracted_text), evidence_id),
+        )
+        _record_machine_extraction(
+            conn,
+            evidence_id=evidence_id,
+            transcript=extracted_text,
+            provider="dashscope",
+            model=ocr.OCR_MODEL,
         )
         _clear_extract_note(conn, evidence_id)
         _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
@@ -1406,6 +1455,11 @@ def create_app() -> FastAPI:
                 "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
                 (_build_attachment_raw_text("image", filename, corrected_text), evidence_id),
             )
+            _record_user_extraction(
+                conn,
+                evidence_id=evidence_id,
+                transcript=corrected_text,
+            )
             _clear_extract_note(conn, evidence_id)
             _set_ocr_corrected(conn, evidence_id, True)
             _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
@@ -1758,6 +1812,15 @@ def create_app() -> FastAPI:
                     "UPDATE evidence SET raw_text = ?, plain_summary = ? WHERE evidence_id = ?",
                     (raw_text_override, text or None, row["evidence_id"]),
                 )
+                if media_type != "image" and extracted_for_parse:
+                    _record_machine_extraction(
+                        conn,
+                        evidence_id=row["evidence_id"],
+                        transcript=extracted_for_parse,
+                        provider="builtin",
+                        model=None,
+                        created_at=now_ms,
+                    )
                 row = conn.execute("SELECT * FROM evidence WHERE evidence_id = ?", (row["evidence_id"],)).fetchone()
                 row = dict(row)
             _set_parse_status(conn, row["evidence_id"], parse_status)

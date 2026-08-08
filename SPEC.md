@@ -92,17 +92,19 @@
 - 把不确定性显式暴露出来,比假装全自动更可靠
 - 用户确认本身就是高价值标注数据
 
-### D5. AI 分两段,复用同一条文本解析链
+### D5. AI 分阶段解析,复用同一条证据链
 **决策**:
 - 图 → 文:阿里云百炼 `vanchin/deepseek-ocr`(OpenAI 兼容接口)
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
+- `Evidence -> Extraction(transcript + visual observations) -> Fact -> Event`
 - 文 → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
 - Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
 - Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
-- 文档提取与 OCR 产物统一落到 `raw_text`,后续搜索、导出、详情页、语义解析全部复用同一链路
+- Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
+- 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
 
 ### D6. 访客沙箱优先于账号体系
@@ -345,6 +347,31 @@ V2 的目标底层关系为:
 - Interpretation 不得反向改写 Fact 的原始抽取结果
 - Evidence 始终代表原始证据,解释层变化不改变 Evidence 的完整性语义
 
+### 3.8 V4 提取层新增表
+
+#### evidence_extractions
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| extraction_id | TEXT PK | 提取版本 ID |
+| evidence_id | TEXT NOT NULL | 所属 Evidence |
+| origin | TEXT NOT NULL | machine / user |
+| provider | TEXT NOT NULL | 提取供应方标识 |
+| model | TEXT NULL | 提取模型名 |
+| transcript | TEXT NULL | 提取到的文字 |
+| observations | TEXT NOT NULL | JSON 数组,默认 `[]` |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| supersedes_extraction_id | TEXT NULL | 指向被 supersede 的旧版本 |
+
+语义边界:
+- Extraction 是 Evidence 的可追溯提取层,不等于 Fact
+- `transcript` 记录提取到的文字
+- `observations` 只允许记录**界面可观察事实**,例如"小王账号对该消息显示👍反应"
+- Observation 不得推断心理、态度或意图,例如不得写成"小王已认真阅读并同意全部内容"
+- 旧版本 Extraction 不删除、不覆盖
+- 当前 `raw_text` 仍保留为兼容层展示 / 搜索 / 解析输入,但机器或用户提取历史应落入 `evidence_extractions`
+- `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
+
 ---
 
 ## 4. 哈希链算法(核心)
@@ -501,6 +528,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 核心定位从"谁欠谁"调整为"中立记录谁对谁表达了什么、发生了什么变化" | `"我的待办"`降级为可选身份视图,不再作为底层事实模型的核心差异点 |
 | 2026-08-08 | 新增 V2 语义模型骨架: Submission → Evidence → Fact → Event → Derived State | 为后续语义归档与事件层演进预留安全迁移路径,同时保留现有兼容层 |
 | 2026-08-08 | V3 为 facts 增加 `due_anchor_at / event_assignment_confidence / origin / review_status` | 加固相对日期换算语义,拆分事件归属置信度,并为用户确认/修正预留保护状态 |
+| 2026-08-08 | V4 新增 `evidence_extractions`,将提取层显式化为 `Evidence -> Extraction -> Fact` | 为 OCR / 文档提取 / 人工校正提供可追溯版本历史,同时保持 `raw_text` 兼容层不变 |
 
 ---
 
