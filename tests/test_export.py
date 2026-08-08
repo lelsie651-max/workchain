@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import random
 import subprocess
@@ -8,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from pypdf import PdfReader
 
 from evidence_core import canonical
 from evidence_core.chain import compute_record_digest
@@ -15,6 +17,13 @@ from evidence_core.db import init_db
 from evidence_core import export as export_module
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots
+from app.pdf_report import build_evidence_pdf, PDF_FOOTER_TEXT
+from scripts.seed_demo import seed_demo_data
+
+
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ioAAAAASUVORK5CYII="
+)
 
 
 @pytest.fixture
@@ -359,3 +368,51 @@ def test_export_raises_when_repo_verify_path_missing(db_file, blobs_root, export
 
     with pytest.raises(FileNotFoundError, match="verify.py not found at"):
         export_evidence_package(conn, blobs_root=blobs_root, out_dir=export_dir)
+
+
+def test_build_evidence_pdf_creates_file_and_extracts_chinese_with_footer(tmp_path):
+    demo_dir = tmp_path / "demo_data"
+    seed_demo_data(demo_dir)
+    conn = init_db(demo_dir / "workchain.db")
+    pdf_path = tmp_path / "thread.pdf"
+    try:
+        build_evidence_pdf(
+            conn,
+            blobs_root=demo_dir / "blobs",
+            thread_id="thr_channel",
+            out_path=pdf_path,
+        )
+    finally:
+        conn.close()
+
+    assert pdf_path.exists()
+    assert pdf_path.stat().st_size > 0
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(str(pdf_path)).pages)
+    assert "渠道复盘数据" in text
+    assert PDF_FOOTER_TEXT in text
+
+
+def test_pdf_with_image_is_larger_than_text_only_export(db_file, blobs_root, tmp_path):
+    conn = init_db(db_file)
+    try:
+        _append_text(conn, blobs_root, text="渠道复盘数据需要先留档。", captured_at=1723000000)
+        text_only_pdf = tmp_path / "text-only.pdf"
+        build_evidence_pdf(conn, blobs_root=blobs_root, scope="all", out_path=text_only_pdf)
+
+        append_evidence(
+            conn,
+            blobs_root=blobs_root,
+            media_type="image",
+            payload=PNG_BYTES,
+            captured_at=1723000001,
+            occurred_at=1723000001,
+            source_hint="飞书-项目复盘群",
+        )
+        image_pdf = tmp_path / "with-image.pdf"
+        build_evidence_pdf(conn, blobs_root=blobs_root, scope="all", out_path=image_pdf)
+    finally:
+        conn.close()
+
+    assert text_only_pdf.exists()
+    assert image_pdf.exists()
+    assert image_pdf.stat().st_size > text_only_pdf.stat().st_size

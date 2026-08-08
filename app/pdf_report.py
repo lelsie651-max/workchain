@@ -62,11 +62,8 @@ def _resolve_rows(
     conn: sqlite3.Connection,
     *,
     thread_id: str | None,
-    evidence_ids: list[str] | None,
+    scope: str | None,
 ) -> list[sqlite3.Row]:
-    if thread_id and evidence_ids:
-        raise ValueError("thread_id and evidence_ids are mutually exclusive")
-
     if thread_id:
         rows = conn.execute(
             """
@@ -84,29 +81,10 @@ def _resolve_rows(
         ).fetchall()
         return list(rows)
 
-    if evidence_ids is not None:
-        if not evidence_ids:
-            return []
-        placeholders = ",".join("?" for _ in evidence_ids)
-        rows = conn.execute(
-            f"""
-            SELECT
-                e.*,
-                sr.canonical_name AS requester_name,
-                so.canonical_name AS owner_name
-            FROM evidence AS e
-            LEFT JOIN actors AS sr ON sr.actor_id = e.slot_requester
-            LEFT JOIN actors AS so ON so.actor_id = e.slot_owner
-            WHERE e.evidence_id IN ({placeholders})
-            ORDER BY e.occurred_at ASC, e.seq ASC
-            """,
-            evidence_ids,
-        ).fetchall()
-        order_map = {evidence_id: index for index, evidence_id in enumerate(evidence_ids)}
-        return sorted(rows, key=lambda row: (order_map[row["evidence_id"]], row["seq"]))
+    where_clause = "WHERE e.evidence_id NOT LIKE 'ev_demo_%'" if scope == "mine" else ""
 
     rows = conn.execute(
-        """
+        f"""
         SELECT
             e.*,
             sr.canonical_name AS requester_name,
@@ -114,6 +92,7 @@ def _resolve_rows(
         FROM evidence AS e
         LEFT JOIN actors AS sr ON sr.actor_id = e.slot_requester
         LEFT JOIN actors AS so ON so.actor_id = e.slot_owner
+        {where_clause}
         ORDER BY e.occurred_at ASC, e.seq ASC
         """
     ).fetchall()
@@ -214,6 +193,7 @@ class _NumberedCanvas(canvas.Canvas):
         self._startPage()
 
     def save(self) -> None:
+        self._saved_page_states.append(dict(self.__dict__))
         page_count = len(self._saved_page_states)
         for state in self._saved_page_states:
             self.__dict__.update(state)
@@ -278,13 +258,12 @@ def build_evidence_pdf(
     *,
     blobs_root,
     thread_id=None,
-    evidence_ids=None,
+    scope=None,
     out_path,
 ) -> Path:
     blobs_root = Path(blobs_root)
     out_path = Path(out_path)
-    evidence_id_list = None if evidence_ids is None else list(evidence_ids)
-    rows = _resolve_rows(conn, thread_id=thread_id, evidence_ids=evidence_id_list)
+    rows = _resolve_rows(conn, thread_id=thread_id, scope=scope)
     if not rows:
         raise ValueError("no evidence selected for export")
 
@@ -391,7 +370,7 @@ def build_evidence_pdf(
     story.append(Spacer(1, 6 * mm))
     _append_paragraph(
         story,
-        "如果你拿到的是完整举证包,可以在包内运行 python verify.py --dir . 自行验证所有记录是否和保存时完全一致。",
+        "完整的可验证举证包请使用「导出完整举证包」功能。",
         styles["body"],
     )
 

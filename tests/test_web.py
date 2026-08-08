@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import base64
+import io
+import json
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 import httpx
+from pypdf import PdfReader
 
 from app.main import create_app
 from evidence_core.db import init_db
@@ -171,6 +177,8 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert 'id="self-name-input"' in html
     assert "新增词条" in html
     assert "还没告诉系统你在对话里叫什么" not in html
+    assert "导出完整举证包" in html
+    assert "包含你的全部记录与校验工具" in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -199,6 +207,8 @@ def test_thread_channel_page_contains_10_evidence_cards(tmp_path, monkeypatch):
     assert "⚠️ 需求在这里发生了变更" in response.text
     assert "10 条记录" in response.text
     assert 'href="/help"' in response.text
+    assert "导出这件事(PDF)" in response.text
+    assert "导出完整举证包" not in response.text
 
 
 def test_thread_userlist_page_contains_3_evidence_cards(tmp_path, monkeypatch):
@@ -486,6 +496,7 @@ def test_index_shows_recent_user_records_after_post(tmp_path, monkeypatch):
     assert "我刚存的" in response.text
     assert "这些记录只属于你" in response.text
     assert "李娜刚补了一句" in response.text
+    assert "导出我的记录(PDF)" in response.text
 
 
 def test_index_contains_full_long_text_in_html(tmp_path, monkeypatch):
@@ -537,6 +548,133 @@ def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
         )
         evidence_id = create_response.json()["evidence_id"]
         response = client_b.get(f"/evidence/{evidence_id}")
+
+    assert response.status_code == 404
+
+
+def test_export_pdf_thread_route_returns_pdf(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/export/pdf", params={"thread_id": "thr_channel"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"].startswith("attachment;")
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(response.content)).pages)
+    assert "渠道复盘数据" in text
+
+
+def test_export_pdf_mine_route_returns_pdf_for_user_records(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.post(
+            "/api/evidence",
+            json={"text": "这是我自己补充的一条记录。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        response = client.get("/export/pdf", params={"scope": "mine"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/pdf"
+    text = "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(response.content)).pages)
+    assert "这是我自己补充的一条记录。" in text
+
+
+def test_export_package_route_returns_zip_and_verify_passes(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/export/package")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+
+    zip_path = tmp_path / "package.zip"
+    extract_dir = tmp_path / "unzipped"
+    zip_path.write_bytes(response.content)
+    with zipfile.ZipFile(zip_path) as archive:
+        archive.extractall(extract_dir)
+
+    manifest = json.loads((extract_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["records"]) == 18
+    assert (extract_dir / "verify.py").exists()
+    assert (extract_dir / "怎么验证这份材料.txt").exists()
+    assert any(path.suffix == ".pdf" for path in extract_dir.iterdir())
+
+    result = subprocess.run(
+        [sys.executable, str(extract_dir / "verify.py"), "--dir", str(extract_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_export_package_ignores_thread_id_and_still_exports_full_chain(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/export/package", params={"thread_id": "thr_channel"})
+
+    assert response.status_code == 200
+    extract_dir = tmp_path / "ignored-thread-package"
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        archive.extractall(extract_dir)
+    manifest = json.loads((extract_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert len(manifest["records"]) == 18
+
+
+def test_export_pdf_thread_route_returns_404_across_sandboxes(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+
+    client_a = TestClient(create_app())
+    client_b = TestClient(create_app())
+
+    with client_a, client_b:
+        client_a.post(
+            "/api/evidence",
+            json={"text": "只有 A 里能看到这条记录。", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        db_path_a = _sandbox_db_path(client_a, sandbox_root)
+        conn_a = init_db(db_path_a)
+        try:
+            conn_a.execute(
+                """
+                INSERT INTO threads (
+                    thread_id, title, status, owner_actor_id, requester_actor_id,
+                    current_deliverable, current_due, version, risk_flags,
+                    last_activity_at, first_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "thr_only_in_a",
+                    "只在 A 的事项",
+                    "open",
+                    "act_self",
+                    "act_zhang",
+                    "只在 A 的交付物",
+                    None,
+                    1,
+                    "[]",
+                    1723000000,
+                    1723000000,
+                ),
+            )
+            conn_a.commit()
+        finally:
+            conn_a.close()
+        response = client_b.get("/export/pdf", params={"thread_id": "thr_only_in_a"})
 
     assert response.status_code == 404
 

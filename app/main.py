@@ -1344,16 +1344,13 @@ def create_app() -> FastAPI:
         sandbox: SandboxContext = Depends(get_sandbox),
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> FileResponse:
-        evidence_ids = None
         if thread_id:
             if not _thread_exists(conn, thread_id):
                 raise HTTPException(status_code=404, detail="thread not found")
-        elif scope == "mine":
-            evidence_ids = _mine_evidence_ids(conn)
-            if not evidence_ids:
-                raise HTTPException(status_code=404, detail="no evidence to export")
-        else:
+        elif scope != "mine":
             raise HTTPException(status_code=400, detail="请指定 thread_id 或 scope=mine")
+        elif not _mine_evidence_ids(conn):
+            raise HTTPException(status_code=404, detail="no evidence to export")
 
         temp_dir = Path(tempfile.mkdtemp(prefix="workchain-pdf-"))
         pdf_name = _pdf_download_name()
@@ -1362,34 +1359,24 @@ def create_app() -> FastAPI:
             conn,
             blobs_root=sandbox.blobs_root,
             thread_id=thread_id,
-            evidence_ids=evidence_ids,
+            scope=scope,
             out_path=pdf_path,
         )
-        return FileResponse(
+        response = FileResponse(
             path=pdf_path,
             media_type="application/pdf",
             filename=pdf_name,
             background=BackgroundTask(_cleanup_temp_dir, temp_dir),
         )
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     @app.get("/export/package")
     def export_package(
         thread_id: str | None = None,
-        scope: str | None = None,
         sandbox: SandboxContext = Depends(get_sandbox),
         conn: sqlite3.Connection = Depends(get_conn),
     ) -> FileResponse:
-        evidence_ids = None
-        if thread_id:
-            if not _thread_exists(conn, thread_id):
-                raise HTTPException(status_code=404, detail="thread not found")
-        elif scope == "mine":
-            evidence_ids = _mine_evidence_ids(conn)
-            if not evidence_ids:
-                raise HTTPException(status_code=404, detail="no evidence to export")
-        else:
-            raise HTTPException(status_code=400, detail="请指定 thread_id 或 scope=mine")
-
         temp_dir = Path(tempfile.mkdtemp(prefix="workchain-package-"))
         package_dir = temp_dir / "package"
         package_dir.mkdir(parents=True, exist_ok=True)
@@ -1397,16 +1384,13 @@ def create_app() -> FastAPI:
         build_evidence_pdf(
             conn,
             blobs_root=sandbox.blobs_root,
-            thread_id=thread_id,
-            evidence_ids=evidence_ids,
+            scope="all",
             out_path=package_dir / pdf_name,
         )
         export_evidence_package(
             conn,
             blobs_root=sandbox.blobs_root,
             out_dir=package_dir,
-            thread_id=thread_id,
-            evidence_ids=evidence_ids,
         )
         (package_dir / "怎么验证这份材料.txt").write_text(PACKAGE_README_TEXT, encoding="utf-8")
 
@@ -1416,12 +1400,14 @@ def create_app() -> FastAPI:
             for file_path in package_dir.rglob("*"):
                 if file_path.is_file():
                     archive.write(file_path, file_path.relative_to(package_dir))
-        return FileResponse(
+        response = FileResponse(
             path=zip_path,
             media_type="application/zip",
             filename=zip_name,
             background=BackgroundTask(_cleanup_temp_dir, temp_dir),
         )
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     @app.post("/api/evidence")
     async def create_evidence(

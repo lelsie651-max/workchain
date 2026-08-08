@@ -281,7 +281,7 @@
                         data-export-button
                         data-loading-text="生成中…"
                     >
-                        导出我的记录
+                        导出我的记录(PDF)
                     </button>
                 </form>
             </div>
@@ -408,6 +408,25 @@
                     {% endfor %}
                 </div>
             </details>
+        </section>
+
+        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                    <h2 class="text-xl font-semibold text-white">导出完整举证包</h2>
+                    <p class="mt-1 text-sm text-slate-400">包含你的全部记录与校验工具,对方可自行验证真伪。单条事项的 PDF 仅供阅读,不含校验工具。</p>
+                </div>
+                <form method="get" action="/export/package" data-export-form>
+                    <button
+                        type="submit"
+                        class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
+                        data-export-button
+                        data-loading-text="生成中…"
+                    >
+                        导出完整举证包
+                    </button>
+                </form>
+            </div>
         </section>
     </div>
 </div>

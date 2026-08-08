@@ -21,18 +21,7 @@
                     data-export-button
                     data-loading-text="生成中…"
                 >
-                    导出 PDF
-                </button>
-            </form>
-            <form method="get" action="/export/package" data-export-form>
-                <input type="hidden" name="thread_id" value="{{ thread.thread_id }}">
-                <button
-                    type="submit"
-                    class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
-                    data-export-button
-                    data-loading-text="生成中…"
-                >
-                    导出完整举证包
+                    导出这件事(PDF)
                 </button>
             </form>
             {% for label in thread.risk_labels %}
