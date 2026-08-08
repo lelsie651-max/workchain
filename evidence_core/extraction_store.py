@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import Any
 
-from app.evidence_extractor import normalize_observations
+from evidence_core.extraction_contract import normalize_observations
 
 
 class ExtractionStoreError(ValueError):

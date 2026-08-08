@@ -95,6 +95,7 @@
 ### D5. AI 分阶段解析,复用同一条证据链
 **决策**:
 - 图 → 文:阿里云百炼 `vanchin/deepseek-ocr`(OpenAI 兼容接口)
+- 可替换实验能力:Visual Provider(如 Doubao Ark)可输出 `transcript + observations`,但 production 默认仍使用现有 OCR
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
 - `Evidence -> Extraction(transcript + visual observations) -> Fact -> Event`
 - 文 → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
@@ -103,6 +104,7 @@
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
+- Visual Provider 属于可替换实验能力,用于补充界面可观察事实,但不改变 production 默认 OCR 链路
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - 文档提取与 OCR 产物当前仍会兼容写入 `raw_text`,后续搜索、导出、详情页、语义解析继续复用现有链路
 - 这样可以把"原始材料"与"AI 解读"严格分离,继续满足 D2
@@ -237,7 +239,7 @@ V2 的目标底层关系为:
 
 | key 模式 | value | 用途 |
 |---|---|---|
-| `schema_version` | `1/2/3` | schema 版本 |
+| `schema_version` | `1/2/3/4` | schema 版本 |
 | `parse_status:{evidence_id}` | `ocr_running / llm_running / done / failed / unsupported` | 解析状态机 |
 | `parse_detail:{evidence_id}` | TEXT | 解析失败或降级说明 |
 | `extract_note:{evidence_id}` | TEXT | 文档提取 / OCR 的具体失败原因 |
@@ -368,6 +370,7 @@ V2 的目标底层关系为:
 - `transcript` 记录提取到的文字
 - `observations` 只允许记录**界面可观察事实**,例如"小王账号对该消息显示👍反应"
 - Observation 不得推断心理、态度或意图,例如不得写成"小王已认真阅读并同意全部内容"
+- 如果画面里能看到 reaction 存在,但看不到反应者身份,只能记录 reaction 存在或身份未知,不得根据后续对话猜测是谁点的
 - 旧版本 Extraction 不删除、不覆盖
 - 当前 `raw_text` 仍保留为兼容层展示 / 搜索 / 解析输入,但机器或用户提取历史应落入 `evidence_extractions`
 - `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
@@ -529,6 +532,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | 新增 V2 语义模型骨架: Submission → Evidence → Fact → Event → Derived State | 为后续语义归档与事件层演进预留安全迁移路径,同时保留现有兼容层 |
 | 2026-08-08 | V3 为 facts 增加 `due_anchor_at / event_assignment_confidence / origin / review_status` | 加固相对日期换算语义,拆分事件归属置信度,并为用户确认/修正预留保护状态 |
 | 2026-08-08 | V4 新增 `evidence_extractions`,将提取层显式化为 `Evidence -> Extraction -> Fact` | 为 OCR / 文档提取 / 人工校正提供可追溯版本历史,同时保持 `raw_text` 兼容层不变 |
+| 2026-08-08 | 新增实验 Visual Provider 边界,production 默认仍为 OCR | 为本地评测和未来多模态能力预留接口,但不改变线上默认图片提取链路 |
 
 ---
 
