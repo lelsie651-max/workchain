@@ -998,6 +998,7 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
             {
                 "fact_id": fact["fact_id"],
                 "fact_type": fact["fact_type"],
+                "fact_type_label": _event_fact_type_label(fact["fact_type"]),
                 "content": fact["content"],
                 "due_raw": fact["due_raw"],
                 "due_date_value": _format_datetime(fact["due_at"], "%Y-%m-%d"),
@@ -1048,6 +1049,7 @@ def _event_match_fact_items(
             {
                 "fact_id": row["fact_id"],
                 "fact_type": row["fact_type"],
+                "fact_type_label": _event_fact_type_label(row["fact_type"]),
                 "content": row["content"],
                 "event_id": row["event_id"],
                 "event_title": row["event_title"],
@@ -2274,7 +2276,11 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
         "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d %H:%M"),
         "due_text": _format_due_display(row["due_at"]),
         "recent_facts": [
-            {"fact_type": item["fact_type"], "content": item["content"]}
+            {
+                "fact_type": item["fact_type"],
+                "fact_type_label": _event_fact_type_label(item["fact_type"]),
+                "content": item["content"],
+            }
             for item in summary_rows
         ],
     }
@@ -2992,6 +2998,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/diag/llm")
     def diag_llm() -> dict[str, Any]:
+        if not _diagnostics_enabled():
+            raise HTTPException(status_code=404, detail="diagnostics disabled")
         api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
         if not api_key:
             return {
@@ -3602,6 +3610,7 @@ def create_app() -> FastAPI:
                 "my_events": context["my_events"],
                 "history_events": context["history_events"],
                 "demo_threads": context["demo_threads"],
+                "diagnostics_enabled": _diagnostics_enabled(),
                 "references": context["references"],
                 "recent_records": context["recent_records"],
                 "source_presets": SOURCE_PRESETS,

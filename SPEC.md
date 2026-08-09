@@ -597,7 +597,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
 - 首页主体验已切到 Event / Fact 体系:`我的事项` 只展示当前访客沙箱中的真实 `events + facts`
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
-- 旧 demo threads 已降级为 `看看示例`,与真实 Event 分区展示,不再混为同一数据体系
+- 旧 demo threads 兼容路由仍保留,但普通用户首页不再公开展示;仅在 diagnostics/debug 场景下保留只读入口,避免与真实 Event 体系混淆
 - `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要;若 latest Event Match 为 `pending` 且 routing_mode 为 `confirm / needs_context`,首页直接复用与详情页相同的事项归属确认面板,无需先进入详情页
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
 - Event 详情页现已升级为 Competition Event Control Center V1:可修改事项名称、纠正 Fact 的 `content / fact_type / due_at`、直接补/改相关 Evidence 的记录日期,并通过受控接口切换 `active <-> resolved`
@@ -611,15 +611,16 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 首页原 `我刚存的` 文案已改为 `最近证据`,说明固定为 `按保存顺序保留的原始材料，用于回看和核对。`
 - 用户可见文案不得直接暴露 `anchor_date / due_date / fact_index / event_assignment` 等内部字段名;相对日期缺少可靠锚点时,统一改写为用户能理解的提示,并明确只有补充"记录发生日期"后才能换算
 - 当 Evidence 已有可靠 anchor 后,当前视图要过滤掉"缺少记录发生日期 / 无法换算今天或周五"这类 stale date uncertainty;历史 Interpretation 保留,但可补充一条轻量提示: `已按 YYYY-MM-DD 换算相对日期。`
-- Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、原件完整保存与校验、以及 `auto / confirm / needs_context` 的真实行为
+- Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、AI 结果可继续纠正、原件独立保存与完整性校验;用户可见文案统一改成人话,不直接暴露 `AUTO / CONFIRM / NEEDS_CONTEXT` 等实现术语
 - 访客沙箱(`wc_sid`)与 24 小时过期清理
 - 图片/文档上传、预览、Lightbox
 - PDF 导出
 - 完整举证包 zip 导出(全链)
-- `/api/diag/llm` 与 `/api/diag/ocr` 连通性自检
+- 普通用户页面不直接展示 provider/model、parser version、semantic run id、HTTP status/latency/timeout、schema/provider/internal routing enum 等开发诊断信息;Evidence 普通区只展示用户可理解的整理结果与保存/校验信息
+- diagnostics 能力继续保留,但统一受 `WORKCHAIN_DIAGNOSTICS=1` 控制:关闭时 diagnostics UI 不渲染,`/api/diag/llm`、`/api/diag/ocr`、Evidence diagnostics / preflight / Ark 实验接口全部返回 404,且不会额外触发真实模型探测
 - diagnostics-only Visual A/B Diagnostics:可对同一图片 Evidence 临时运行 Ark Vision,与当前 machine extraction 做只读对照,结果不落库不改状态
 - diagnostics-only DeepSeek text preflight:可对同一 Evidence 临时运行轻量 JSON ping,不写 DB,用于区分 Key / 余额 / 模型 / API 问题与真实 Semantic Parser 问题
-- Evidence diagnostics 现可追踪 Semantic Parser provider failure stage,仅暴露安全元数据(如 stage / http status / timeout / thinking mode / safe message),不包含 prompt、transcript 或完整模型输出
+- Evidence diagnostics 可追踪 Semantic Parser provider failure stage,仅暴露安全元数据(如 stage / http status / timeout / thinking mode / safe message),不包含 prompt、transcript 或完整模型输出,且这些信息只出现在 diagnostics 区
 
 ### 下一阶段
 - TSA/外部时间锚点,进一步补强 checkpoint 之后的链尾截断问题
@@ -633,6 +634,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 日期 | 变更 | 原因 |
 |---|---|---|
 | 2026-08-09 | Competition Event Control Center V1:Event 页支持改名 / Fact 纠正 / 记录日期补改 / 结档与重开,首页新增历史事项并将 `我刚存的` 改为 `最近证据` | 让 `我的事项` 成为用户纠正 AI 结果、补日期、结档和回看历史的主入口,同时保持旧记录兼容与哈希链不受影响 |
+| 2026-08-09 | Competition Release Hardening:普通页清理 provider/model/parser/run id 等 dev 痕迹,diagnostics 关闭即整组 404,Help 与 demo surface 做正式版收口 | 发布版默认只保留用户能理解的界面与安全错误面,同时继续保留同一套代码下的 diagnostics 能力 |
 | 2026-08-07 | v1.0 初始版本 | — |
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 | 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |

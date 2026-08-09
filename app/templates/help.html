@@ -32,9 +32,9 @@
     <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
         <h2 class="text-2xl font-semibold text-white">三、事项是怎么串起来的</h2>
         <div class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
-            <p><span class="font-medium text-white">AUTO：</span>系统能可靠判断属于同一件事时，会自动归档到已有事项，或新建一个事项承接这组事实。</p>
-            <p><span class="font-medium text-white">CONFIRM：</span>当一段记录可能同时涉及多件事时，系统只保存建议结果，等待后续人工确认，不会自动改动事实归属。</p>
-            <p><span class="font-medium text-white">NEEDS_CONTEXT：</span>上下文还不够时，系统会明确告诉你“暂时无法可靠判断”，同样不会自动乱归档。</p>
+            <p><span class="font-medium text-white">判断明确：</span>系统能可靠判断属于同一件事时，会自动归入已有事项，或新建一个事项承接这组事实。</p>
+            <p><span class="font-medium text-white">存在多个可能：</span>系统会先保留建议结果，再请你确认归到哪件事，不会替你乱改事实归属。</p>
+            <p><span class="font-medium text-white">上下文不足：</span>系统会明确告诉你还需要补充或选择什么，再继续整理，不会凭空替你下结论。</p>
             <p>不管是哪一种状态，事实整理和原始证据都会保留下来。</p>
         </div>
     </article>
@@ -51,10 +51,11 @@
     </article>
 
     <article class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 sm:p-6">
-        <h2 class="text-2xl font-semibold text-white">五、当前没有提供什么</h2>
+        <h2 class="text-2xl font-semibold text-white">五、使用边界</h2>
         <div class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
-            <p>当前版本不提供自动需求变化检测、Reminder、多图合并解析，也没有正式账号云同步。</p>
-            <p>如果系统没有足够把握，它会停在建议或“需要更多上下文”，而不是替你做有风险的确认写操作。</p>
+            <p>AI 整理结果可以继续纠正，包括事项名称、事实内容、事实类型和明确日期。</p>
+            <p>如果系统没有足够把握，它会停在建议、请你确认，或请你补充上下文，而不是替你做有风险的确认写操作。</p>
+            <p>原始材料独立保存，完整性校验证明的是“材料未被篡改”，不直接证明材料内容本身一定真实。</p>
         </div>
     </article>
 
@@ -62,7 +63,7 @@
         <h2 class="text-2xl font-semibold text-white">六、补充说明</h2>
         <ul class="mt-4 space-y-3 text-sm leading-7 text-slate-300">
             <li>原件保存与完整性校验保护的是“这份材料没有被篡改”，不直接证明材料内容本身一定真实。</li>
-            <li>项目仓库：<a href="https://github.com/lelsie651-max/workchain" target="_blank" rel="noreferrer" class="text-cyan-200 underline underline-offset-4">https://github.com/lelsie651-max/workchain</a></li>
+            <li>导出完整举证包后，第三方可以独立校验材料和校验文件是否一致。</li>
         </ul>
     </article>
 </section>

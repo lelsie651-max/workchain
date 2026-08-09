@@ -226,7 +226,7 @@
                     <div class="mt-4 space-y-3 text-sm text-slate-300">
                         {% for fact in event.recent_facts %}
                         <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3">
-                            <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type }}</p>
+                            <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
                             <p class="mt-1">{{ fact.content }}</p>
                         </div>
                         {% endfor %}
@@ -275,6 +275,7 @@
             {% endif %}
         </section>
 
+        {% if diagnostics_enabled and demo_threads %}
         <section>
             <div class="mb-5">
                 <div>
@@ -310,6 +311,7 @@
                 {% endfor %}
             </div>
         </section>
+        {% endif %}
 
         {% if recent_records %}
         <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
@@ -422,7 +424,7 @@
                         <div class="space-y-2">
                             {% for fact in item.semantic_fact_preview %}
                             <div class="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-3">
-                                <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type }}</p>
+                                <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
                                 <p class="mt-1 text-slate-100">{{ fact.content }}</p>
                             </div>
                             {% endfor %}

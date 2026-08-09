@@ -180,6 +180,7 @@ def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
 
 
 def test_diag_llm_without_api_key_returns_configured_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -195,6 +196,7 @@ def test_diag_llm_without_api_key_returns_configured_false(tmp_path, monkeypatch
 
 
 def test_diag_llm_with_connection_error_returns_reachable_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     fake_key = "sk-test-visible-key"
     monkeypatch.setenv("DEEPSEEK_API_KEY", fake_key)
     client, _, _ = _make_client(tmp_path, monkeypatch)
@@ -214,6 +216,7 @@ def test_diag_llm_with_connection_error_returns_reachable_false(tmp_path, monkey
 
 
 def test_diag_llm_response_never_contains_api_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
     fake_key = "sk-very-obvious-secret"
     monkeypatch.setenv("DEEPSEEK_API_KEY", fake_key)
     client, _, _ = _make_client(tmp_path, monkeypatch)
@@ -225,6 +228,19 @@ def test_diag_llm_response_never_contains_api_key(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert fake_key not in response.text
+
+
+def test_diag_llm_returns_404_when_diagnostics_disabled_and_does_not_probe(tmp_path, monkeypatch):
+    monkeypatch.delenv("WORKCHAIN_DIAGNOSTICS", raising=False)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.httpx.post") as mock_post:
+        with client:
+            response = client.get("/api/diag/llm")
+
+    assert response.status_code == 404
+    mock_post.assert_not_called()
 
 
 def test_diag_ocr_without_api_key_returns_configured_false(tmp_path, monkeypatch):
@@ -278,7 +294,7 @@ def test_diag_ocr_returns_404_when_diagnostics_disabled(tmp_path, monkeypatch):
     assert response.status_code == 404
 
 
-def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
+def test_index_hides_demo_threads_from_regular_users(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -290,11 +306,9 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
     assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" in html
     assert "可选：我的词典" in html
     assert "我的事项" in html
-    assert "看看示例" in html
-    assert "这不是我要的" in html
-    assert "用户明细导出" in html
-    assert "接口文档补充" in html
-    assert "需求改了 3 次,你一次都没等到确认" in html
+    assert "历史事项" in html
+    assert "看看示例" not in html
+    assert 'data-testid="thread-card"' not in html
     assert "导出完整举证包" in html
     assert "包含你的全部记录与校验工具" in html
     assert "填了之后系统才知道哪句话是你说的" not in html
@@ -321,7 +335,7 @@ def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypa
     assert "下周一开始工位调整" in html
 
 
-def test_index_shows_real_event_in_my_events_and_keeps_demo_threads_separate(tmp_path, monkeypatch):
+def test_index_shows_real_event_in_my_events_without_exposing_demo_threads(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     parsed = _semantic_result(
@@ -366,9 +380,8 @@ def test_index_shows_real_event_in_my_events_and_keeps_demo_threads_separate(tmp
     assert "我的事项" in html
     assert 'data-testid="event-card"' in html
     assert "补签供应商合同" in html
-    assert "看看示例" in html
-    assert 'data-testid="thread-card"' in html
-    assert "渠道复盘数据" in html
+    assert "看看示例" not in html
+    assert 'data-testid="thread-card"' not in html
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:
@@ -1470,12 +1483,34 @@ def test_help_page_returns_200_and_contains_review_notes(tmp_path, monkeypatch):
     assert "无需登录即可体验" in html
     assert "每位访客都会拿到一个独立的匿名体验空间" in html
     assert "体验数据会在 24 小时后自动清理" in html
-    assert "AUTO：" in html
-    assert "CONFIRM：" in html
-    assert "NEEDS_CONTEXT：" in html
+    assert "判断明确" in html
+    assert "存在多个可能" in html
+    assert "上下文不足" in html
+    assert "AI 整理结果可以继续纠正" in html
     assert "即将开放" not in html
     assert "自动归并算法已完成设计但尚未实现" not in html
-    assert "https://github.com/lelsie651-max/workchain" in html
+    assert "AUTO：" not in html
+    assert "CONFIRM：" not in html
+    assert "NEEDS_CONTEXT：" not in html
+    assert "https://github.com/lelsie651-max/workchain" not in html
+
+
+def test_html_500_page_does_not_expose_traceback_or_secret(tmp_path, monkeypatch):
+    demo_dir = tmp_path / "web_demo_data"
+    sandbox_root = tmp_path / "sandboxes"
+    monkeypatch.setenv("WORKCHAIN_DEMO_DIR", str(demo_dir))
+    monkeypatch.setenv("WORKCHAIN_SANDBOX_ROOT", str(sandbox_root))
+    secret = "sk-live-should-stay-hidden"
+    client = TestClient(create_app(), raise_server_exceptions=False)
+
+    with patch("app.main._fetch_index_data", side_effect=RuntimeError(f"boom {secret} traceback")):
+        with client:
+            response = client.get("/")
+
+    assert response.status_code == 500
+    assert "Internal Server Error" in response.text
+    assert "traceback" not in response.text.lower()
+    assert secret not in response.text
 
 
 def test_startup_auto_generates_demo_data_when_directory_missing(tmp_path, monkeypatch):
@@ -3457,7 +3492,9 @@ def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monk
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert detail_response.status_code == 200
-    assert "机器提取 · DashScope / vanchin/deepseek-ocr" in detail_response.text
+    assert "机器提取" in detail_response.text
+    assert "DashScope" not in detail_response.text
+    assert "vanchin/deepseek-ocr" not in detail_response.text
 
 
 def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monkeypatch):
@@ -3473,6 +3510,7 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
                 create_response = _upload_png(client, filename="diag-off.png")
                 evidence_id = create_response.json()["evidence_id"]
                 detail_response = client.get(f"/evidence/{evidence_id}")
+                llm_diag_response = client.get("/api/diag/llm")
                 diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
                 ocr_diag_response = client.get("/api/diag/ocr")
                 ark_response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
@@ -3480,8 +3518,17 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
 
     assert detail_response.status_code == 200
     assert "解析诊断" not in detail_response.text
+    assert "Doubao Ark" not in detail_response.text
+    assert "DeepSeek" not in detail_response.text
+    assert "Parser v" not in detail_response.text
+    assert "Run ID" not in detail_response.text
+    assert "HTTP status" not in detail_response.text
+    assert "latency" not in detail_response.text
+    assert "timeout" not in detail_response.text
+    assert "preflight" not in detail_response.text
     assert "用 Ark Vision 实验解析" not in detail_response.text
     assert "测试 DeepSeek 连接" not in detail_response.text
+    assert llm_diag_response.status_code == 404
     assert diag_response.status_code == 404
     assert ocr_diag_response.status_code == 404
     assert ark_response.status_code == 404

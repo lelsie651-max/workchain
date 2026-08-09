@@ -36,7 +36,7 @@
             <div class="mt-4 space-y-3">
                 {% for fact in group.fact_items %}
                 <div class="rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-3 text-sm leading-7 text-slate-100">
-                    <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type }}</p>
+                    <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
                     <p class="mt-1">{{ fact.content }}</p>
                 </div>
                 {% endfor %}
