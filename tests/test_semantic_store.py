@@ -13,6 +13,7 @@ from evidence_core.semantic_store import (
     SemanticStoreError,
     confirm_fact,
     create_event,
+    create_event_change_run,
     create_event_match_run,
     create_fact,
     create_interpretation,
@@ -20,15 +21,18 @@ from evidence_core.semantic_store import (
     create_submission,
     correct_relative_due_dates_by_user,
     correct_fact_by_user,
+    get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
     get_semantic_run,
     get_latest_semantic_run_for_evidence,
     list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
+    mark_event_change_run_failed,
     mark_event_match_run_failed,
     mark_semantic_run_failed,
     mark_semantic_run_succeeded,
+    persist_event_change_run_result,
     persist_event_match_run_result,
     persist_semantic_run_result,
     review_event_match_run_by_user,
@@ -1878,6 +1882,109 @@ def test_event_match_run_lifecycle_failed_and_supersedes_history(db_file, blobs_
     assert latest["event_match_run_id"] == "mrun-2"
 
 
+def test_event_change_run_lifecycle_dedupes_duplicates_and_tracks_latest_succeeded(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="事项一", created_at=1, updated_at=1)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="5月1日：采用方案A。", captured_at=1)
+    _append_text(conn, blobs_root, evidence_id="ev-2", text="5月6日：我之前要求的是方案B。", captured_at=2)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[
+            {"evidence_id": "ev-1", "position": 0},
+            {"evidence_id": "ev-2", "position": 1},
+        ],
+        created_at=10,
+    )
+    persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "request",
+                "content": "张三要求采用方案A。",
+                "event_id": "evt-1",
+                "event_assignment": "confirmed",
+                "evidence_ids": ["ev-1"],
+                "created_at": 11,
+                "updated_at": 11,
+            },
+            {
+                "fact_id": "fact-2",
+                "fact_type": "statement",
+                "content": "张三表示我之前要求的是方案B。",
+                "event_id": "evt-1",
+                "event_assignment": "confirmed",
+                "evidence_ids": ["ev-2"],
+                "created_at": 12,
+                "updated_at": 12,
+            },
+        ],
+        interpretations=[],
+        completed_at=13,
+    )
+
+    first = create_event_change_run(
+        conn,
+        change_run_id="crun-1",
+        event_id="evt-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        detector_version="1.0",
+        created_at=20,
+    )
+    failed = mark_event_change_run_failed(
+        conn,
+        change_run_id=first["change_run_id"],
+        failure_type="provider_timeout",
+        completed_at=21,
+    )
+    second = create_event_change_run(
+        conn,
+        change_run_id="crun-2",
+        event_id="evt-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        detector_version="1.0",
+        created_at=22,
+    )
+    persisted = persist_event_change_run_result(
+        conn,
+        change_run_id=second["change_run_id"],
+        event_id="evt-1",
+        changes=[
+            {
+                "change_type": "contradiction",
+                "earlier_fact_id": "fact-1",
+                "later_fact_id": "fact-2",
+                "summary": "前后记录对之前要求的方案表述不一致。",
+                "confidence": 0.91,
+            },
+            {
+                "change_type": "contradiction",
+                "earlier_fact_id": "fact-1",
+                "later_fact_id": "fact-2",
+                "summary": "重复记录不应再次保存。",
+                "confidence": 0.4,
+            },
+        ],
+        completed_at=23,
+    )
+
+    latest = get_latest_event_change_run_for_event(conn, "evt-1")
+
+    assert failed["status"] == "failed"
+    assert failed["failure_type"] == "provider_timeout"
+    assert persisted["status"] == "succeeded"
+    assert len(persisted["changes"]) == 1
+    assert persisted["changes"][0]["change_type"] == "contradiction"
+    assert latest["change_run_id"] == "crun-2"
+
+
 def test_event_match_operations_keep_verify_chain_clean(db_file, blobs_root):
     conn = init_db(db_file)
     _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
@@ -1937,6 +2044,82 @@ def test_event_match_operations_keep_verify_chain_clean(db_file, blobs_root):
         },
         facts=persisted["facts"],
         completed_at=15,
+    )
+    after = verify_chain(conn, blobs_root=blobs_root)
+
+    assert before == (True, None, None)
+    assert after == (True, None, None)
+
+
+def test_event_change_operations_keep_verify_chain_clean(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="事件一", created_at=10)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[
+            {"evidence_id": "ev-1", "position": 0},
+            {"evidence_id": "ev-2", "position": 1},
+        ],
+        created_at=11,
+    )
+    persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "request",
+                "content": "先做方案A。",
+                "event_id": "evt-1",
+                "event_assignment": "confirmed",
+                "evidence_ids": ["ev-1"],
+                "created_at": 12,
+                "updated_at": 12,
+            },
+            {
+                "fact_id": "fact-2",
+                "fact_type": "request",
+                "content": "改成方案B。",
+                "event_id": "evt-1",
+                "event_assignment": "confirmed",
+                "evidence_ids": ["ev-2"],
+                "created_at": 13,
+                "updated_at": 13,
+            },
+        ],
+        interpretations=[],
+        completed_at=14,
+    )
+
+    before = verify_chain(conn, blobs_root=blobs_root)
+    change_run = create_event_change_run(
+        conn,
+        event_id="evt-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        detector_version="1.0",
+        created_at=15,
+    )
+    persist_event_change_run_result(
+        conn,
+        change_run_id=change_run["change_run_id"],
+        event_id="evt-1",
+        changes=[
+            {
+                "change_type": "requirement_change",
+                "earlier_fact_id": "fact-1",
+                "later_fact_id": "fact-2",
+                "summary": "要求从方案A改为方案B。",
+                "confidence": 0.89,
+            }
+        ],
+        completed_at=16,
     )
     after = verify_chain(conn, blobs_root=blobs_root)
 

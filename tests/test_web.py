@@ -169,6 +169,70 @@ def _semantic_result(
     }
 
 
+def _insert_text_evidence(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    seq: int,
+    raw_text: str,
+    source_hint: str,
+    occurred_at: int,
+    captured_at: int | None = None,
+) -> None:
+    captured_at = occurred_at if captured_at is None else captured_at
+    content_hash = compute_content_hash(raw_text.encode("utf-8"))
+    prev_hash = compute_content_hash(f"prev:{evidence_id}".encode("utf-8"))
+    chain_hash = compute_content_hash(f"chain:{evidence_id}".encode("utf-8"))
+    conn.execute(
+        """
+        INSERT INTO evidence (
+            evidence_id, seq, thread_id, kind, media_type, blob_path, raw_text, source_hint,
+            slot_requester, slot_owner, slot_deliverable, slot_due, slot_due_raw, slot_direction,
+            slots_filled, plain_summary, caveats, occurred_at, captured_at,
+            content_hash, prev_hash, chain_hash
+        ) VALUES (?, ?, NULL, 'reference', 'text', NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, '[]', ?, ?, ?, ?, ?)
+        """,
+        (
+            evidence_id,
+            seq,
+            raw_text,
+            source_hint,
+            occurred_at,
+            captured_at,
+            content_hash,
+            prev_hash,
+            chain_hash,
+        ),
+    )
+
+
+def _insert_event_fact(
+    conn: sqlite3.Connection,
+    *,
+    fact_id: str,
+    event_id: str,
+    evidence_id: str,
+    fact_type: str,
+    content: str,
+    occurred_at: int,
+    created_at: int,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO facts (
+            fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw, due_anchor_at,
+            confidence, event_assignment, event_assignment_confidence, origin, review_status,
+            semantic_run_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0.9, 'confirmed', NULL, 'ai', 'unreviewed', NULL, ?, ?)
+        """,
+        (fact_id, event_id, fact_type, content, occurred_at, created_at, created_at),
+    )
+    conn.execute(
+        "INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)",
+        (fact_id, evidence_id),
+    )
+
+
 def test_healthz_returns_ok_and_evidence_count_18(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
@@ -5441,6 +5505,430 @@ def test_event_assignment_confirmation_creates_event_and_marks_completed(tmp_pat
     finally:
         conn.close()
 
+
+def test_event_change_detection_auto_assignment_renders_contradiction_and_scopes_to_same_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "statement",
+                "content": "张三表示“我之前要求的是方案B。”",
+                "actors": [{"name": "张三", "role": "speaker"}],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": "2026-05-06",
+                "confidence": 0.94,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.95,
+                "reason": "延续同一件事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+    captured: dict[str, object] = {}
+
+    def fake_detect(event_id: str, facts: list[dict[str, object]]) -> dict[str, object]:
+        captured["event_id"] = event_id
+        captured["fact_contents"] = [str(item["content"]) for item in facts]
+        later_fact = next(item for item in facts if "方案B" in str(item["content"]))
+        return {
+            "result": {
+                "changes": [
+                    {
+                        "change_type": "contradiction",
+                        "earlier_fact_id": "fact-old",
+                        "later_fact_id": later_fact["fact_id"],
+                        "summary": "较早记录明确是方案A，较新记录回述为方案B。",
+                        "confidence": 0.93,
+                    }
+                ]
+            },
+            "diagnostic": {"success": True, "stage": "success"},
+        }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES ('evt-1', '方案讨论', 'active', NULL, 1, 1)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES ('evt-2', '无关事项', 'active', NULL, 2, 2)
+                """
+            )
+            _insert_text_evidence(
+                conn,
+                evidence_id="ev-old",
+                seq=101,
+                raw_text="5月1日：张三要求采用方案A。",
+                source_hint="飞书-项目群",
+                occurred_at=1_714_518_400_000,
+            )
+            _insert_text_evidence(
+                conn,
+                evidence_id="ev-other",
+                seq=102,
+                raw_text="这是另一件完全无关的事项。",
+                source_hint="飞书-项目群",
+                occurred_at=1_714_604_800_000,
+            )
+            _insert_event_fact(
+                conn,
+                fact_id="fact-old",
+                event_id="evt-1",
+                evidence_id="ev-old",
+                fact_type="request",
+                content="张三要求采用方案A。",
+                occurred_at=1_714_518_400_000,
+                created_at=11,
+            )
+            _insert_event_fact(
+                conn,
+                fact_id="fact-other",
+                event_id="evt-2",
+                evidence_id="ev-other",
+                fact_type="statement",
+                content="别的事项不应参与比较。",
+                occurred_at=1_714_604_800_000,
+                created_at=12,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                with patch("app.main.change_detector.detect_changes_diagnostic_result", side_effect=fake_detect):
+                    create_response = client.post(
+                        "/api/evidence",
+                        json={"text": "张三表示我之前要求的是方案B。", "source": "飞书", "source_detail": "项目群"},
+                    )
+                    new_evidence_id = create_response.json()["evidence_id"]
+                    event_response = client.get("/event/evt-1")
+
+    assert create_response.status_code == 200
+    assert captured["event_id"] == "evt-1"
+    assert "别的事项不应参与比较。" not in captured["fact_contents"]
+    assert event_response.status_code == 200
+    assert "这件事发生过这些变化" in event_response.text
+    assert "前后记录存在不一致" in event_response.text
+    assert "张三要求采用方案A。" in event_response.text
+    assert "张三表示“我之前要求的是方案B。”" in event_response.text
+    assert 'href="/evidence/ev-old"' in event_response.text
+    assert f'href="/evidence/{new_evidence_id}"' in event_response.text
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        change_run = conn.execute(
+            """
+            SELECT status
+            FROM event_change_runs
+            WHERE event_id = 'evt-1'
+            ORDER BY created_at DESC, change_run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+    assert change_run["status"] == "succeeded"
+
+
+def test_event_change_detection_skips_single_evidence_events(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请做A。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.88,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "做A",
+                "confidence": 0.91,
+                "reason": "新事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with patch("app.main.change_detector.detect_changes_diagnostic_result") as mock_detector:
+                with client:
+                    create_response = client.post(
+                        "/api/evidence",
+                        json={"text": "请做A。", "source": "飞书", "source_detail": "项目群"},
+                    )
+
+    assert create_response.status_code == 200
+    mock_detector.assert_not_called()
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        change_run_count = conn.execute("SELECT COUNT(*) AS count FROM event_change_runs").fetchone()["count"]
+    finally:
+        conn.close()
+    assert change_run_count == 0
+
+
+def test_event_change_detection_failure_does_not_break_auto_assignment(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "deadline_change",
+                "content": "改成周三交。",
+                "actors": [],
+                "due_raw": "周三",
+                "due_date": "2026-05-06",
+                "due_anchor_date": "2026-05-03",
+                "occurred_date": "2026-05-03",
+                "confidence": 0.9,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.95,
+                "reason": "延续旧事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES ('evt-1', '截止时间跟进', 'active', NULL, 1, 1)
+                """
+            )
+            _insert_text_evidence(
+                conn,
+                evidence_id="ev-old",
+                seq=201,
+                raw_text="5月1日：周五交。",
+                source_hint="飞书-项目群",
+                occurred_at=1_714_518_400_000,
+            )
+            _insert_event_fact(
+                conn,
+                fact_id="fact-old",
+                event_id="evt-1",
+                evidence_id="ev-old",
+                fact_type="deadline_change",
+                content="周五交。",
+                occurred_at=1_714_518_400_000,
+                created_at=11,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                with patch(
+                    "app.main.change_detector.detect_changes_diagnostic_result",
+                    return_value={"result": None, "diagnostic": {"success": False, "stage": "timeout"}},
+                ):
+                    create_response = client.post(
+                        "/api/evidence",
+                        json={"text": "改成周三交。", "source": "飞书", "source_detail": "项目群"},
+                    )
+                    event_response = client.get("/event/evt-1")
+
+    assert create_response.status_code == 200
+    assert event_response.status_code == 200
+    assert "这件事发生过这些变化" not in event_response.text
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        parse_status = conn.execute(
+            "SELECT value FROM meta WHERE key LIKE 'parse_status:%' ORDER BY key DESC LIMIT 1"
+        ).fetchone()["value"]
+        fact_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM facts WHERE event_id = 'evt-1'"
+        ).fetchone()["count"]
+        change_run = conn.execute(
+            """
+            SELECT status, failure_type
+            FROM event_change_runs
+            WHERE event_id = 'evt-1'
+            ORDER BY created_at DESC, change_run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert parse_status == "done"
+    assert fact_count == 2
+    assert change_run["status"] == "failed"
+    assert change_run["failure_type"] == "provider_timeout"
+
+
+def test_event_change_detection_runs_after_user_confirmation_and_renders_deadline_change(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "deadline_change",
+                "content": "改成周三交。",
+                "actors": [],
+                "due_raw": "周三",
+                "due_date": "2026-05-06",
+                "due_anchor_date": "2026-05-03",
+                "occurred_date": "2026-05-03",
+                "confidence": 0.91,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    def fake_detect(event_id: str, facts: list[dict[str, object]]) -> dict[str, object]:
+        new_fact = next(item for item in facts if "周三" in str(item["content"]))
+        return {
+            "result": {
+                "changes": [
+                    {
+                        "change_type": "deadline_change",
+                        "earlier_fact_id": "fact-old",
+                        "later_fact_id": new_fact["fact_id"],
+                        "summary": "截止时间从周五调整到周三。",
+                        "confidence": 0.9,
+                    }
+                ]
+            },
+            "diagnostic": {"success": True, "stage": "success"},
+        }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES ('evt-1', '交付时间确认', 'active', NULL, 1, 1)
+                """
+            )
+            _insert_text_evidence(
+                conn,
+                evidence_id="ev-old",
+                seq=301,
+                raw_text="5月1日：周五交。",
+                source_hint="飞书-项目群",
+                occurred_at=1_714_518_400_000,
+            )
+            _insert_event_fact(
+                conn,
+                fact_id="fact-old",
+                event_id="evt-1",
+                evidence_id="ev-old",
+                fact_type="deadline_change",
+                content="周五交。",
+                occurred_at=1_714_518_400_000,
+                created_at=11,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "改成周三交。", "source": "飞书", "source_detail": "项目群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+
+        conn = init_db(db_path)
+        try:
+            match_run_id = conn.execute(
+                """
+                SELECT event_match_run_id
+                FROM event_match_runs
+                ORDER BY created_at DESC, event_match_run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()["event_match_run_id"]
+        finally:
+            conn.close()
+
+        with patch("app.main.change_detector.detect_changes_diagnostic_result", side_effect=fake_detect):
+            confirm_response = client.post(
+                f"/api/evidence/{evidence_id}/event-assignment",
+                json={
+                    "event_match_run_id": match_run_id,
+                    "groups": [
+                        {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+                    ],
+                },
+            )
+            event_response = client.get("/event/evt-1")
+
+    assert create_response.status_code == 200
+    assert confirm_response.status_code == 200
+    assert event_response.status_code == 200
+    assert "这件事发生过这些变化" in event_response.text
+    assert "截止时间发生变化" in event_response.text
+    assert "需要注意：截止时间从周五调整到周三。" in event_response.text
+    assert 'href="/evidence/ev-old"' in event_response.text
+    assert f'href="/evidence/{evidence_id}"' in event_response.text
 
 def test_event_assignment_confirmation_rejects_tampered_fact_ids(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -422,6 +422,60 @@ def _create_v8_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _create_v9_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS event_change_runs (
+            change_run_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            detector_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            failure_type TEXT,
+            FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE RESTRICT
+        );
+
+        CREATE TABLE IF NOT EXISTS event_changes (
+            change_id TEXT PRIMARY KEY,
+            change_run_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            change_type TEXT NOT NULL CHECK (
+                change_type IN (
+                    'requirement_change',
+                    'deadline_change',
+                    'responsibility_change',
+                    'contradiction'
+                )
+            ),
+            earlier_fact_id TEXT NOT NULL,
+            later_fact_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (change_run_id) REFERENCES event_change_runs(change_run_id) ON DELETE RESTRICT,
+            FOREIGN KEY (event_id) REFERENCES events(event_id) ON DELETE RESTRICT,
+            FOREIGN KEY (earlier_fact_id) REFERENCES facts(fact_id) ON DELETE RESTRICT,
+            FOREIGN KEY (later_fact_id) REFERENCES facts(fact_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_change_runs_event_id
+            ON event_change_runs(event_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_event_changes_change_run_id
+            ON event_changes(change_run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_event_changes_event_id
+            ON event_changes(event_id);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_event_changes_run_tuple
+            ON event_changes(change_run_id, change_type, earlier_fact_id, later_fact_id);
+        """
+    )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -493,6 +547,11 @@ def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 8)
 
 
+def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    _create_v9_schema(conn)
+    _set_schema_version(conn, 9)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -520,6 +579,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v6_schema(conn)
         _create_v7_schema(conn)
         _create_v8_schema(conn)
+        _create_v9_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -540,6 +600,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -549,6 +610,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -558,6 +620,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 4:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -567,6 +630,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 5:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -576,6 +640,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 6:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -585,6 +650,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v6_schema(conn)
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 7:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -594,6 +660,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v6_schema(conn)
         _create_v7_schema(conn)
         _migrate_v7_to_v8(conn)
+        _migrate_v8_to_v9(conn)
     elif schema_version == 8:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -603,6 +670,17 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v6_schema(conn)
         _create_v7_schema(conn)
         _create_v8_schema(conn)
+        _migrate_v8_to_v9(conn)
+    elif schema_version == 9:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
+        _create_v5_schema(conn)
+        _create_v6_schema(conn)
+        _create_v7_schema(conn)
+        _create_v8_schema(conn)
+        _create_v9_schema(conn)
     else:
         conn.close()
         raise ValueError(

@@ -608,6 +608,10 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
 - Event 详情页现已升级为 Competition Event Control Center V1:可修改事项名称、纠正 Fact 的 `content / fact_type / due_at`、直接补/改相关 Evidence 的记录日期,并通过受控接口切换 `active <-> resolved`
 - Event 详情页的原始 Evidence 改为事项级集中展示:在 header/action 区之后先渲染 `相关原始记录`,按当前 Event 全部 Facts 关联到的 `evidence_id` 去重后展示图片缩略图/文字摘要/文件信息,再进入弱化说明文字与 Facts 时间线;Fact 卡内不再重复渲染"支撑它的原始证据"
+- Event Change Detection V1 是独立的 semantic derived layer:只比较同一 Event 内、来自不同 Evidence 的历史 Facts,每次最多取最近 20 条并保持时间顺序,识别 `requirement_change / deadline_change / responsibility_change / contradiction` 四类中立差异
+- Event Change Detection 结果单独保存到 `event_change_runs / event_changes`,只保留较早 Fact、较新 Fact、change type、summary 与 confidence,不保存模型原始 response,也不把结果写入 Evidence hash chain
+- Event Change Detection 的触发点仅限两处:新 Fact 自动归入既有 Event 后,以及用户确认归属后使某 Event 拥有来自至少 2 个 Evidence 的 Facts;若 Event 只有一个 Evidence,则不调用 detector;detector 失败只记录 failed run,不影响 Semantic Parse、Event assignment 与 Fact 主流程
+- Event 详情页在 `相关原始记录` 之后、Facts 之前可追加 `这件事发生过这些变化` 区块,只展示 latest succeeded change run,每条 change 必须能回溯到较早/较新两个 Fact 及其原始 Evidence;没有可靠 changes 时不渲染空卡片
 - Event 页 Fact 纠正必须走 `correct_fact_by_user(...)`;只允许修改语义字段,不得改 `fact_id / semantic_run_id / Evidence` 关联,写入后统一标记 `origin=user / review_status=corrected` 并更新 `events.updated_at`
 - Evidence 详情页改为单列阅读流,顺序固定为:记录标题/来源/时间与轻量 badge -> 原始材料 -> 事项归属(如有) -> `AI 整理` -> 真 legacy 记录的兼容编辑(如有) -> `记录信息` 折叠区 -> diagnostics(仅 dev-only);不再使用"解析结果 / 保存与校验"并列双栏
 - Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,位置固定在原始材料之后、`AI 整理` 之前,并与首页共用同一服务端确认写入逻辑;完成后展示最终事项归属结果

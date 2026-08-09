@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import event_matcher, llm, ocr, semantic_llm, vision_provider
+from app import change_detector, event_matcher, llm, ocr, semantic_llm, vision_provider
 from app.ai_provider import (
     build_text_config_diagnostic,
     diagnose_deepseek_text_preflight,
@@ -61,18 +61,22 @@ from evidence_core.extraction_store import create_extraction, get_latest_extract
 from evidence_core.semantic_store import (
     ProtectedFactError,
     SemanticStoreError,
+    create_event_change_run,
     create_semantic_run,
     create_event_match_run,
     correct_fact_by_user,
     correct_relative_due_dates_by_user,
+    get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
     get_latest_event_match_for_semantic_run,
     get_latest_semantic_run_for_evidence,
     list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
+    mark_event_change_run_failed,
     mark_event_match_run_failed,
     mark_semantic_run_failed,
+    persist_event_change_run_result,
     persist_event_match_run_result,
     persist_semantic_run_result,
     review_event_match_run_by_user,
@@ -1275,6 +1279,131 @@ def _event_matcher_fact_payload(conn: sqlite3.Connection, facts: list[dict[str, 
     return payloads
 
 
+def _event_change_fact_payload(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+
+    fact_rows = conn.execute(
+        """
+        WITH recent_facts AS (
+            SELECT
+                f.fact_id,
+                f.fact_type,
+                f.content,
+                f.occurred_at,
+                f.created_at,
+                f.due_at,
+                f.due_raw,
+                (
+                    SELECT fe.evidence_id
+                    FROM fact_evidence fe
+                    JOIN evidence e ON e.evidence_id = fe.evidence_id
+                    WHERE fe.fact_id = f.fact_id
+                    ORDER BY e.seq ASC, e.evidence_id ASC
+                    LIMIT 1
+                ) AS evidence_id
+            FROM facts f
+            WHERE f.event_id = ?
+            ORDER BY COALESCE(f.occurred_at, f.created_at) DESC, f.created_at DESC, f.fact_id DESC
+            LIMIT ?
+        )
+        SELECT *
+        FROM recent_facts
+        ORDER BY COALESCE(occurred_at, created_at) ASC, created_at ASC, fact_id ASC
+        """,
+        (event_id, limit),
+    ).fetchall()
+
+    payloads: list[dict[str, Any]] = []
+    for row in fact_rows:
+        actor_rows = conn.execute(
+            """
+            SELECT a.canonical_name, fa.role
+            FROM fact_actors fa
+            JOIN actors a ON a.actor_id = fa.actor_id
+            WHERE fa.fact_id = ?
+            ORDER BY fa.role ASC, a.canonical_name ASC
+            """,
+            (row["fact_id"],),
+        ).fetchall()
+        evidence_id = row["evidence_id"]
+        if evidence_id is None:
+            continue
+        payloads.append(
+            {
+                "fact_id": row["fact_id"],
+                "fact_type": row["fact_type"],
+                "content": row["content"],
+                "occurred_at": row["occurred_at"],
+                "due_at": row["due_at"],
+                "due_raw": row["due_raw"],
+                "occurred_date": _format_datetime(row["occurred_at"], "%Y-%m-%d"),
+                "due_date": _format_datetime(row["due_at"], "%Y-%m-%d"),
+                "evidence_id": evidence_id,
+                "actors": [
+                    {"name": actor_row["canonical_name"], "role": actor_row["role"]}
+                    for actor_row in actor_rows
+                ],
+            }
+        )
+    return payloads
+
+
+def _maybe_run_event_change_detection(conn: sqlite3.Connection, event_id: str) -> None:
+    fact_payloads = _event_change_fact_payload(conn, event_id, limit=20)
+    evidence_ids = {item["evidence_id"] for item in fact_payloads if item.get("evidence_id")}
+    if len(fact_payloads) < 2 or len(evidence_ids) < 2:
+        return
+
+    change_run = None
+    try:
+        change_run = create_event_change_run(
+            conn,
+            event_id=event_id,
+            provider="deepseek",
+            model=get_text_model(),
+            detector_version=change_detector.CHANGE_DETECTOR_VERSION,
+        )
+        detection = change_detector.detect_changes_diagnostic_result(event_id, fact_payloads)
+        if detection["result"] is None:
+            mark_event_change_run_failed(
+                conn,
+                change_run_id=change_run["change_run_id"],
+                failure_type=change_detector.change_failure_type_from_diagnostic(detection["diagnostic"]),
+            )
+            return
+        persist_event_change_run_result(
+            conn,
+            change_run_id=change_run["change_run_id"],
+            event_id=event_id,
+            changes=detection["result"]["changes"],
+        )
+    except Exception:
+        if change_run is not None:
+            try:
+                mark_event_change_run_failed(
+                    conn,
+                    change_run_id=change_run["change_run_id"],
+                    failure_type="persistence_error",
+                )
+            except Exception:
+                pass
+
+
+def _event_change_type_label(change_type: str) -> str:
+    return {
+        "requirement_change": "要求发生变化",
+        "deadline_change": "截止时间发生变化",
+        "responsibility_change": "负责人发生变化",
+        "contradiction": "前后记录存在不一致",
+    }.get(change_type, "记录发生变化")
+
+
 def _export_timestamp() -> str:
     return datetime.now().strftime("%Y%m%d-%H%M")
 
@@ -2040,7 +2169,7 @@ def _run_parse_pipeline(
                 )
                 if normalized_match is None:
                     raise ValueError("matcher returned no normalized result")
-                persist_event_match_run_result(
+                stored_match = persist_event_match_run_result(
                     conn,
                     event_match_run_id=event_match_run["event_match_run_id"],
                     semantic_run_id=semantic_run_id,
@@ -2048,6 +2177,15 @@ def _run_parse_pipeline(
                     normalized_match=normalized_match,
                     facts=persisted["facts"],
                 )
+                if stored_match["routing_mode"] == "auto":
+                    groups = stored_match.get("result", {}).get("groups") or []
+                    target_event_ids = {
+                        group.get("event_id")
+                        for group in groups
+                        if group.get("target") in {"existing", "new"} and group.get("event_id")
+                    }
+                    for target_event_id in target_event_ids:
+                        _maybe_run_event_change_detection(conn, target_event_id)
             except ProtectedFactError:
                 mark_event_match_run_failed(
                     conn,
@@ -2733,10 +2871,26 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
 
     fact_rows = conn.execute(
         """
-        SELECT fact_id, fact_type, content, occurred_at, created_at, due_at, origin, review_status
-        FROM facts
-        WHERE event_id = ?
-        ORDER BY COALESCE(occurred_at, created_at) ASC, created_at ASC, fact_id ASC
+        SELECT
+            f.fact_id,
+            f.fact_type,
+            f.content,
+            f.occurred_at,
+            f.created_at,
+            f.due_at,
+            f.origin,
+            f.review_status,
+            (
+                SELECT fe.evidence_id
+                FROM fact_evidence fe
+                JOIN evidence e ON e.evidence_id = fe.evidence_id
+                WHERE fe.fact_id = f.fact_id
+                ORDER BY e.seq ASC, e.evidence_id ASC
+                LIMIT 1
+            ) AS evidence_id
+        FROM facts f
+        WHERE f.event_id = ?
+        ORDER BY COALESCE(f.occurred_at, f.created_at) ASC, f.created_at ASC, f.fact_id ASC
         """,
         (event_id,),
     ).fetchall()
@@ -2765,12 +2919,49 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
                 "due_date_value": _format_datetime(row["due_at"], "%Y-%m-%d"),
                 "origin": row["origin"],
                 "review_status": row["review_status"],
+                "evidence_id": row["evidence_id"],
                 "occurred_at_text": _format_datetime(
                     row["occurred_at"] if row["occurred_at"] is not None else row["created_at"],
                     "%m-%d %H:%M",
                 ),
             }
         )
+
+    facts_by_id = {fact["fact_id"]: fact for fact in facts}
+    latest_change_run = get_latest_event_change_run_for_event(conn, event_id, status="succeeded")
+    event_changes: list[dict[str, Any]] = []
+    if latest_change_run is not None:
+        for item in latest_change_run.get("changes", []):
+            earlier_fact = facts_by_id.get(item["earlier_fact_id"])
+            later_fact = facts_by_id.get(item["later_fact_id"])
+            if earlier_fact is None or later_fact is None:
+                continue
+            event_changes.append(
+                {
+                    "change_type": item["change_type"],
+                    "title": _event_change_type_label(item["change_type"]),
+                    "summary": item["summary"],
+                    "is_contradiction": item["change_type"] == "contradiction",
+                    "earlier": {
+                        "occurred_at_text": earlier_fact["occurred_at_text"],
+                        "content": earlier_fact["content"],
+                        "href": (
+                            f"/evidence/{earlier_fact['evidence_id']}"
+                            if earlier_fact.get("evidence_id")
+                            else None
+                        ),
+                    },
+                    "later": {
+                        "occurred_at_text": later_fact["occurred_at_text"],
+                        "content": later_fact["content"],
+                        "href": (
+                            f"/evidence/{later_fact['evidence_id']}"
+                            if later_fact.get("evidence_id")
+                            else None
+                        ),
+                    },
+                }
+            )
 
     return {
         "event": {
@@ -2785,6 +2976,7 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
             "updated_at_text": _format_datetime(event_row["updated_at"], "%m-%d %H:%M"),
         },
         "related_evidence": [build_related_evidence_card(row) for row in related_evidence_rows],
+        "event_changes": event_changes,
         "facts": facts,
         "fact_type_options": _event_fact_type_options(),
     }
@@ -3543,6 +3735,18 @@ def create_app() -> FastAPI:
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            affected_event_rows = conn.execute(
+                """
+                SELECT DISTINCT event_id
+                FROM facts
+                WHERE semantic_run_id = ?
+                  AND event_id IS NOT NULL
+                ORDER BY event_id ASC
+                """,
+                (reviewed_run["semantic_run_id"],),
+            ).fetchall()
+            for row in affected_event_rows:
+                _maybe_run_event_change_detection(conn, row["event_id"])
             return JSONResponse(
                 {
                     "event_match_run_id": reviewed_run["event_match_run_id"],
@@ -3976,6 +4180,7 @@ def create_app() -> FastAPI:
                 "page_title": context["event"]["title"],
                 "event": context["event"],
                 "related_evidence": context["related_evidence"],
+                "event_changes": context["event_changes"],
                 "facts": context["facts"],
                 "fact_type_options": context["fact_type_options"],
                 "current_search_q": "",

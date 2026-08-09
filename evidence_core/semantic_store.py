@@ -18,6 +18,12 @@ _FACT_MUTABLE_FIELDS = (
     "due_anchor_at",
 )
 MAX_EVENT_TITLE_LENGTH = 120
+EVENT_CHANGE_TYPES = {
+    "requirement_change",
+    "deadline_change",
+    "responsibility_change",
+    "contradiction",
+}
 
 
 class SemanticStoreError(ValueError):
@@ -59,6 +65,15 @@ def _coerce_required_text(name: str, value: Any) -> str:
     normalized = _coerce_optional_text(value)
     if normalized is None:
         raise SemanticStoreError(f"{name} must be a non-empty string")
+    return normalized
+
+
+def _coerce_probability(name: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise SemanticStoreError(f"{name} must be a number between 0 and 1")
+    normalized = float(value)
+    if normalized < 0.0 or normalized > 1.0:
+        raise SemanticStoreError(f"{name} must be between 0 and 1")
     return normalized
 
 
@@ -340,6 +355,27 @@ def _load_event_match_run(conn: sqlite3.Connection, event_match_run_id: str) -> 
     return result
 
 
+def _load_event_change_run(conn: sqlite3.Connection, change_run_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM event_change_runs WHERE change_run_id = ?",
+        (change_run_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"event change run not found: {change_run_id}")
+    result = dict(row)
+    change_rows = conn.execute(
+        """
+        SELECT *
+        FROM event_changes
+        WHERE change_run_id = ?
+        ORDER BY created_at ASC, change_id ASC
+        """,
+        (change_run_id,),
+    ).fetchall()
+    result["changes"] = [dict(change_row) for change_row in change_rows]
+    return result
+
+
 def _touch_event_updated_at(
     conn: sqlite3.Connection,
     *,
@@ -462,6 +498,48 @@ def _normalize_review_decisions(
     return normalized
 
 
+def _normalize_event_changes_for_storage(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    changes: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized_changes: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for item in changes:
+        if not isinstance(item, Mapping):
+            raise SemanticStoreError("each event change must be an object")
+        change_type = _coerce_required_text("change_type", item.get("change_type"))
+        if change_type not in EVENT_CHANGE_TYPES:
+            raise SemanticStoreError("event change_type is invalid")
+        earlier_fact_id = _coerce_required_text("earlier_fact_id", item.get("earlier_fact_id"))
+        later_fact_id = _coerce_required_text("later_fact_id", item.get("later_fact_id"))
+        if earlier_fact_id == later_fact_id:
+            raise SemanticStoreError("event change must reference two different facts")
+        summary = _coerce_required_text("summary", item.get("summary"))
+        confidence = _coerce_probability("confidence", item.get("confidence"))
+
+        earlier_fact = _get_fact_row(conn, earlier_fact_id)
+        later_fact = _get_fact_row(conn, later_fact_id)
+        if earlier_fact["event_id"] != event_id or later_fact["event_id"] != event_id:
+            raise SemanticStoreError("event change facts must belong to the same event")
+
+        dedupe_key = (change_type, earlier_fact_id, later_fact_id)
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        normalized_changes.append(
+            {
+                "change_type": change_type,
+                "earlier_fact_id": earlier_fact_id,
+                "later_fact_id": later_fact_id,
+                "summary": summary,
+                "confidence": confidence,
+            }
+        )
+    return normalized_changes
+
+
 def _load_fact(conn: sqlite3.Connection, fact_id: str) -> dict[str, Any]:
     fact = _get_fact_row(conn, fact_id)
     evidence_rows = conn.execute(
@@ -562,6 +640,28 @@ def get_latest_event_match_for_semantic_run(
     if row is None:
         return None
     return _load_event_match_run(conn, row["event_match_run_id"])
+
+
+def get_latest_event_change_run_for_event(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT change_run_id
+        FROM event_change_runs
+        WHERE event_id = ?
+    """
+    params: list[Any] = [event_id]
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC, change_run_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_event_change_run(conn, row["change_run_id"])
 
 
 def list_event_candidates(
@@ -1350,6 +1450,165 @@ def persist_event_match_run_result(
             ),
         )
         result = _load_event_match_run(conn, event_match_run_id)
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        raise
+
+
+def create_event_change_run(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    provider: str,
+    model: str,
+    detector_version: str,
+    change_run_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    event_id = _coerce_required_text("event_id", event_id)
+    provider = _coerce_required_text("provider", provider)
+    model = _coerce_required_text("model", model)
+    detector_version = _coerce_required_text("detector_version", detector_version)
+    created_at = _now_ms() if created_at is None else created_at
+    change_run_id = change_run_id or _new_id("crun")
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        _ensure_event_exists(conn, event_id)
+        conn.execute(
+            """
+            INSERT INTO event_change_runs (
+                change_run_id, event_id, provider, model, detector_version,
+                status, created_at, completed_at, failure_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                change_run_id,
+                event_id,
+                provider,
+                model,
+                detector_version,
+                "running",
+                created_at,
+                None,
+                None,
+            ),
+        )
+        result = _load_event_change_run(conn, change_run_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def mark_event_change_run_failed(
+    conn: sqlite3.Connection,
+    *,
+    change_run_id: str,
+    failure_type: str | None = None,
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    failure_type = _coerce_optional_text(failure_type)
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        current = _load_event_change_run(conn, change_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("event change run is not running")
+        conn.execute(
+            """
+            UPDATE event_change_runs
+            SET status = ?, failure_type = ?, completed_at = ?
+            WHERE change_run_id = ?
+            """,
+            ("failed", failure_type, completed_at, change_run_id),
+        )
+        result = _load_event_change_run(conn, change_run_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def persist_event_change_run_result(
+    conn: sqlite3.Connection,
+    *,
+    change_run_id: str,
+    event_id: str,
+    changes: Sequence[Mapping[str, Any]],
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
+
+        current = _load_event_change_run(conn, change_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("event change run is not running")
+        if current["event_id"] != event_id:
+            raise SemanticStoreError("event change run event_id does not match")
+
+        normalized_changes = _normalize_event_changes_for_storage(
+            conn,
+            event_id=event_id,
+            changes=changes,
+        )
+        for item in normalized_changes:
+            conn.execute(
+                """
+                INSERT INTO event_changes (
+                    change_id, change_run_id, event_id, change_type,
+                    earlier_fact_id, later_fact_id, summary, confidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _new_id("chg"),
+                    change_run_id,
+                    event_id,
+                    item["change_type"],
+                    item["earlier_fact_id"],
+                    item["later_fact_id"],
+                    item["summary"],
+                    item["confidence"],
+                    completed_at,
+                ),
+            )
+
+        conn.execute(
+            """
+            UPDATE event_change_runs
+            SET status = ?, failure_type = ?, completed_at = ?
+            WHERE change_run_id = ?
+            """,
+            ("succeeded", None, completed_at, change_run_id),
+        )
+        result = _load_event_change_run(conn, change_run_id)
         if started_transaction:
             conn.commit()
         else:
