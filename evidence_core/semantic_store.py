@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 import uuid
@@ -283,6 +284,133 @@ def _load_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[s
     return result
 
 
+def _load_event(conn: sqlite3.Connection, event_id: str) -> dict[str, Any]:
+    row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"event not found: {event_id}")
+    return dict(row)
+
+
+def _decode_event_match_result(value: str | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SemanticStoreError("event_match result_json is invalid") from exc
+    if not isinstance(payload, dict):
+        raise SemanticStoreError("event_match result_json must decode to an object")
+    return payload
+
+
+def _load_event_match_run(conn: sqlite3.Connection, event_match_run_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM event_match_runs WHERE event_match_run_id = ?",
+        (event_match_run_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"event match run not found: {event_match_run_id}")
+    result = dict(row)
+    result["result"] = _decode_event_match_result(result.get("result_json"))
+    return result
+
+
+def _touch_event_updated_at(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    updated_at: int,
+) -> dict[str, Any]:
+    _ensure_event_exists(conn, event_id)
+    conn.execute(
+        "UPDATE events SET updated_at = ? WHERE event_id = ?",
+        (updated_at, event_id),
+    )
+    return _load_event(conn, event_id)
+
+
+def _normalize_event_match_result_for_storage(
+    normalized_match: Mapping[str, Any],
+    *,
+    facts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    groups = normalized_match.get("groups")
+    ambiguities = normalized_match.get("ambiguities")
+    if not isinstance(groups, list):
+        raise SemanticStoreError("event match groups must be a list")
+    if not isinstance(ambiguities, list):
+        raise SemanticStoreError("event match ambiguities must be a list")
+
+    fact_ids_by_index: list[str] = []
+    seen_fact_ids: set[str] = set()
+    for item in facts:
+        fact_id = _coerce_required_text("fact_id", item.get("fact_id"))
+        if fact_id in seen_fact_ids:
+            raise SemanticStoreError("facts must not contain duplicate fact_id")
+        seen_fact_ids.add(fact_id)
+        fact_ids_by_index.append(fact_id)
+
+    normalized_groups: list[dict[str, Any]] = []
+    claimed_fact_ids: set[str] = set()
+    for group in groups:
+        if not isinstance(group, Mapping):
+            raise SemanticStoreError("event match group must be an object")
+        target = _coerce_required_text("target", group.get("target"))
+        if target not in {"existing", "new", "unassigned"}:
+            raise SemanticStoreError("event match group target is invalid")
+        raw_indexes = group.get("fact_indexes")
+        if not isinstance(raw_indexes, list) or not raw_indexes:
+            raise SemanticStoreError("event match group fact_indexes must be a non-empty list")
+
+        fact_ids: list[str] = []
+        seen_indexes: set[int] = set()
+        for raw_index in raw_indexes:
+            if not isinstance(raw_index, int) or isinstance(raw_index, bool):
+                raise SemanticStoreError("event match fact_index must be an integer")
+            if raw_index < 0 or raw_index >= len(fact_ids_by_index):
+                raise SemanticStoreError("event match fact_index is out of range")
+            if raw_index in seen_indexes:
+                raise SemanticStoreError("event match group must not repeat fact_index")
+            seen_indexes.add(raw_index)
+            fact_id = fact_ids_by_index[raw_index]
+            if fact_id in claimed_fact_ids:
+                raise SemanticStoreError("event match fact_id must not belong to multiple groups")
+            claimed_fact_ids.add(fact_id)
+            fact_ids.append(fact_id)
+
+        event_id = _coerce_optional_text(group.get("event_id"))
+        proposed_title = _coerce_optional_text(group.get("proposed_title"))
+        confidence = group.get("confidence")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            confidence = 0.0
+        confidence_value = float(confidence)
+        if confidence_value < 0.0 or confidence_value > 1.0:
+            raise SemanticStoreError("event match confidence must be between 0 and 1")
+        reason = _coerce_optional_text(group.get("reason")) or ""
+
+        normalized_groups.append(
+            {
+                "fact_ids": fact_ids,
+                "target": target,
+                "event_id": event_id,
+                "proposed_title": proposed_title,
+                "confidence": confidence_value,
+                "reason": reason,
+            }
+        )
+
+    normalized_ambiguities: list[str] = []
+    for item in ambiguities:
+        text = _coerce_optional_text(item)
+        if text is not None:
+            normalized_ambiguities.append(text)
+
+    return {
+        "groups": normalized_groups,
+        "ambiguities": normalized_ambiguities,
+    }
+
+
 def _load_fact(conn: sqlite3.Connection, fact_id: str) -> dict[str, Any]:
     fact = _get_fact_row(conn, fact_id)
     evidence_rows = conn.execute(
@@ -341,6 +469,98 @@ def get_latest_semantic_run_for_evidence(
     if row is None:
         return None
     return _load_semantic_run(conn, row["semantic_run_id"])
+
+
+def get_latest_event_match_for_evidence(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT emr.event_match_run_id
+        FROM event_match_runs emr
+        JOIN semantic_run_inputs sri ON sri.semantic_run_id = emr.semantic_run_id
+        WHERE sri.evidence_id = ?
+    """
+    params: list[Any] = [evidence_id]
+    if status is not None:
+        query += " AND emr.status = ?"
+        params.append(status)
+    query += " ORDER BY emr.created_at DESC, emr.event_match_run_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_event_match_run(conn, row["event_match_run_id"])
+
+
+def get_latest_event_match_for_semantic_run(
+    conn: sqlite3.Connection,
+    semantic_run_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT event_match_run_id
+        FROM event_match_runs
+        WHERE semantic_run_id = ?
+        ORDER BY created_at DESC, event_match_run_id DESC
+        LIMIT 1
+        """,
+        (semantic_run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return _load_event_match_run(conn, row["event_match_run_id"])
+
+
+def list_event_candidates(
+    conn: sqlite3.Connection,
+    *,
+    limit_events: int = 30,
+    recent_facts_per_event: int = 6,
+) -> list[dict[str, Any]]:
+    if limit_events <= 0:
+        return []
+    if recent_facts_per_event <= 0:
+        recent_facts_per_event = 0
+
+    event_rows = conn.execute(
+        """
+        SELECT event_id, title, summary, updated_at
+        FROM events
+        WHERE status = 'active'
+        ORDER BY updated_at DESC, event_id DESC
+        LIMIT ?
+        """,
+        (limit_events,),
+    ).fetchall()
+    candidates: list[dict[str, Any]] = []
+    for row in event_rows:
+        recent_facts: list[dict[str, str]] = []
+        if recent_facts_per_event > 0:
+            fact_rows = conn.execute(
+                """
+                SELECT fact_type, content
+                FROM facts
+                WHERE event_id = ?
+                ORDER BY updated_at DESC, created_at DESC, fact_id DESC
+                LIMIT ?
+                """,
+                (row["event_id"], recent_facts_per_event),
+            ).fetchall()
+            recent_facts = [
+                {"fact_type": fact_row["fact_type"], "content": fact_row["content"]}
+                for fact_row in fact_rows
+            ]
+        candidates.append(
+            {
+                "event_id": row["event_id"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "recent_facts": recent_facts,
+            }
+        )
+    return candidates
 
 
 def list_facts_for_semantic_run(
@@ -490,9 +710,11 @@ def create_event(
     created_at = _now_ms() if created_at is None else created_at
     updated_at = created_at if updated_at is None else updated_at
     event_id = event_id or _new_id("evt")
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         conn.execute(
             """
             INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
@@ -501,10 +723,12 @@ def create_event(
             (event_id, normalized_title, status, summary, created_at, updated_at),
         )
         row = conn.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return _row_to_dict(row)
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 
@@ -895,6 +1119,195 @@ def persist_semantic_run_result(
         raise
 
 
+def create_event_match_run(
+    conn: sqlite3.Connection,
+    *,
+    semantic_run_id: str,
+    provider: str,
+    model: str,
+    matcher_version: str,
+    event_match_run_id: str | None = None,
+    created_at: int | None = None,
+    supersedes_run_id: str | None = None,
+) -> dict[str, Any]:
+    semantic_run_id = _coerce_required_text("semantic_run_id", semantic_run_id)
+    provider = _coerce_required_text("provider", provider)
+    model = _coerce_required_text("model", model)
+    matcher_version = _coerce_required_text("matcher_version", matcher_version)
+    supersedes_run_id = _coerce_optional_text(supersedes_run_id)
+    created_at = _now_ms() if created_at is None else created_at
+    event_match_run_id = event_match_run_id or _new_id("mrun")
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        _get_semantic_run_row(conn, semantic_run_id)
+        if supersedes_run_id is not None:
+            _load_event_match_run(conn, supersedes_run_id)
+        conn.execute(
+            """
+            INSERT INTO event_match_runs (
+                event_match_run_id, semantic_run_id, provider, model, matcher_version,
+                status, routing_mode, result_json, failure_type, created_at, completed_at, supersedes_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_match_run_id,
+                semantic_run_id,
+                provider,
+                model,
+                matcher_version,
+                "running",
+                None,
+                None,
+                None,
+                created_at,
+                None,
+                supersedes_run_id,
+            ),
+        )
+        result = _load_event_match_run(conn, event_match_run_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def mark_event_match_run_failed(
+    conn: sqlite3.Connection,
+    *,
+    event_match_run_id: str,
+    failure_type: str | None = None,
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    failure_type = _coerce_optional_text(failure_type)
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        current = _load_event_match_run(conn, event_match_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("event match run is not running")
+        conn.execute(
+            """
+            UPDATE event_match_runs
+            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?
+            WHERE event_match_run_id = ?
+            """,
+            ("failed", None, None, failure_type, completed_at, event_match_run_id),
+        )
+        result = _load_event_match_run(conn, event_match_run_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def persist_event_match_run_result(
+    conn: sqlite3.Connection,
+    *,
+    event_match_run_id: str,
+    semantic_run_id: str,
+    routing_mode: str,
+    normalized_match: Mapping[str, Any],
+    facts: Sequence[Mapping[str, Any]],
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    if routing_mode not in {"auto", "confirm", "needs_context"}:
+        raise SemanticStoreError("unsupported routing_mode")
+    completed_at = _now_ms() if completed_at is None else completed_at
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
+        current = _load_event_match_run(conn, event_match_run_id)
+        if current["status"] != "running":
+            raise SemanticStoreError("event match run is not running")
+        if current["semantic_run_id"] != semantic_run_id:
+            raise SemanticStoreError("event match run semantic_run_id does not match")
+
+        safe_result = _normalize_event_match_result_for_storage(normalized_match, facts=facts)
+        for fact in facts:
+            fact_id = _coerce_required_text("fact_id", fact.get("fact_id"))
+            fact_row = _get_fact_row(conn, fact_id)
+            if fact_row["semantic_run_id"] != semantic_run_id:
+                raise SemanticStoreError("fact semantic_run_id does not match event match run")
+
+        if routing_mode == "auto":
+            valid_groups = [
+                group for group in safe_result["groups"] if group["target"] in {"existing", "new"}
+            ]
+            if len(valid_groups) != 1:
+                raise SemanticStoreError("auto routing requires exactly one assignable group")
+            group = valid_groups[0]
+            if group["target"] == "existing":
+                target_event = _load_event(conn, _coerce_required_text("event_id", group.get("event_id")))
+            else:
+                target_event = create_event(
+                    conn,
+                    title=_coerce_required_text("proposed_title", group.get("proposed_title")),
+                    created_at=completed_at,
+                    updated_at=completed_at,
+                )
+                group["event_id"] = target_event["event_id"]
+            for fact_id in group["fact_ids"]:
+                set_event_assignment_by_ai(
+                    conn,
+                    fact_id=fact_id,
+                    event_id=target_event["event_id"],
+                    assignment="auto",
+                    event_assignment_confidence=group["confidence"],
+                    updated_at=completed_at,
+                )
+            _touch_event_updated_at(
+                conn,
+                event_id=target_event["event_id"],
+                updated_at=completed_at,
+            )
+
+        conn.execute(
+            """
+            UPDATE event_match_runs
+            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?
+            WHERE event_match_run_id = ?
+            """,
+            (
+                "succeeded",
+                routing_mode,
+                json.dumps(safe_result, ensure_ascii=False, separators=(",", ":")),
+                None,
+                completed_at,
+                event_match_run_id,
+            ),
+        )
+        result = _load_event_match_run(conn, event_match_run_id)
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        raise
+
+
 def set_event_assignment_by_ai(
     conn: sqlite3.Connection,
     *,
@@ -907,9 +1320,11 @@ def set_event_assignment_by_ai(
     if assignment not in {"auto", "suggested"}:
         raise SemanticStoreError("AI assignment must be 'auto' or 'suggested'")
     updated_at = _now_ms() if updated_at is None else updated_at
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         current = _get_fact_row(conn, fact_id)
         if current["event_assignment"] == "confirmed":
             raise ProtectedFactError(
@@ -925,10 +1340,12 @@ def set_event_assignment_by_ai(
             (event_id, assignment, event_assignment_confidence, updated_at, fact_id),
         )
         result = _load_fact(conn, fact_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 

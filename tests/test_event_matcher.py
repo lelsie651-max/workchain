@@ -426,5 +426,6 @@ def test_match_events_does_not_modify_input_facts(monkeypatch):
 
 
 def test_event_matcher_module_no_longer_exposes_httpx_or_deepseek_endpoint():
+    assert event_matcher.EVENT_MATCHER_VERSION == "1.0"
     assert not hasattr(event_matcher, "httpx")
     assert not hasattr(event_matcher, "DEEPSEEK_API_URL")

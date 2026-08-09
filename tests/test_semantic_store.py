@@ -12,17 +12,22 @@ from evidence_core.semantic_store import (
     SemanticStoreError,
     confirm_fact,
     create_event,
+    create_event_match_run,
     create_fact,
     create_interpretation,
     create_semantic_run,
     create_submission,
     correct_fact_by_user,
+    get_latest_event_match_for_evidence,
     get_semantic_run,
     get_latest_semantic_run_for_evidence,
+    list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
+    mark_event_match_run_failed,
     mark_semantic_run_failed,
     mark_semantic_run_succeeded,
+    persist_event_match_run_result,
     persist_semantic_run_result,
     set_event_assignment_by_ai,
     set_event_assignment_by_user,
@@ -908,6 +913,542 @@ def test_persist_semantic_run_result_supports_nested_transaction_via_savepoint(d
     assert persisted["semantic_run"]["status"] == "succeeded"
     assert _count(conn, "facts") == 1
     assert _count(conn, "fact_actors") == 1
+
+
+def test_list_event_candidates_limits_active_events_and_recent_facts(db_file, blobs_root):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    _append_text(conn, blobs_root, evidence_id="ev-3", text="三", captured_at=3)
+
+    for index in range(35):
+        status = "resolved" if index == 34 else "active"
+        event = create_event(
+            conn,
+            event_id=f"evt-{index:02d}",
+            title=f"事项 {index:02d}",
+            status=status,
+            created_at=100 + index,
+            updated_at=100 + index,
+        )
+        for fact_index in range(8):
+            create_fact(
+                conn,
+                fact_id=f"fact-{index:02d}-{fact_index}",
+                fact_type="statement",
+                content=f"事项 {index:02d} 的事实 {fact_index}",
+                evidence_ids=["ev-1" if fact_index % 3 == 0 else "ev-2"],
+                event_id=event["event_id"],
+                event_assignment="confirmed",
+                created_at=1000 + fact_index,
+                updated_at=1000 + fact_index,
+            )
+
+    candidates = list_event_candidates(conn)
+
+    assert len(candidates) == 30
+    assert all(item["event_id"] != "evt-34" for item in candidates)
+    assert all(len(item["recent_facts"]) <= 6 for item in candidates)
+    assert candidates[0]["event_id"] == "evt-33"
+    assert candidates[0]["recent_facts"][0]["content"] == "事项 33 的事实 7"
+
+
+def test_event_match_run_confirm_persists_safe_snapshot_with_real_fact_ids(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=10, updated_at=10)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-b",
+                "fact_type": "request",
+                "content": "请补一版渠道复盘",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 12,
+                "updated_at": 12,
+            },
+            {
+                "fact_id": "fact-a",
+                "fact_type": "deadline_change",
+                "content": "截止改到周五",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 13,
+                "updated_at": 13,
+            },
+        ],
+        interpretations=[],
+        completed_at=14,
+    )
+    match_run = create_event_match_run(
+        conn,
+        event_match_run_id="mrun-1",
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=15,
+    )
+
+    result = persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run["event_match_run_id"],
+        semantic_run_id=run["semantic_run_id"],
+        routing_mode="confirm",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [1],
+                    "target": "existing",
+                    "event_id": "evt-1",
+                    "proposed_title": None,
+                    "confidence": 0.74,
+                    "reason": "第二条像是在延续已有事项",
+                },
+                {
+                    "fact_indexes": [0],
+                    "target": "new",
+                    "event_id": None,
+                    "proposed_title": "补渠道复盘",
+                    "confidence": 0.72,
+                    "reason": "第一条也像独立新事项",
+                },
+            ],
+            "ambiguities": ["可能涉及两件事"],
+        },
+        facts=persisted["facts"],
+        completed_at=16,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["routing_mode"] == "confirm"
+    assert result["result"] == {
+        "groups": [
+            {
+                "fact_ids": ["fact-a"],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.74,
+                "reason": "第二条像是在延续已有事项",
+            },
+            {
+                "fact_ids": ["fact-b"],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补渠道复盘",
+                "confidence": 0.72,
+                "reason": "第一条也像独立新事项",
+            },
+        ],
+        "ambiguities": ["可能涉及两件事"],
+    }
+    fact_rows = conn.execute(
+        """
+        SELECT fact_id, event_id, event_assignment
+        FROM facts
+        WHERE semantic_run_id = ?
+        ORDER BY fact_id ASC
+        """,
+        (run["semantic_run_id"],),
+    ).fetchall()
+    assert [(row["fact_id"], row["event_id"], row["event_assignment"]) for row in fact_rows] == [
+        ("fact-a", None, "unassigned"),
+        ("fact-b", None, "unassigned"),
+    ]
+
+
+def test_event_match_run_auto_existing_assigns_all_facts_atomically(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=10, updated_at=10)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "request",
+                "content": "请补一版渠道复盘",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 12,
+                "updated_at": 12,
+            },
+            {
+                "fact_id": "fact-2",
+                "fact_type": "deadline_change",
+                "content": "截止改到周五",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 13,
+                "updated_at": 13,
+            },
+        ],
+        interpretations=[],
+        completed_at=14,
+    )
+    match_run = create_event_match_run(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=15,
+    )
+
+    result = persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run["event_match_run_id"],
+        semantic_run_id=run["semantic_run_id"],
+        routing_mode="auto",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0, 1],
+                    "target": "existing",
+                    "event_id": "evt-1",
+                    "proposed_title": None,
+                    "confidence": 0.96,
+                    "reason": "都属于渠道复盘事项",
+                }
+            ],
+            "ambiguities": [],
+        },
+        facts=persisted["facts"],
+        completed_at=16,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["routing_mode"] == "auto"
+    fact_rows = conn.execute(
+        """
+        SELECT fact_id, event_id, event_assignment, event_assignment_confidence
+        FROM facts
+        WHERE semantic_run_id = ?
+        ORDER BY fact_id ASC
+        """,
+        (run["semantic_run_id"],),
+    ).fetchall()
+    assert [(row["fact_id"], row["event_id"], row["event_assignment"], row["event_assignment_confidence"]) for row in fact_rows] == [
+        ("fact-1", "evt-1", "auto", 0.96),
+        ("fact-2", "evt-1", "auto", 0.96),
+    ]
+
+
+def test_event_match_run_auto_new_creates_event_and_assigns_all_facts_atomically(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "request",
+                "content": "请今天补签供应商合同",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 12,
+                "updated_at": 12,
+            }
+        ],
+        interpretations=[],
+        completed_at=14,
+    )
+    match_run = create_event_match_run(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=15,
+    )
+
+    result = persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run["event_match_run_id"],
+        semantic_run_id=run["semantic_run_id"],
+        routing_mode="auto",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0],
+                    "target": "new",
+                    "event_id": None,
+                    "proposed_title": "补签供应商合同",
+                    "confidence": 0.95,
+                    "reason": "是一件明确的新事项",
+                }
+            ],
+            "ambiguities": [],
+        },
+        facts=persisted["facts"],
+        completed_at=16,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["result"]["groups"][0]["event_id"] is not None
+    created_event = conn.execute(
+        "SELECT title FROM events WHERE event_id = ?",
+        (result["result"]["groups"][0]["event_id"],),
+    ).fetchone()
+    fact_row = conn.execute(
+        """
+        SELECT event_id, event_assignment, event_assignment_confidence
+        FROM facts WHERE fact_id = ?
+        """,
+        ("fact-1",),
+    ).fetchone()
+    assert created_event["title"] == "补签供应商合同"
+    assert fact_row["event_id"] == result["result"]["groups"][0]["event_id"]
+    assert fact_row["event_assignment"] == "auto"
+    assert fact_row["event_assignment_confidence"] == 0.95
+
+
+def test_event_match_run_auto_rolls_back_on_protected_fact(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_event(conn, event_id="evt-1", title="旧事项", created_at=10, updated_at=10)
+    create_event(conn, event_id="evt-2", title="新事项", created_at=11, updated_at=11)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=12,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "request",
+                "content": "第一条事实",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 13,
+                "updated_at": 13,
+            },
+            {
+                "fact_id": "fact-2",
+                "fact_type": "statement",
+                "content": "第二条事实",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 14,
+                "updated_at": 14,
+            },
+        ],
+        interpretations=[],
+        completed_at=15,
+    )
+    set_event_assignment_by_user(conn, fact_id="fact-2", event_id="evt-2", updated_at=16)
+    match_run = create_event_match_run(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=17,
+    )
+
+    with pytest.raises(ProtectedFactError, match="confirmed event assignment"):
+        persist_event_match_run_result(
+            conn,
+            event_match_run_id=match_run["event_match_run_id"],
+            semantic_run_id=run["semantic_run_id"],
+            routing_mode="auto",
+            normalized_match={
+                "groups": [
+                    {
+                        "fact_indexes": [0, 1],
+                        "target": "existing",
+                        "event_id": "evt-1",
+                        "proposed_title": None,
+                        "confidence": 0.95,
+                        "reason": "都应归入旧事项",
+                    }
+                ],
+                "ambiguities": [],
+            },
+            facts=persisted["facts"],
+            completed_at=18,
+        )
+
+    event_count = conn.execute("SELECT COUNT(*) AS count FROM events").fetchone()["count"]
+    fact_rows = conn.execute(
+        """
+        SELECT fact_id, event_id, event_assignment
+        FROM facts
+        WHERE semantic_run_id = ?
+        ORDER BY fact_id ASC
+        """,
+        (run["semantic_run_id"],),
+    ).fetchall()
+    match_row = conn.execute(
+        "SELECT status, routing_mode, result_json FROM event_match_runs WHERE event_match_run_id = ?",
+        (match_run["event_match_run_id"],),
+    ).fetchone()
+    assert event_count == 2
+    assert [(row["fact_id"], row["event_id"], row["event_assignment"]) for row in fact_rows] == [
+        ("fact-1", None, "unassigned"),
+        ("fact-2", "evt-2", "confirmed"),
+    ]
+    assert match_row["status"] == "running"
+    assert match_row["routing_mode"] is None
+    assert match_row["result_json"] is None
+
+
+def test_event_match_run_lifecycle_failed_and_supersedes_history(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    run1 = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+    mark_semantic_run_succeeded(conn, semantic_run_id=run1["semantic_run_id"], completed_at=11)
+    first = create_event_match_run(
+        conn,
+        event_match_run_id="mrun-1",
+        semantic_run_id=run1["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=12,
+    )
+    failed = mark_event_match_run_failed(
+        conn,
+        event_match_run_id=first["event_match_run_id"],
+        failure_type="provider_invalid_response",
+        completed_at=13,
+    )
+
+    run2 = create_semantic_run(
+        conn,
+        semantic_run_id="srun-2",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=14,
+        supersedes_run_id=run1["semantic_run_id"],
+    )
+    mark_semantic_run_succeeded(conn, semantic_run_id=run2["semantic_run_id"], completed_at=15)
+    second = create_event_match_run(
+        conn,
+        event_match_run_id="mrun-2",
+        semantic_run_id=run2["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=16,
+        supersedes_run_id=first["event_match_run_id"],
+    )
+
+    latest = get_latest_event_match_for_evidence(conn, ev1["evidence_id"])
+
+    assert failed["status"] == "failed"
+    assert failed["failure_type"] == "provider_invalid_response"
+    assert second["supersedes_run_id"] == "mrun-1"
+    assert latest["event_match_run_id"] == "mrun-2"
+
+
+def test_event_match_operations_keep_verify_chain_clean(db_file, blobs_root):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_event(conn, event_id="evt-1", title="事件一", created_at=10)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": "ev-1", "position": 0}],
+        created_at=11,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-1",
+                "fact_type": "statement",
+                "content": "先记一条事实",
+                "evidence_ids": ["ev-1"],
+                "created_at": 12,
+                "updated_at": 12,
+            }
+        ],
+        interpretations=[],
+        completed_at=13,
+    )
+
+    before = verify_chain(conn, blobs_root=blobs_root)
+    match_run = create_event_match_run(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=14,
+    )
+    persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run["event_match_run_id"],
+        semantic_run_id=run["semantic_run_id"],
+        routing_mode="auto",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0],
+                    "target": "existing",
+                    "event_id": "evt-1",
+                    "proposed_title": None,
+                    "confidence": 0.95,
+                    "reason": "延续旧事项",
+                }
+            ],
+            "ambiguities": [],
+        },
+        facts=persisted["facts"],
+        completed_at=15,
+    )
+    after = verify_chain(conn, blobs_root=blobs_root)
+
+    assert before == (True, None, None)
+    assert after == (True, None, None)
 
 
 def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):

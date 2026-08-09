@@ -101,7 +101,9 @@
 - Extraction(`transcript + visual observations`) → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
 - Production Semantic Parsing 固定使用 DeepSeek V4 Flash 的 non-thinking 模式(`thinking: {"type":"disabled"}`),并使用独立 `DEEPSEEK_TEXT_TIMEOUT_SECONDS`(默认 60 秒,仅作用于文本语义链路)
 - Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
+- Production 路由现为 `Semantic Parser succeeded -> Event Matcher -> deterministic routing`;仅当本次 Semantic Run 成功且生成了新 Fact 时才运行 Event Matcher
 - Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
+- 只有 `routing_mode=auto` 才会实际写入 `facts.event_id / event_assignment`; `confirm / needs_context` 只保存建议结果,等待后续用户决定
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
@@ -552,6 +554,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 **正在收口**
 - Event Matcher:Fact 分组 + 归属建议
 - `auto / confirm / needs_context` 由确定性 routing policy 决定,不由模型决定
+- V1 production apply:matcher result 以 run 履历保存;仅 auto 真正归档,confirm / needs_context 不自动改 Fact
 
 ### 阶段四:界面与导出
 **已完成首版**
@@ -595,6 +598,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | Semantic Parser V2.2 支持同时消费 transcript + visual observations | 让语义解析可以基于文字与画面直接可观察事实共同生成 Fact / Interpretation,同时保持 Observation 边界与冲突显式化 |
 | 2026-08-08 | V6 新增 Semantic Run / Fact Extraction Provenance | 让 Fact / Interpretation 能追溯到具体 parser run、模型版本与精确 Evidence / Extraction 输入,同时继续保持其在哈希链之外 |
 | 2026-08-08 | Production Semantic Pipeline V2 接管旧 `extract_slots`,详情页最小展示最新 Semantic Run 结果 | 新 Evidence 的生产语义入口已统一切到 latest Extraction -> Semantic Parser V2.2,旧 slot 字段降级为兼容展示层 |
+| 2026-08-09 | V7 新增 Event Match Run 履历,Production 改为 Semantic succeeded 后运行 Event Matcher | 让 Event 建议/自动归档同样具备 provenance,并明确只有 auto 会实际改写 Fact 归属 |
 
 ---
 

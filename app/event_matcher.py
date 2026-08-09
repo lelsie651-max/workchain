@@ -4,6 +4,8 @@ import json
 from typing import Any
 
 from app.ai_provider import chat_json
+
+EVENT_MATCHER_VERSION = "1.0"
 AUTO_THRESHOLD = 0.90
 CONFIRM_THRESHOLD = 0.65
 GROUP_TARGETS = {"existing", "new", "unassigned"}

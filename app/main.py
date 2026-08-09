@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import llm, ocr, semantic_llm, vision_provider
+from app import event_matcher, llm, ocr, semantic_llm, vision_provider
 from app.ai_provider import (
     build_text_config_diagnostic,
     diagnose_deepseek_text_preflight,
@@ -59,11 +59,18 @@ from evidence_core import chain
 from evidence_core.db import init_db
 from evidence_core.extraction_store import create_extraction, get_latest_extraction, list_extractions
 from evidence_core.semantic_store import (
+    ProtectedFactError,
     create_semantic_run,
+    create_event_match_run,
+    get_latest_event_match_for_evidence,
+    get_latest_event_match_for_semantic_run,
     get_latest_semantic_run_for_evidence,
+    list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
+    mark_event_match_run_failed,
     mark_semantic_run_failed,
+    persist_event_match_run_result,
     persist_semantic_run_result,
 )
 from evidence_core.export import export_evidence_package
@@ -704,6 +711,7 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
                 "fact_content": None if item["fact_id"] is None else fact_map.get(item["fact_id"], {}).get("content"),
             }
         )
+    event_match = _build_event_match_result(conn, run["semantic_run_id"])
 
     return {
         "semantic_run_id": run["semantic_run_id"],
@@ -722,7 +730,132 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
             for fact in facts
         ],
         "help_items": help_items,
+        "event_match": event_match,
     }
+
+
+def _event_title(conn: sqlite3.Connection, event_id: str | None) -> str | None:
+    if not event_id:
+        return None
+    row = conn.execute(
+        "SELECT title FROM events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["title"]
+
+
+def _event_match_titles(result: dict[str, Any]) -> list[dict[str, Any]]:
+    groups = result.get("groups")
+    if not isinstance(groups, list):
+        return []
+    suggestions: list[dict[str, Any]] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        title = group.get("event_title") or group.get("proposed_title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        suggestions.append(
+            {
+                "title": title.strip(),
+                "reason": group.get("reason") if isinstance(group.get("reason"), str) else "",
+            }
+        )
+    return suggestions
+
+
+def _build_event_match_result(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any] | None:
+    run = get_latest_event_match_for_semantic_run(conn, semantic_run_id)
+    if run is None:
+        return None
+    result = run.get("result")
+    if run["status"] == "failed":
+        return {
+            "status": "failed",
+            "routing_mode": None,
+            "message": "事件归档暂不可用，事实解析已保存。",
+            "reason": None,
+            "suggestions": [],
+        }
+    if not isinstance(result, dict):
+        return None
+
+    groups = result.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            event_id = group.get("event_id")
+            if isinstance(event_id, str) and event_id.strip():
+                group["event_title"] = _event_title(conn, event_id)
+
+    routing_mode = run.get("routing_mode")
+    if routing_mode == "auto":
+        auto_group = next(
+            (
+                group
+                for group in result.get("groups", [])
+                if isinstance(group, dict) and group.get("target") in {"existing", "new"}
+            ),
+            None,
+        )
+        return {
+            "status": "succeeded",
+            "routing_mode": "auto",
+            "message": None if auto_group is None else f"已自动归入：{auto_group.get('event_title') or auto_group.get('proposed_title') or '未命名事项'}",
+            "reason": None if auto_group is None else auto_group.get("reason"),
+            "suggestions": [],
+        }
+    if routing_mode == "confirm":
+        return {
+            "status": "succeeded",
+            "routing_mode": "confirm",
+            "message": "这段记录可能涉及多个事项，等待你确认归档。",
+            "reason": None,
+            "suggestions": _event_match_titles(result),
+        }
+    if routing_mode == "needs_context":
+        return {
+            "status": "succeeded",
+            "routing_mode": "needs_context",
+            "message": "暂时无法可靠判断属于哪件事，需要补充上下文。",
+            "reason": None,
+            "suggestions": [],
+        }
+    return None
+
+
+def _event_matcher_fact_payload(conn: sqlite3.Connection, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for fact in facts:
+        actor_rows = conn.execute(
+            """
+            SELECT a.canonical_name, fa.role
+            FROM fact_actors fa
+            JOIN actors a ON a.actor_id = fa.actor_id
+            WHERE fa.fact_id = ?
+            ORDER BY fa.role ASC, a.canonical_name ASC
+            """,
+            (fact["fact_id"],),
+        ).fetchall()
+        payloads.append(
+            {
+                "fact_type": fact["fact_type"],
+                "content": fact["content"],
+                "confidence": fact["confidence"],
+                "actors": [
+                    {"name": row["canonical_name"], "role": row["role"]}
+                    for row in actor_rows
+                ],
+                "occurred_date": None if fact["occurred_at"] is None else _format_datetime(fact["occurred_at"], "%Y-%m-%d"),
+                "due_raw": fact["due_raw"],
+                "due_date": None if fact["due_at"] is None else _format_datetime(fact["due_at"], "%Y-%m-%d"),
+                "due_anchor_date": None if fact["due_anchor_at"] is None else _format_datetime(fact["due_anchor_at"], "%Y-%m-%d"),
+            }
+        )
+    return payloads
 
 
 def _export_timestamp() -> str:
@@ -1445,12 +1578,55 @@ def _run_parse_pipeline(
             parsed,
             created_at=int(time.time() * 1000),
         )
-        persist_semantic_run_result(
+        persisted = persist_semantic_run_result(
             conn,
             semantic_run_id=semantic_run_id,
             facts=fact_payloads,
             interpretations=interpretation_payloads,
         )
+        if semantic_run_id is not None and persisted["facts"]:
+            previous_match_run = get_latest_event_match_for_evidence(conn, evidence_id)
+            event_match_run = create_event_match_run(
+                conn,
+                semantic_run_id=semantic_run_id,
+                provider="deepseek",
+                model=get_text_model(),
+                matcher_version=event_matcher.EVENT_MATCHER_VERSION,
+                supersedes_run_id=None if previous_match_run is None else previous_match_run["event_match_run_id"],
+            )
+            try:
+                normalized_match = event_matcher.match_events(
+                    _event_matcher_fact_payload(conn, persisted["facts"]),
+                    existing_events=list_event_candidates(conn),
+                )
+                if normalized_match is None:
+                    raise ValueError("matcher returned no normalized result")
+                persist_event_match_run_result(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    semantic_run_id=semantic_run_id,
+                    routing_mode=event_matcher.decide_assignment_mode(normalized_match),
+                    normalized_match=normalized_match,
+                    facts=persisted["facts"],
+                )
+            except ProtectedFactError:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="protected_fact",
+                )
+            except ValueError:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="provider_invalid_response",
+                )
+            except Exception:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="persistence_error",
+                )
         _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
         _set_parse_detail(conn, evidence_id, "")
         _emit_structured_log(
