@@ -89,6 +89,50 @@
                 </div>
                 <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
                     <h4 class="text-sm font-medium text-white">AI帮你理解</h4>
+                    {% if evidence.semantic_result.record_date or evidence.semantic_result.has_relative_due_raw %}
+                    <div id="record-date-section" class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                        <div id="record-date-display" class="{% if not evidence.semantic_result.record_date %}space-y-1{% endif %}">
+                            {% if evidence.semantic_result.record_date %}
+                            <p class="text-sm text-slate-100">记录日期：{{ evidence.semantic_result.record_date }}</p>
+                            {% if evidence.semantic_result.record_date_source_label %}
+                            <p class="mt-1 text-xs text-slate-400">来源：{{ evidence.semantic_result.record_date_source_label }}</p>
+                            {% endif %}
+                            {% if evidence.semantic_result.date_resolution_notice %}
+                            <p class="mt-2 text-xs text-emerald-200">{{ evidence.semantic_result.date_resolution_notice }}</p>
+                            {% endif %}
+                            {% else %}
+                            <p class="text-sm text-slate-100">这些内容用了“今天 / 周五”等相对时间。</p>
+                            <p class="mt-1 text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
+                            {% endif %}
+                        </div>
+                        <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if evidence.semantic_result.record_date %}hidden{% endif %}">
+                            <input
+                                id="record-date-input"
+                                type="date"
+                                min="1900-01-01"
+                                max="2100-12-31"
+                                value="{{ evidence.semantic_result.record_date or '' }}"
+                                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                            >
+                            <button
+                                id="record-date-submit"
+                                type="submit"
+                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                            >
+                                确认日期
+                            </button>
+                        </form>
+                        {% if evidence.semantic_result.record_date %}
+                        <button
+                            id="record-date-toggle"
+                            type="button"
+                            class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            修改
+                        </button>
+                        {% endif %}
+                    </div>
+                    {% endif %}
                     {% if evidence.semantic_result.help_items %}
                     <ul class="mt-3 space-y-3">
                         {% for item in evidence.semantic_result.help_items %}
@@ -150,6 +194,50 @@
                 {% endif %}
                 <div class="mt-4">
                     <p class="text-sm font-medium text-white">AI帮你理解</p>
+                    {% if evidence.semantic_result.record_date or evidence.semantic_result.has_relative_due_raw %}
+                    <div id="record-date-section" class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+                        <div id="record-date-display" class="{% if not evidence.semantic_result.record_date %}space-y-1{% endif %}">
+                            {% if evidence.semantic_result.record_date %}
+                            <p class="text-sm text-slate-100">记录日期：{{ evidence.semantic_result.record_date }}</p>
+                            {% if evidence.semantic_result.record_date_source_label %}
+                            <p class="mt-1 text-xs text-slate-400">来源：{{ evidence.semantic_result.record_date_source_label }}</p>
+                            {% endif %}
+                            {% if evidence.semantic_result.date_resolution_notice %}
+                            <p class="mt-2 text-xs text-emerald-200">{{ evidence.semantic_result.date_resolution_notice }}</p>
+                            {% endif %}
+                            {% else %}
+                            <p class="text-sm text-slate-100">这些内容用了“今天 / 周五”等相对时间。</p>
+                            <p class="mt-1 text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
+                            {% endif %}
+                        </div>
+                        <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if evidence.semantic_result.record_date %}hidden{% endif %}">
+                            <input
+                                id="record-date-input"
+                                type="date"
+                                min="1900-01-01"
+                                max="2100-12-31"
+                                value="{{ evidence.semantic_result.record_date or '' }}"
+                                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                            >
+                            <button
+                                id="record-date-submit"
+                                type="submit"
+                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                            >
+                                确认日期
+                            </button>
+                        </form>
+                        {% if evidence.semantic_result.record_date %}
+                        <button
+                            id="record-date-toggle"
+                            type="button"
+                            class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            修改
+                        </button>
+                        {% endif %}
+                    </div>
+                    {% endif %}
                     {% if evidence.semantic_result.help_items %}
                     <ul class="mt-3 space-y-3">
                         {% for item in evidence.semantic_result.help_items %}
@@ -418,6 +506,12 @@
         const deepseekPreflightResult = document.getElementById("deepseek-preflight-result");
         const eventAssignmentForm = document.querySelector("[data-event-assignment-form]");
         const eventAssignmentSaveButton = document.querySelector("[data-event-assignment-save]");
+        const recordDateDisplay = document.getElementById("record-date-display");
+        const recordDateForm = document.getElementById("record-date-form");
+        const recordDateInput = document.getElementById("record-date-input");
+        const recordDateSubmitButton = document.getElementById("record-date-submit");
+        const recordDateToggleButton = document.getElementById("record-date-toggle");
+        const evidenceId = "{{ evidence.evidence_id }}";
 
         const showFlash = (text, tone) => {
             flash.textContent = text;
@@ -437,6 +531,19 @@
             ocrTextEditor.classList.toggle("hidden", !open);
             ocrTextReadonly.classList.toggle("hidden", open);
             editOcrTextButton.classList.toggle("hidden", open);
+        };
+
+        const setRecordDateEditorOpen = (open) => {
+            if (!recordDateForm) {
+                return;
+            }
+            recordDateForm.classList.toggle("hidden", !open);
+            if (recordDateDisplay) {
+                recordDateDisplay.classList.toggle("hidden", open && Boolean(recordDateToggleButton));
+            }
+            if (recordDateToggleButton) {
+                recordDateToggleButton.classList.toggle("hidden", open);
+            }
         };
 
         const syncEventAssignmentInputs = () => {
@@ -486,6 +593,51 @@
                 groups,
             };
         };
+
+        if (recordDateToggleButton) {
+            recordDateToggleButton.addEventListener("click", () => {
+                setRecordDateEditorOpen(true);
+            });
+        }
+
+        if (recordDateForm) {
+            recordDateForm.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                if (!recordDateInput || !recordDateInput.value) {
+                    showFlash("请选择记录发生日期", "error");
+                    return;
+                }
+                if (!recordDateInput.checkValidity()) {
+                    recordDateInput.reportValidity();
+                    return;
+                }
+                if (recordDateSubmitButton) {
+                    recordDateSubmitButton.disabled = true;
+                    recordDateSubmitButton.classList.add("opacity-60", "cursor-not-allowed");
+                }
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/record-date`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ record_date: recordDateInput.value }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "记录日期更新失败", "error");
+                        return;
+                    }
+                    showFlash("记录日期已更新", "success");
+                    window.setTimeout(() => window.location.reload(), 300);
+                } catch (error) {
+                    showFlash("记录日期更新失败，请稍后再试", "error");
+                } finally {
+                    if (recordDateSubmitButton) {
+                        recordDateSubmitButton.disabled = false;
+                        recordDateSubmitButton.classList.remove("opacity-60", "cursor-not-allowed");
+                    }
+                }
+            });
+        }
 
         const escapeHtml = (value) => {
             return String(value)

@@ -762,10 +762,38 @@ def test_interpretation_indexes_are_remapped_after_invalid_facts_are_filtered():
         ("这周一", "2026-08-07", "2026-08-03"),
         ("下周三", "2026-08-07", "2026-08-12"),
         ("下下周五", "2026-08-07", "2026-08-21"),
+        ("周五", "2026-08-09", "2026-08-14"),
+        ("星期五", "2026-08-09", "2026-08-14"),
+        ("周五前", "2026-08-09", "2026-08-14"),
+        ("这个周五", "2026-08-09", "2026-08-14"),
+        ("今天", "2026-08-09", "2026-08-09"),
     ],
 )
 def test_resolve_due_date_supports_required_relative_rules(due_raw: str, anchor_date: str, expected: str):
     assert semantic_llm.resolve_due_date(due_raw, anchor_date) == expected
+
+
+def test_infer_reliable_anchor_date_from_message_header():
+    assert semantic_llm.infer_reliable_anchor_date("小李（2026.8.9）：今天补你。") == "2026-08-09"
+
+
+def test_infer_reliable_anchor_date_does_not_guess_plain_body_date():
+    assert semantic_llm.infer_reliable_anchor_date("合同2026.8.20前交付。") is None
+
+
+def test_infer_reliable_anchor_date_returns_none_for_conflicting_dates():
+    text = "小李（2026.8.9）：今天补你。\n小王（2026.8.10）：我明天交。"
+    assert semantic_llm.infer_reliable_anchor_date(text) is None
+
+
+def test_infer_reliable_anchor_date_accepts_explicit_timestamp_observation():
+    observations = [{"kind": "timestamp", "content": "消息日期 2026-08-09 10:30", "confidence": 0.9}]
+    assert semantic_llm.infer_reliable_anchor_date("", observations=observations) == "2026-08-09"
+
+
+def test_infer_reliable_anchor_date_ignores_observation_without_explicit_label():
+    observations = [{"kind": "message", "content": "2026-08-09 10:30", "confidence": 0.9}]
+    assert semantic_llm.infer_reliable_anchor_date("", observations=observations) is None
 
 
 def test_unreliable_relative_due_raw_does_not_trust_model_guess():

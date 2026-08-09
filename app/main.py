@@ -60,8 +60,10 @@ from evidence_core.db import init_db
 from evidence_core.extraction_store import create_extraction, get_latest_extraction, list_extractions
 from evidence_core.semantic_store import (
     ProtectedFactError,
+    SemanticStoreError,
     create_semantic_run,
     create_event_match_run,
+    correct_relative_due_dates_by_user,
     get_latest_event_match_for_evidence,
     get_latest_event_match_for_semantic_run,
     get_latest_semantic_run_for_evidence,
@@ -86,6 +88,8 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_LLM_TEXT_LENGTH = 8_000
 MAX_OCR_TEXT_LENGTH = 50_000
+MIN_RECORD_DATE = "1900-01-01"
+MAX_RECORD_DATE = "2100-12-31"
 WORKCHAIN_DIAGNOSTICS_ENV = "WORKCHAIN_DIAGNOSTICS"
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PARSE_STATUS_OCR_RUNNING = "ocr_running"
@@ -175,6 +179,31 @@ def _humanize_user_facing_text(text: str | None) -> str | None:
     return normalized
 
 
+def _semantic_anchor_source_label(source: str | None) -> str | None:
+    if source == "user":
+        return "你填写的"
+    if source == "content":
+        return "从记录时间中识别"
+    return None
+
+
+def _is_date_resolution_message(text: str | None) -> bool:
+    normalized = (text or "").strip()
+    if not normalized:
+        return False
+    if "anchor_date" in normalized and "换算" in normalized:
+        return True
+    if "缺少记录发生日期" in normalized:
+        return True
+    return (
+        "还无法确定" in normalized and "具体是哪一天" in normalized
+    ) or (
+        "补充这段记录发生的日期后" in normalized and "换算" in normalized
+    ) or (
+        "无法换算" in normalized and "具体日期" in normalized
+    )
+
+
 def _normalize_record_date_input(value: Any) -> str | None:
     if value is None:
         return None
@@ -182,9 +211,12 @@ def _normalize_record_date_input(value: Any) -> str | None:
     if not normalized:
         return None
     try:
-        return datetime.strptime(normalized, "%Y-%m-%d").strftime("%Y-%m-%d")
+        parsed = datetime.strptime(normalized, "%Y-%m-%d")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="记录发生日期请按 YYYY-MM-DD 填写") from exc
+    if not 1900 <= parsed.year <= 2100:
+        raise HTTPException(status_code=400, detail="记录发生日期需在 1900-01-01 到 2100-12-31 之间")
+    return parsed.strftime("%Y-%m-%d")
 
 
 def _decode_json_array(value: str | None) -> list[str]:
@@ -463,18 +495,45 @@ def _ocr_corrected_key(evidence_id: str) -> str:
     return f"ocr_corrected:{evidence_id}"
 
 
-def _set_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str, anchor_date: str | None) -> None:
-    key = _semantic_anchor_date_key(evidence_id)
+def _set_semantic_anchor(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+    anchor_date: str | None,
+    source: str | None,
+    *,
+    commit: bool = True,
+) -> None:
+    date_key = _semantic_anchor_date_key(evidence_id)
+    source_key = _semantic_anchor_source_key(evidence_id)
     if anchor_date is None:
-        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
-        conn.commit()
+        conn.execute("DELETE FROM meta WHERE key IN (?, ?)", (date_key, source_key))
+        if commit:
+            conn.commit()
         return
-    _set_meta_value(conn, key, anchor_date)
-    conn.commit()
+    _set_meta_value(conn, date_key, anchor_date)
+    if source is not None:
+        _set_meta_value(conn, source_key, source)
+    else:
+        conn.execute("DELETE FROM meta WHERE key = ?", (source_key,))
+    if commit:
+        conn.commit()
+
+
+def _set_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str, anchor_date: str | None) -> None:
+    _set_semantic_anchor(
+        conn,
+        evidence_id,
+        anchor_date,
+        _get_semantic_anchor_source(conn, evidence_id),
+    )
 
 
 def _get_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str) -> str | None:
     return _get_meta_value(conn, _semantic_anchor_date_key(evidence_id))
+
+
+def _get_semantic_anchor_source(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    return _get_meta_value(conn, _semantic_anchor_source_key(evidence_id))
 
 
 def _set_extract_note(conn: sqlite3.Connection, evidence_id: str, note: str) -> None:
@@ -592,6 +651,28 @@ def _can_run_semantic_parse(transcript: str | None, observations: list[dict[str,
 
 def _date_to_millis(value: str | None) -> int | None:
     return llm.due_date_to_millis(value)
+
+
+def _build_relative_due_updates(
+    facts: list[dict[str, Any]],
+    *,
+    anchor_date: str,
+) -> list[dict[str, Any]]:
+    anchor_millis = _date_to_millis(anchor_date)
+    updates: list[dict[str, Any]] = []
+    for fact in facts:
+        due_raw = fact.get("due_raw")
+        if not semantic_llm.is_relative_due_raw(due_raw):
+            continue
+        resolved_due_date = semantic_llm.resolve_due_date(due_raw, anchor_date)
+        updates.append(
+            {
+                "fact_id": fact["fact_id"],
+                "due_at": _date_to_millis(resolved_due_date),
+                "due_anchor_at": anchor_millis if resolved_due_date is not None else None,
+            }
+        )
+    return updates
 
 
 def _person_glossary_map(glossary: list[dict[str, Any]] | None) -> dict[str, str]:
@@ -782,6 +863,27 @@ def _semantic_interpretation_payloads(
     return payloads
 
 
+def _should_hide_resolved_date_help_item(
+    item: dict[str, Any],
+    *,
+    fact_map: dict[str, dict[str, Any]],
+    has_relative_due_raw: bool,
+    anchor_date: str | None,
+) -> bool:
+    if anchor_date is None or item.get("kind") != "uncertainty":
+        return False
+    raw_content = item.get("raw_content")
+    if not _is_date_resolution_message(raw_content):
+        return False
+    fact_id = item.get("fact_id")
+    if fact_id is None:
+        return has_relative_due_raw
+    related_fact = fact_map.get(fact_id)
+    if related_fact is None:
+        return has_relative_due_raw
+    return semantic_llm.is_relative_due_raw(related_fact.get("due_raw"))
+
+
 def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[str, Any] | None:
     run = get_latest_semantic_run_for_evidence(conn, evidence_id, status="succeeded")
     if run is None:
@@ -794,16 +896,41 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         evidence_id=evidence_id,
     )
     fact_map = {fact["fact_id"]: fact for fact in facts}
+    anchor_date = _get_semantic_anchor_date(conn, evidence_id)
+    anchor_source = _get_semantic_anchor_source(conn, evidence_id)
+    has_relative_due_raw = any(
+        semantic_llm.is_relative_due_raw(fact.get("due_raw"))
+        for fact in facts
+    )
     help_items = []
+    filtered_stale_date_help_items = 0
     for item in interpretations:
+        help_item = {
+            "kind": item["kind"],
+            "label": _friendly_interpretation_label(item["kind"]),
+            "content": _humanize_user_facing_text(item["content"]) or "",
+            "raw_content": item["content"],
+            "confidence": item["confidence"],
+            "is_uncertainty": item["kind"] == "uncertainty",
+            "fact_id": item["fact_id"],
+            "fact_content": None if item["fact_id"] is None else fact_map.get(item["fact_id"], {}).get("content"),
+        }
+        if _should_hide_resolved_date_help_item(
+            help_item,
+            fact_map=fact_map,
+            has_relative_due_raw=has_relative_due_raw,
+            anchor_date=anchor_date,
+        ):
+            filtered_stale_date_help_items += 1
+            continue
         help_items.append(
             {
-                "kind": item["kind"],
-                "label": _friendly_interpretation_label(item["kind"]),
-                "content": _humanize_user_facing_text(item["content"]) or "",
-                "confidence": item["confidence"],
-                "is_uncertainty": item["kind"] == "uncertainty",
-                "fact_content": None if item["fact_id"] is None else fact_map.get(item["fact_id"], {}).get("content"),
+                "kind": help_item["kind"],
+                "label": help_item["label"],
+                "content": help_item["content"],
+                "confidence": help_item["confidence"],
+                "is_uncertainty": help_item["is_uncertainty"],
+                "fact_content": help_item["fact_content"],
             }
         )
     event_match = _build_event_match_result(conn, run["semantic_run_id"])
@@ -821,11 +948,19 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
                 "fact_id": fact["fact_id"],
                 "fact_type": fact["fact_type"],
                 "content": fact["content"],
+                "due_raw": fact["due_raw"],
+                "due_date_value": _format_datetime(fact["due_at"], "%Y-%m-%d"),
             }
             for fact in facts
         ],
         "help_items": help_items,
         "event_match": event_match,
+        "has_relative_due_raw": has_relative_due_raw,
+        "record_date": anchor_date,
+        "record_date_source": anchor_source,
+        "record_date_source_label": _semantic_anchor_source_label(anchor_source),
+        "date_resolution_notice": None if not (anchor_date and has_relative_due_raw) else f"已按 {anchor_date} 换算相对日期。",
+        "filtered_stale_date_help_items": filtered_stale_date_help_items,
     }
 
 
@@ -1208,6 +1343,10 @@ def _semantic_anchor_date_key(evidence_id: str) -> str:
     return f"semantic_anchor_date:{evidence_id}"
 
 
+def _semantic_anchor_source_key(evidence_id: str) -> str:
+    return f"semantic_anchor_source:{evidence_id}"
+
+
 def _verified_key(evidence_id: str) -> str:
     return f"verified:{evidence_id}"
 
@@ -1511,6 +1650,7 @@ def _run_parse_pipeline(
     observations: list[dict[str, Any]] = []
     glossary: list[dict[str, Any]] = []
     anchor_date: str | None = None
+    anchor_source: str | None = None
     try:
         evidence_row = conn.execute(
             "SELECT evidence_id, source_hint FROM evidence WHERE evidence_id = ?",
@@ -1519,10 +1659,19 @@ def _run_parse_pipeline(
         extraction = get_latest_extraction(conn, evidence_id)
         if evidence_row is not None:
             glossary = get_settings(sandbox_db_path).get("glossary", [])
-            anchor_date = _get_semantic_anchor_date(conn, evidence_id)
+            stored_anchor_date = _get_semantic_anchor_date(conn, evidence_id)
+            stored_anchor_source = _get_semantic_anchor_source(conn, evidence_id)
         if extraction is not None:
             transcript = extraction.get("transcript")
             observations = extraction.get("observations") if isinstance(extraction.get("observations"), list) else []
+        if evidence_row is not None:
+            if stored_anchor_source == "user" and stored_anchor_date is not None:
+                anchor_date = stored_anchor_date
+                anchor_source = "user"
+            else:
+                anchor_date = semantic_llm.infer_reliable_anchor_date(transcript, observations=observations)
+                anchor_source = None if anchor_date is None else "content"
+                _set_semantic_anchor(conn, evidence_id, anchor_date, anchor_source)
     finally:
         conn.close()
 
@@ -3006,6 +3155,87 @@ def create_app() -> FastAPI:
         finally:
             conn.close()
 
+    @app.post("/api/evidence/{evidence_id}/record-date")
+    async def update_evidence_record_date(
+        evidence_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"record_date"})
+        if unexpected_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported fields: {', '.join(unexpected_fields)}",
+            )
+
+        record_date = _normalize_record_date_input(payload.get("record_date"))
+        if record_date is None:
+            raise HTTPException(status_code=400, detail="请选择记录发生日期")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            evidence_row = conn.execute(
+                "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if evidence_row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+
+            latest_run = get_latest_semantic_run_for_evidence(conn, evidence_id, status="succeeded")
+            relative_due_updates: list[dict[str, Any]] = []
+            if latest_run is not None:
+                latest_facts = list_facts_for_semantic_run(
+                    conn,
+                    latest_run["semantic_run_id"],
+                    evidence_id=evidence_id,
+                )
+                relative_due_updates = _build_relative_due_updates(
+                    latest_facts,
+                    anchor_date=record_date,
+                )
+
+            updated_at = int(time.time() * 1000)
+            conn.execute("BEGIN IMMEDIATE")
+            _set_semantic_anchor(conn, evidence_id, record_date, "user", commit=False)
+            if latest_run is not None and relative_due_updates:
+                correct_relative_due_dates_by_user(
+                    conn,
+                    evidence_id=evidence_id,
+                    semantic_run_id=latest_run["semantic_run_id"],
+                    due_updates=relative_due_updates,
+                    updated_at=updated_at,
+                )
+            conn.commit()
+        except HTTPException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        except SemanticStoreError as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        response = JSONResponse(
+            {
+                "evidence_id": evidence_id,
+                "record_date": record_date,
+                "record_date_source": "user",
+                "record_date_source_label": _semantic_anchor_source_label("user"),
+                "updated_fact_count": len(relative_due_updates),
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
     @app.post("/api/evidence/{evidence_id}/event-assignment")
     async def confirm_event_assignment(
         evidence_id: str,
@@ -3609,7 +3839,8 @@ def create_app() -> FastAPI:
             if extract_note is not None:
                 _set_extract_note(conn, row["evidence_id"], extract_note)
             if record_date is not None:
-                _set_semantic_anchor_date(conn, row["evidence_id"], record_date)
+                _set_semantic_anchor(conn, row["evidence_id"], record_date, "user", commit=False)
+            conn.commit()
         finally:
             conn.close()
 

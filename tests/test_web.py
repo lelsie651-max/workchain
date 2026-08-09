@@ -502,14 +502,20 @@ def test_home_page_contains_mutually_exclusive_input_copy_and_record_date_field(
         response = client.get("/")
 
     assert response.status_code == 200
-    assert 'id="input-mode-hint"' in response.text
-    assert "本次已选择文字记录" in response.text
-    assert "本次已选择文件" in response.text
-    assert "textarea.disabled = disableTextarea" in response.text
+    assert 'id="text-input-region"' in response.text
+    assert 'id="file-picker-region"' in response.text
+    assert 'id="text-mode-hint"' in response.text
+    assert "清空文字后可改用文件" in response.text
+    assert 'min="1900-01-01"' in response.text
+    assert 'max="2100-12-31"' in response.text
+    assert 'textInputRegion.classList.toggle("hidden", hideTextInput);' in response.text
+    assert 'filePickerRegion.classList.toggle("hidden", hasFile || hasTextInput);' in response.text
+    assert 'textModeHint.classList.toggle("hidden", !hasTextInput || hasFile);' in response.text
     assert "fileInput.disabled = disableFileInput" in response.text
     assert 'name="record_date"' in response.text
     assert "这段记录发生日期（可选）" in response.text
-    assert "不会自动拿上传时间代替" in response.text
+    assert "有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。" in response.text
+    assert "recordDateInput.reportValidity();" in response.text
 
 
 def test_home_recent_record_shows_pending_assignment_panel_and_reuses_detail_endpoint(tmp_path, monkeypatch):
@@ -1965,7 +1971,7 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
         ).fetchone()
         assert semantic_run["provider"] == "deepseek"
         assert semantic_run["model"] == "deepseek-v4-flash"
-        assert semantic_run["parser_version"] == "2.2"
+        assert semantic_run["parser_version"] == "2.3"
         assert semantic_run["extraction_id"] is not None
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
@@ -3101,7 +3107,7 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     }
     assert payload["text_llm"]["provider"] == "deepseek"
     assert payload["text_llm"]["model"] == main_module.get_text_model()
-    assert payload["text_llm"]["parser_version"] == "2.2"
+    assert payload["text_llm"]["parser_version"] == "2.3"
     assert payload["semantic_parser"]["run_status"] == "succeeded"
     assert payload["semantic_parser"]["failure_type"] is None
     assert payload["semantic_parser"]["diagnostic"]["success"] is True
@@ -3923,7 +3929,7 @@ def test_successful_parse_persists_semantic_run_and_facts_and_chain_stays_valid(
         assert run_row["status"] == "succeeded"
         assert run_row["provider"] == "deepseek"
         assert run_row["model"] == "deepseek-v4-flash"
-        assert run_row["parser_version"] == "2.2"
+        assert run_row["parser_version"] == "2.3"
         assert run_row["anchor_date"] is None
         assert run_row["extraction_id"] is not None
         assert fact_row["fact_type"] == "request"
@@ -4796,7 +4802,7 @@ def test_parse_pipeline_uses_explicit_record_date_as_anchor_date(tmp_path, monke
             response = client.post(
                 "/api/evidence",
                 json={
-                    "text": "周五前补一版。",
+                    "text": "小李（2026.8.9）：周五前补一版。",
                     "source": "飞书",
                     "source_detail": "项目复盘群",
                     "record_date": "2026-08-08",
@@ -4805,6 +4811,187 @@ def test_parse_pipeline_uses_explicit_record_date_as_anchor_date(tmp_path, monke
 
     assert response.status_code == 200
     assert captured["anchor_date"] == "2026-08-08"
+
+
+def test_parse_pipeline_infers_reliable_anchor_date_from_message_header(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        captured["anchor_date"] = anchor_date
+        return _semantic_result()
+
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                json={
+                    "text": "小李（2026.8.9）：今天补你。",
+                    "source": "飞书",
+                    "source_detail": "项目复盘群",
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["anchor_date"] == "2026-08-09"
+
+
+def test_parse_pipeline_does_not_infer_plain_body_delivery_date_as_anchor(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        captured["anchor_date"] = anchor_date
+        return _semantic_result()
+
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                json={
+                    "text": "合同2026.8.20前交付。",
+                    "source": "飞书",
+                    "source_detail": "项目复盘群",
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["anchor_date"] is None
+
+
+@pytest.mark.parametrize(
+    ("record_date", "expected_detail"),
+    [
+        ("202600-08-09", "记录发生日期请按 YYYY-MM-DD 填写"),
+        ("2200-01-01", "记录发生日期需在 1900-01-01 到 2100-12-31 之间"),
+    ],
+)
+def test_record_date_rejects_invalid_or_out_of_range_year(tmp_path, monkeypatch, record_date, expected_detail):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.post(
+            "/api/evidence",
+            json={
+                "text": "周五前补一版。",
+                "source": "飞书",
+                "source_detail": "项目复盘群",
+                "record_date": record_date,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == expected_detail
+
+
+def test_evidence_detail_record_date_update_recomputes_due_without_calling_deepseek(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "deadline_change",
+                "content": "请周五前补材料。",
+                "actors": [],
+                "due_raw": "周五前",
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            }
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "uncertainty",
+                "content": "由于缺少 anchor_date，无法将“周五”换算为具体日期。",
+                "confidence": 0.6,
+            },
+            {
+                "fact_index": 0,
+                "kind": "uncertainty",
+                "content": "负责人还不够明确。",
+                "confidence": 0.5,
+            },
+        ],
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补材料",
+                "confidence": 0.95,
+                "reason": "这是一件新的补材料事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请周五前补材料。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                detail_before = client.get(f"/evidence/{evidence_id}")
+
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=AssertionError("should not call DeepSeek")):
+        with client:
+            update_response = client.post(
+                f"/api/evidence/{evidence_id}/record-date",
+                json={"record_date": "2026-08-09"},
+            )
+            detail_after = client.get(f"/evidence/{evidence_id}")
+            home_after = client.get("/")
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        fact_row = conn.execute(
+            """
+            SELECT due_at, due_anchor_at, origin, review_status, event_id
+            FROM facts
+            WHERE fact_id IN (
+                SELECT fact_id FROM fact_evidence WHERE evidence_id = ?
+            )
+            """,
+            (evidence_id,),
+        ).fetchone()
+        anchor_rows = conn.execute(
+            "SELECT key, value FROM meta WHERE key IN (?, ?)",
+            (
+                f"semantic_anchor_date:{evidence_id}",
+                f"semantic_anchor_source:{evidence_id}",
+            ),
+        ).fetchall()
+        anchor_meta = {row["key"]: row["value"] for row in anchor_rows}
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+    friendly_copy = "还无法确定“周五”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
+    assert create_response.status_code == 200
+    assert friendly_copy in detail_before.text
+    assert update_response.status_code == 200
+    assert update_response.json()["updated_fact_count"] == 1
+    assert fact_row["due_at"] == main_module.llm.due_date_to_millis("2026-08-14")
+    assert fact_row["due_anchor_at"] == main_module.llm.due_date_to_millis("2026-08-09")
+    assert fact_row["origin"] == "user"
+    assert fact_row["review_status"] == "corrected"
+    assert anchor_meta[f"semantic_anchor_date:{evidence_id}"] == "2026-08-09"
+    assert anchor_meta[f"semantic_anchor_source:{evidence_id}"] == "user"
+    assert friendly_copy not in detail_after.text
+    assert "负责人还不够明确。" in detail_after.text
+    assert "记录日期：2026-08-09" in detail_after.text
+    assert "来源：你填写的" in detail_after.text
+    assert "已按 2026-08-09 换算相对日期。" in detail_after.text
+    assert "截止：08-14" in home_after.text
 
 
 def test_parse_pipeline_does_not_pass_self_names_or_counterpart(tmp_path, monkeypatch):

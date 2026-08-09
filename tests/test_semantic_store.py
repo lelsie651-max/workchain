@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from app.llm import due_date_to_millis
 from app.semantic_llm import SEMANTIC_PARSER_VERSION
 from evidence_core.db import init_db
 from evidence_core.extraction_store import create_extraction
@@ -17,6 +18,7 @@ from evidence_core.semantic_store import (
     create_interpretation,
     create_semantic_run,
     create_submission,
+    correct_relative_due_dates_by_user,
     correct_fact_by_user,
     get_latest_event_match_for_evidence,
     get_semantic_run,
@@ -641,6 +643,111 @@ def test_correct_fact_by_user_sets_origin_and_review_status_and_keeps_evidence_l
     assert corrected["review_status"] == "corrected"
     assert corrected["evidence_ids"] == ["ev-1"]
     assert corrected["actors"] == [{"actor_id": "act-2", "role": "owner"}]
+
+
+def test_correct_relative_due_dates_by_user_updates_due_fields_and_event_timestamp(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="周五前补材料", captured_at=1)
+    create_event(conn, event_id="evt-1", title="补材料", created_at=10, updated_at=10)
+    create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+    create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="deadline_change",
+        content="周五前补材料",
+        evidence_ids=[ev1["evidence_id"]],
+        semantic_run_id="srun-1",
+        event_id="evt-1",
+        event_assignment="confirmed",
+        due_raw="周五前",
+        created_at=12,
+        updated_at=12,
+    )
+
+    result = correct_relative_due_dates_by_user(
+        conn,
+        evidence_id=ev1["evidence_id"],
+        semantic_run_id="srun-1",
+        due_updates=[
+            {
+                "fact_id": "fact-1",
+                "due_at": due_date_to_millis("2026-08-14"),
+                "due_anchor_at": due_date_to_millis("2026-08-09"),
+            }
+        ],
+        updated_at=20,
+    )
+
+    corrected = result["facts"][0]
+    event_row = conn.execute("SELECT updated_at FROM events WHERE event_id = 'evt-1'").fetchone()
+
+    assert corrected["due_at"] == due_date_to_millis("2026-08-14")
+    assert corrected["due_anchor_at"] == due_date_to_millis("2026-08-09")
+    assert corrected["origin"] == "user"
+    assert corrected["review_status"] == "corrected"
+    assert event_row["updated_at"] == 20
+
+
+def test_correct_relative_due_dates_by_user_rolls_back_entire_batch(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="周五前补材料", captured_at=1)
+    create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=11,
+    )
+    create_fact(
+        conn,
+        fact_id="fact-1",
+        fact_type="deadline_change",
+        content="周五前补材料",
+        evidence_ids=[ev1["evidence_id"]],
+        semantic_run_id="srun-1",
+        due_raw="周五前",
+        created_at=12,
+        updated_at=12,
+    )
+
+    with pytest.raises(SemanticStoreError, match="fact not found"):
+        correct_relative_due_dates_by_user(
+            conn,
+            evidence_id=ev1["evidence_id"],
+            semantic_run_id="srun-1",
+            due_updates=[
+                {
+                    "fact_id": "fact-1",
+                    "due_at": due_date_to_millis("2026-08-14"),
+                    "due_anchor_at": due_date_to_millis("2026-08-09"),
+                },
+                {
+                    "fact_id": "fact-missing",
+                    "due_at": due_date_to_millis("2026-08-15"),
+                    "due_anchor_at": due_date_to_millis("2026-08-09"),
+                },
+            ],
+            updated_at=20,
+        )
+
+    fact_row = conn.execute(
+        "SELECT due_at, due_anchor_at, origin, review_status, updated_at FROM facts WHERE fact_id = 'fact-1'"
+    ).fetchone()
+    assert fact_row["due_at"] is None
+    assert fact_row["due_anchor_at"] is None
+    assert fact_row["origin"] == "ai"
+    assert fact_row["review_status"] == "unreviewed"
+    assert fact_row["updated_at"] == 12
 
 
 def test_create_interpretation_validates_parent_records(db_file, blobs_root):
@@ -1858,7 +1965,20 @@ def test_semantic_operations_keep_verify_chain_clean(db_file, blobs_root):
         actor_roles=[("act-2", "owner")],
         updated_at=16,
     )
-    mark_semantic_run_succeeded(conn, semantic_run_id="srun-1", completed_at=17)
+    correct_relative_due_dates_by_user(
+        conn,
+        evidence_id="ev-1",
+        semantic_run_id="srun-1",
+        due_updates=[
+            {
+                "fact_id": "fact-1",
+                "due_at": due_date_to_millis("2026-08-21"),
+                "due_anchor_at": due_date_to_millis("2026-08-07"),
+            }
+        ],
+        updated_at=17,
+    )
+    mark_semantic_run_succeeded(conn, semantic_run_id="srun-1", completed_at=18)
 
     after = verify_chain(conn, blobs_root=blobs_root)
 

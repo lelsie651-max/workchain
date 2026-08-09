@@ -1665,6 +1665,124 @@ def correct_fact_by_user(
         raise
 
 
+def correct_relative_due_dates_by_user(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    semantic_run_id: str,
+    due_updates: Sequence[Mapping[str, Any]],
+    updated_at: int | None = None,
+) -> dict[str, Any]:
+    normalized_evidence_id = _coerce_required_text("evidence_id", evidence_id)
+    normalized_semantic_run_id = _coerce_required_text("semantic_run_id", semantic_run_id)
+    if not due_updates:
+        raise SemanticStoreError("due_updates must contain at least one item")
+
+    normalized_updates: list[dict[str, Any]] = []
+    seen_fact_ids: set[str] = set()
+    for item in due_updates:
+        if not isinstance(item, Mapping):
+            raise SemanticStoreError("each due update must be an object")
+        unexpected_fields = set(item) - {"fact_id", "due_at", "due_anchor_at"}
+        if unexpected_fields:
+            raise SemanticStoreError(
+                f"unsupported due update fields: {', '.join(sorted(unexpected_fields))}"
+            )
+        fact_id = _coerce_required_text("fact_id", item.get("fact_id"))
+        if fact_id in seen_fact_ids:
+            raise SemanticStoreError("due_updates must not contain duplicate fact_id")
+        seen_fact_ids.add(fact_id)
+
+        due_at = item.get("due_at")
+        due_anchor_at = item.get("due_anchor_at")
+        for field_name, value in (("due_at", due_at), ("due_anchor_at", due_anchor_at)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool)):
+                raise SemanticStoreError(f"{field_name} must be an integer or None")
+
+        normalized_updates.append(
+            {
+                "fact_id": fact_id,
+                "due_at": due_at,
+                "due_anchor_at": due_anchor_at,
+            }
+        )
+
+    updated_at = _now_ms() if updated_at is None else updated_at
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
+
+        _ensure_semantic_run_covers_evidence_ids(
+            conn,
+            semantic_run_id=normalized_semantic_run_id,
+            evidence_ids=[normalized_evidence_id],
+        )
+
+        touched_event_ids: set[str] = set()
+        corrected_facts: list[dict[str, Any]] = []
+        for item in normalized_updates:
+            current = _get_fact_row(conn, item["fact_id"])
+            if current["semantic_run_id"] != normalized_semantic_run_id:
+                raise SemanticStoreError("fact does not belong to semantic_run_id")
+            evidence_link = conn.execute(
+                """
+                SELECT 1
+                FROM fact_evidence
+                WHERE fact_id = ? AND evidence_id = ?
+                """,
+                (item["fact_id"], normalized_evidence_id),
+            ).fetchone()
+            if evidence_link is None:
+                raise SemanticStoreError("fact does not belong to evidence_id")
+
+            conn.execute(
+                """
+                UPDATE facts
+                SET due_at = ?, due_anchor_at = ?, origin = ?, review_status = ?, updated_at = ?
+                WHERE fact_id = ?
+                """,
+                (
+                    item["due_at"],
+                    item["due_anchor_at"],
+                    "user",
+                    "corrected",
+                    updated_at,
+                    item["fact_id"],
+                ),
+            )
+            if current["event_id"]:
+                touched_event_ids.add(current["event_id"])
+            corrected_facts.append(_load_fact(conn, item["fact_id"]))
+
+        for event_id in touched_event_ids:
+            conn.execute(
+                "UPDATE events SET updated_at = ? WHERE event_id = ?",
+                (updated_at, event_id),
+            )
+
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        return {
+            "facts": corrected_facts,
+            "event_ids": sorted(touched_event_ids),
+            "updated_at": updated_at,
+        }
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        raise
+
+
 def update_fact_by_ai(
     conn: sqlite3.Connection,
     *,
