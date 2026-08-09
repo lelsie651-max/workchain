@@ -286,25 +286,24 @@ def test_index_contains_three_thread_titles(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     html = response.text
+    assert "把聊天截图、文字或文档放进来" in html
+    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" in html
+    assert "可选：我的词典" in html
+    assert "我的事项" in html
+    assert "看看示例" in html
     assert "这不是我要的" in html
-    assert '<h1 class="text-4xl' not in html
-    assert "你手上的事" in html
-    assert "事项线" not in html
-    assert "自动留证" in html
-    assert "渠道复盘数据" in html
     assert "用户明细导出" in html
     assert "接口文档补充" in html
     assert "需求改了 3 次,你一次都没等到确认" in html
-    assert "飞书" in html
-    assert "企业微信" in html
-    assert "保存" in html
-    assert "存证" not in html
-    assert "谁答应了谁什么" in html
-    assert 'id="self-name-input"' in html
-    assert "新增词条" in html
-    assert "还没告诉系统你在对话里叫什么" not in html
     assert "导出完整举证包" in html
     assert "包含你的全部记录与校验工具" in html
+    assert "填了之后系统才知道哪句话是你说的" not in html
+    assert "你在对话里叫什么" not in html
+    assert 'id="self-name-input"' not in html
+    assert "你手上的事" not in html
+    assert "保存" in html
+    assert "存证" not in html
+    assert "新增词条" in html
 
 
 def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
@@ -320,6 +319,260 @@ def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypa
     assert "公司统一放假半天" in html
     assert "中午点什么外卖" in html
     assert "下周一开始工位调整" in html
+
+
+def test_index_shows_real_event_in_my_events_and_keeps_demo_threads_separate(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请今天补签供应商合同。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补签供应商合同",
+                "confidence": 0.95,
+                "reason": "这是一件新的合同处理事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                index_response = client.get("/")
+
+    assert create_response.status_code == 200
+    html = index_response.text
+    assert "我的事项" in html
+    assert 'data-testid="event-card"' in html
+    assert "补签供应商合同" in html
+    assert "看看示例" in html
+    assert 'data-testid="thread-card"' in html
+    assert "渠道复盘数据" in html
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        event_row = conn.execute(
+            """
+            SELECT event_id, title
+            FROM events
+            ORDER BY created_at DESC, event_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        assert f'href="/event/{event_row["event_id"]}"' in html
+        assert event_row["title"] == "补签供应商合同"
+    finally:
+        conn.close()
+
+
+def test_event_detail_shows_facts_and_evidence_link(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请今天补签供应商合同。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补签供应商合同",
+                "confidence": 0.95,
+                "reason": "这是一件新的合同处理事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        event_row = conn.execute(
+            """
+            SELECT event_id
+            FROM events
+            ORDER BY created_at DESC, event_id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get(f"/event/{event_row['event_id']}")
+
+    assert response.status_code == 200
+    assert "事项详情" in response.text
+    assert "请今天补签供应商合同。" in response.text
+    assert "AI 整理结果可回看原始证据" in response.text
+    assert f'href="/evidence/{evidence_id}"' in response.text
+
+
+def test_recent_record_prefers_semantic_facts_and_event_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "系统整理：补签供应商合同。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补签供应商合同",
+                "confidence": 0.95,
+                "reason": "这是一件新的合同处理事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "原文里只说请处理合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                index_response = client.get("/")
+
+    assert create_response.status_code == 200
+    assert "系统整理：补签供应商合同。" in index_response.text
+    assert "已自动归入：补签供应商合同" in index_response.text
+
+
+def test_recent_record_falls_back_for_legacy_row_without_semantic_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=_semantic_result()):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "旧兼容记录。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        conn.execute(
+            """
+            UPDATE evidence
+            SET plain_summary = ?, slot_deliverable = ?, slot_due_raw = ?, caveats = ?
+            WHERE evidence_id = ?
+            """,
+            ("旧摘要仍可展示", "旧交付物", "周五前", json.dumps(["旧兼容提示"], ensure_ascii=False), evidence_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM interpretations
+            WHERE semantic_run_id IN (
+                SELECT semantic_run_id FROM semantic_run_inputs WHERE evidence_id = ?
+            )
+            """,
+            (evidence_id,),
+        )
+        conn.execute(
+            """
+            DELETE FROM facts
+            WHERE semantic_run_id IN (
+                SELECT semantic_run_id FROM semantic_run_inputs WHERE evidence_id = ?
+            )
+            """,
+            (evidence_id,),
+        )
+        conn.execute(
+            """
+            DELETE FROM event_match_runs
+            WHERE semantic_run_id IN (
+                SELECT semantic_run_id FROM semantic_run_inputs WHERE evidence_id = ?
+            )
+            """,
+            (evidence_id,),
+        )
+        conn.execute("DELETE FROM semantic_run_inputs WHERE evidence_id = ?", (evidence_id,))
+        conn.execute(
+            """
+            DELETE FROM semantic_runs
+            WHERE semantic_run_id NOT IN (
+                SELECT semantic_run_id FROM semantic_run_inputs
+            )
+              AND semantic_run_id NOT IN (
+                SELECT semantic_run_id FROM facts WHERE semantic_run_id IS NOT NULL
+            )
+              AND semantic_run_id NOT IN (
+                SELECT semantic_run_id FROM interpretations WHERE semantic_run_id IS NOT NULL
+            )
+              AND semantic_run_id NOT IN (
+                SELECT semantic_run_id FROM event_match_runs
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "旧摘要仍可展示" in response.text
+    assert "旧交付物" in response.text
+    assert "周五前" in response.text
+    assert "旧兼容提示" in response.text
 
 
 def test_thread_channel_page_contains_10_evidence_cards(tmp_path, monkeypatch):
@@ -544,8 +797,14 @@ def test_help_page_returns_200_and_contains_review_notes(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     html = response.text
-    assert "给评审的说明" in html
-    assert "即将开放" in html
+    assert "无需登录即可体验" in html
+    assert "每位访客都会拿到一个独立的匿名体验空间" in html
+    assert "体验数据会在 24 小时后自动清理" in html
+    assert "AUTO：" in html
+    assert "CONFIRM：" in html
+    assert "NEEDS_CONTEXT：" in html
+    assert "即将开放" not in html
+    assert "自动归并算法已完成设计但尚未实现" not in html
     assert "https://github.com/lelsie651-max/workchain" in html
 
 

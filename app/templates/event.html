@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="space-y-6">
+    <div class="rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+                <p class="text-sm text-cyan-200">事项详情</p>
+                <h1 class="mt-2 text-3xl font-semibold text-white">{{ event.title }}</h1>
+                <div class="mt-4 flex flex-wrap gap-3 text-sm text-slate-400">
+                    <span>{{ event.fact_count }} 条事实</span>
+                    <span>最近活动 {{ event.updated_at_text }}</span>
+                </div>
+            </div>
+            <a
+                href="/"
+                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+            >
+                返回首页
+            </a>
+        </div>
+        <p class="mt-4 text-sm leading-7 text-slate-300">下面是 AI 整理出的事实顺序。每一条都可以回看支撑它的原始证据，方便你自己核对来龙去脉。</p>
+    </div>
+
+    <div class="space-y-4">
+        {% for fact in facts %}
+        <article class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+            <div class="flex flex-wrap items-center gap-3 text-xs text-slate-500">
+                <span class="rounded-full border border-slate-700 px-2.5 py-1 uppercase tracking-wide">{{ fact.fact_type }}</span>
+                <span>{{ fact.occurred_at_text }}</span>
+            </div>
+            <p class="mt-3 text-sm leading-7 text-slate-100">{{ fact.content }}</p>
+            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                <p class="text-xs uppercase tracking-wide text-slate-500">支撑它的原始证据</p>
+                <p class="mt-2 text-xs leading-6 text-slate-400">AI 整理结果可回看原始证据；证据详情里会保留原文、截图或文件。</p>
+                <div class="mt-3 flex flex-wrap gap-3">
+                    {% for evidence in fact.evidence_links %}
+                    <a
+                        href="{{ evidence.href }}"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        {{ evidence.label }}
+                    </a>
+                    {% endfor %}
+                </div>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}

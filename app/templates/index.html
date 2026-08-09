@@ -11,60 +11,11 @@
         ></div>
 
         <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <div class="mb-4">
-                <h2 class="text-xl font-semibold text-white">让它更懂你</h2>
-            </div>
-
-            <div
-                id="self-name-panel"
-                class="{% if settings.has_self_names %}border-slate-800 bg-slate-950/40{% else %}border-yellow-400/30 bg-yellow-400/5{% endif %} rounded-2xl border p-4"
-            >
-                <div class="flex items-start justify-between gap-3">
-                    <div>
-                        <h3 class="text-sm font-medium text-slate-200">你在对话里叫什么</h3>
-                        <p class="mt-1 text-xs text-slate-500">填了之后,系统才知道哪句话是你说的</p>
-                    </div>
-                    <p
-                        id="self-name-suggestion"
-                        class="{% if settings.has_self_names %}hidden {% endif %}text-xs text-yellow-200"
-                    >
-                        建议先填一下
-                    </p>
-                </div>
-                <div id="self-names-tags" class="mt-3 flex flex-wrap gap-2">
-                    {% for item in settings.self_names %}
-                    <button
-                        type="button"
-                        class="inline-flex min-h-11 items-center gap-2 rounded-full border border-slate-700 px-3 py-2 text-sm text-slate-200"
-                        data-self-name="{{ item }}"
-                    >
-                        <span>{{ item }}</span>
-                        <span class="text-slate-500">×</span>
-                    </button>
-                    {% endfor %}
-                </div>
-                <div class="mt-3 flex flex-wrap gap-3">
-                    <input
-                        id="self-name-input"
-                        type="text"
-                        class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                        placeholder="如:小李"
-                    >
-                    <button
-                        id="add-self-name"
-                        type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                    >
-                        添加称呼
-                    </button>
-                </div>
-            </div>
-
-            <div class="mt-5 rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+            <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
                 <div class="flex items-center justify-between gap-3">
                     <div>
-                        <h3 class="text-sm font-medium text-slate-200">我的词典</h3>
-                        <p class="mt-1 text-xs text-slate-500">如果这个词在某句话里是随口一说,系统会以原文为准</p>
+                        <h3 class="text-sm font-medium text-slate-200">可选：我的词典</h3>
+                        <p class="mt-1 text-xs text-slate-500">给常见人名、简称或说法补一点背景，方便 WorkChain 更稳地理解这段记录。</p>
                     </div>
                     <button
                         id="toggle-glossary"
@@ -130,8 +81,12 @@
     <div class="space-y-8">
         <section>
             <form id="evidence-form" enctype="multipart/form-data" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
-                <p class="mb-3 text-sm text-slate-400">把聊天记录粘进来,系统会读懂谁答应了谁什么、什么时候要</p>
-                <label id="evidence-text-label" for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">先把内容粘进来</label>
+                <div class="mb-4 space-y-3">
+                    <p class="text-sm text-cyan-200">把聊天截图、文字或文档放进来</p>
+                    <h1 class="text-3xl font-semibold leading-tight text-white sm:text-4xl">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。</h1>
+                    <p class="text-sm leading-7 text-slate-400">原始证据会完整保存；AI 只负责整理，最后都能回看原文、截图或文件。</p>
+                </div>
+                <label id="evidence-text-label" for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">把记录贴进来</label>
                 <div
                     id="evidence-dropzone"
                     class="rounded-2xl border border-dashed border-slate-700 bg-slate-950/50 p-3 transition"
@@ -141,7 +96,7 @@
                         name="text"
                         rows="6"
                         maxlength="20000"
-                        placeholder="把聊天记录粘进来,或上传截图 / 文档"
+                        placeholder="粘贴聊天记录，或上传截图 / 文档"
                         class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
                     ></textarea>
                     <input
@@ -233,13 +188,49 @@
         <section>
             <div class="mb-5">
                 <div>
-                    <h2 class="text-xl font-semibold text-white sm:text-2xl">你手上的事</h2>
-                    <p class="mt-1 text-sm text-slate-400">每一件事的来龙去脉,自动串成一条时间线。</p>
+                    <h2 class="text-xl font-semibold text-white sm:text-2xl">我的事项</h2>
+                    <p class="mt-1 text-sm text-slate-400">这里展示当前体验空间里，已经被串成同一件事的真实记录。</p>
+                </div>
+            </div>
+
+            {% if my_events %}
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {% for event in my_events %}
+                <a
+                    href="/event/{{ event.event_id }}"
+                    class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
+                    data-testid="event-card"
+                >
+                    <h3 class="text-lg font-semibold text-white">{{ event.title }}</h3>
+                    <p class="mt-3 text-sm text-slate-400">{{ event.fact_count }} 条事实 · 最近活动 {{ event.last_activity_text }}</p>
+                    <div class="mt-4 space-y-3 text-sm text-slate-300">
+                        {% for fact in event.recent_facts %}
+                        <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3">
+                            <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type }}</p>
+                            <p class="mt-1">{{ fact.content }}</p>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </a>
+                {% endfor %}
+            </div>
+            {% else %}
+            <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-sm leading-7 text-slate-300">
+                还没有串起来的事项。先放一条聊天截图、文字或文档进来，WorkChain 会在识别出事实后把同一件事慢慢串起来。
+            </div>
+            {% endif %}
+        </section>
+
+        <section>
+            <div class="mb-5">
+                <div>
+                    <h2 class="text-xl font-semibold text-white sm:text-2xl">看看示例</h2>
+                    <p class="mt-1 text-sm text-slate-400">下面这些是演示用的旧事项线，只用来帮助你快速理解产品，不会和你的真实记录混在一起。</p>
                 </div>
             </div>
 
             <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {% for thread in threads %}
+                {% for thread in demo_threads %}
                 <a
                     href="/thread/{{ thread.thread_id }}"
                     class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
@@ -373,20 +364,34 @@
                         {% elif item.parse_status == "llm_running" or item.parse_status == "pending" %}
                         <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在理解这段对话…</p>
                         {% elif item.parse_status == "done" %}
-                        {% if item.plain_summary %}
-                        <p class="text-slate-200">{{ item.plain_summary }}</p>
-                        {% endif %}
-                        <div class="mt-2 space-y-1 text-slate-400">
-                            {% if item.deliverable %}
-                            <p>交付物：{{ item.deliverable }}</p>
-                            {% endif %}
-                            {% if item.due_text %}
-                            <p>时限：{{ item.due_text }}</p>
-                            {% endif %}
-                            {% for caveat in item.caveats %}
-                            <p class="text-yellow-200">{{ caveat }}</p>
+                        {% if item.semantic_fact_preview %}
+                        <div class="space-y-2">
+                            {% for fact in item.semantic_fact_preview %}
+                            <div class="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-3">
+                                <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type }}</p>
+                                <p class="mt-1 text-slate-100">{{ fact.content }}</p>
+                            </div>
                             {% endfor %}
                         </div>
+                        {% if item.event_match %}
+                        <p class="mt-3 text-sm text-slate-400">{{ item.event_match.message }}</p>
+                        {% endif %}
+                        {% else %}
+                            {% if item.plain_summary %}
+                            <p class="text-slate-200">{{ item.plain_summary }}</p>
+                            {% endif %}
+                            <div class="mt-2 space-y-1 text-slate-400">
+                                {% if item.deliverable %}
+                                <p>交付物：{{ item.deliverable }}</p>
+                                {% endif %}
+                                {% if item.due_text %}
+                                <p>时限：{{ item.due_text }}</p>
+                                {% endif %}
+                                {% for caveat in item.caveats %}
+                                <p class="text-yellow-200">{{ caveat }}</p>
+                                {% endfor %}
+                            </div>
+                        {% endif %}
                         {% else %}
                         {% if item.plain_summary %}
                         <p class="text-slate-200">{{ item.plain_summary }}</p>
@@ -501,11 +506,6 @@
         const lightbox = document.getElementById("image-lightbox");
         const lightboxImage = document.getElementById("lightbox-image");
         const lightboxClose = document.getElementById("lightbox-close");
-        const selfNamePanel = document.getElementById("self-name-panel");
-        const selfNameSuggestion = document.getElementById("self-name-suggestion");
-        const selfNamesTags = document.getElementById("self-names-tags");
-        const selfNameInput = document.getElementById("self-name-input");
-        const addSelfNameButton = document.getElementById("add-self-name");
         const glossaryList = document.getElementById("glossary-list");
         const glossarySection = document.getElementById("glossary-section");
         const toggleGlossaryButton = document.getElementById("toggle-glossary");
@@ -579,8 +579,8 @@
 
         const syncTextareaMode = () => {
             const hasFile = Boolean(selectedFile);
-            textarea.placeholder = hasFile ? "补充说明(可选)" : "把聊天记录粘进来,或上传截图 / 文档";
-            textareaLabel.textContent = hasFile ? "补充说明(可选)" : "先把内容粘进来";
+            textarea.placeholder = hasFile ? "补充说明(可选)" : "粘贴聊天记录，或上传截图 / 文档";
+            textareaLabel.textContent = hasFile ? "补充说明(可选)" : "把记录贴进来";
         };
 
         const renderSelectedFile = () => {
@@ -756,6 +756,21 @@
                 return;
             }
             if (payload.parse_status === "done") {
+                const semanticFacts = Array.isArray(payload.semantic_fact_preview) ? payload.semantic_fact_preview : [];
+                const eventMatch = payload.event_match || null;
+                if (semanticFacts.length > 0) {
+                    const factHtml = semanticFacts.map((fact) => `
+                        <div class="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-3">
+                            <p class="text-xs uppercase tracking-wide text-slate-500">${escapeHtml(fact.fact_type || "fact")}</p>
+                            <p class="mt-1 text-slate-100">${escapeHtml(fact.content || "")}</p>
+                        </div>
+                    `).join("");
+                    target.innerHTML = `
+                        <div class="space-y-2">${factHtml}</div>
+                        ${eventMatch?.message ? `<p class="mt-3 text-slate-400">${escapeHtml(eventMatch.message)}</p>` : ""}
+                    `;
+                    return;
+                }
                 const caveats = (payload.caveats || []).map((item) => `<p class="text-yellow-200">${escapeHtml(item)}</p>`).join("");
                 target.innerHTML = `
                     ${payload.plain_summary ? `<p class="text-slate-200">${escapeHtml(payload.plain_summary)}</p>` : ""}
@@ -801,15 +816,6 @@
             }, 2000);
         };
 
-        const syncSelfNameHighlight = () => {
-            const hasSelfNames = selfNames.length > 0;
-            selfNameSuggestion.classList.toggle("hidden", hasSelfNames);
-            selfNamePanel.classList.toggle("border-yellow-400/30", !hasSelfNames);
-            selfNamePanel.classList.toggle("bg-yellow-400/5", !hasSelfNames);
-            selfNamePanel.classList.toggle("border-slate-800", hasSelfNames);
-            selfNamePanel.classList.toggle("bg-slate-950/40", hasSelfNames);
-        };
-
         const syncGlossaryMobileState = () => {
             glossaryCountMobile.textContent = glossary.length;
             const expanded = !glossarySection.classList.contains("hidden");
@@ -836,23 +842,6 @@
             lightboxImage.src = "";
             lightboxImage.alt = "";
             document.body.classList.remove("overflow-hidden");
-        };
-
-        const renderSelfNames = () => {
-            selfNamesTags.innerHTML = "";
-            selfNames.forEach((item) => {
-                const button = document.createElement("button");
-                button.type = "button";
-                button.className = "inline-flex min-h-11 items-center gap-2 rounded-full border border-slate-700 px-3 py-2 text-sm text-slate-200";
-                button.dataset.selfName = item;
-                button.innerHTML = `<span>${item}</span><span class="text-slate-500">×</span>`;
-                button.addEventListener("click", () => {
-                    selfNames = selfNames.filter((name) => name !== item);
-                    renderSelfNames();
-                });
-                selfNamesTags.appendChild(button);
-            });
-            syncSelfNameHighlight();
         };
 
         const renderGlossary = () => {
@@ -895,7 +884,6 @@
                 }
                 selfNames = data.self_names || [];
                 glossary = data.glossary || [];
-                renderSelfNames();
                 renderGlossary();
                 newGlossaryForm.classList.add("hidden");
                 showBanner("设置已保存,马上生效", "success");
@@ -993,18 +981,6 @@
             }
         });
 
-        addSelfNameButton.addEventListener("click", () => {
-            const value = selfNameInput.value.trim();
-            if (!value) {
-                return;
-            }
-            if (!selfNames.includes(value)) {
-                selfNames.push(value);
-            }
-            selfNameInput.value = "";
-            renderSelfNames();
-        });
-
         addGlossaryRowButton.addEventListener("click", () => {
             newGlossaryForm.classList.toggle("hidden");
         });
@@ -1072,7 +1048,6 @@
             }
         }
 
-        renderSelfNames();
         renderGlossary();
         syncGlossaryMobileState();
         pendingCards.forEach((card) => pollParseStatus(card));

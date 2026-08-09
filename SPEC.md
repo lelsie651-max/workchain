@@ -559,6 +559,11 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 ### 阶段四:界面与导出
 **已完成首版**
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
+- 首页主体验已切到 Event / Fact 体系:`我的事项` 只展示当前访客沙箱中的真实 `events + facts`
+- 旧 demo threads 已降级为 `看看示例`,与真实 Event 分区展示,不再混为同一数据体系
+- `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要与事件归档状态;没有 Semantic Run 的旧记录继续回退兼容层
+- 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
+- Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、原件完整保存与校验、以及 `auto / confirm / needs_context` 的真实行为
 - 访客沙箱(`wc_sid`)与 24 小时过期清理
 - 图片/文档上传、预览、Lightbox
 - PDF 导出
@@ -599,6 +604,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | V6 新增 Semantic Run / Fact Extraction Provenance | 让 Fact / Interpretation 能追溯到具体 parser run、模型版本与精确 Evidence / Extraction 输入,同时继续保持其在哈希链之外 |
 | 2026-08-08 | Production Semantic Pipeline V2 接管旧 `extract_slots`,详情页最小展示最新 Semantic Run 结果 | 新 Evidence 的生产语义入口已统一切到 latest Extraction -> Semantic Parser V2.2,旧 slot 字段降级为兼容展示层 |
 | 2026-08-09 | V7 新增 Event Match Run 履历,Production 改为 Semantic succeeded 后运行 Event Matcher | 让 Event 建议/自动归档同样具备 provenance,并明确只有 auto 会实际改写 Fact 归属 |
+| 2026-08-09 | Competition UX V1:首页主体验切到真实 Event / Fact,新增只读 Event 详情页,Help 同步真实能力 | 让用户首先看到 `我的事项` 与可回看原始证据的事实链路,同时把 demo threads 降级为示例区并清理过时文案 |
 
 ---
 

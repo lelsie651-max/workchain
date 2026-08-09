@@ -1777,12 +1777,17 @@ def _prepare_reference_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, Any]:
+def _prepare_recent_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    sandbox: SandboxContext,
+) -> dict[str, Any]:
     platform, scene = source_label(row["source_hint"])
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
     extracted_text = _extract_file_text(raw_text)
     display_text = extracted_text if extracted_text is not None else raw_text
+    semantic_result = _build_semantic_result(conn, row["evidence_id"])
     return {
         "evidence_id": row["evidence_id"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
@@ -1800,6 +1805,8 @@ def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, 
         "deliverable": row["slot_deliverable"],
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
         "caveats": _decode_json_array(row["caveats"]),
+        "semantic_fact_preview": [] if semantic_result is None else semantic_result["facts"][:2],
+        "event_match": None if semantic_result is None else semantic_result.get("event_match"),
         "is_verified": bool(row["is_verified"]),
         "media_type": row["media_type"],
         "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
@@ -1807,6 +1814,36 @@ def _prepare_recent_row(row: sqlite3.Row, sandbox: SandboxContext) -> dict[str, 
         "is_image": row["media_type"] == "image",
         "is_file": row["media_type"] == "file",
         "has_extracted_text": extracted_text is not None,
+    }
+
+
+def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    summary_rows = conn.execute(
+        """
+        SELECT f.fact_type, f.content
+        FROM facts f
+        WHERE f.event_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM fact_evidence fe
+              JOIN evidence e ON e.evidence_id = fe.evidence_id
+              WHERE fe.fact_id = f.fact_id
+                AND e.evidence_id NOT LIKE 'ev_demo_%'
+          )
+        ORDER BY COALESCE(f.occurred_at, f.updated_at, f.created_at) DESC, f.fact_id DESC
+        LIMIT 2
+        """,
+        (row["event_id"],),
+    ).fetchall()
+    return {
+        "event_id": row["event_id"],
+        "title": row["title"],
+        "fact_count": row["fact_count"],
+        "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d %H:%M"),
+        "recent_facts": [
+            {"fact_type": item["fact_type"], "content": item["content"]}
+            for item in summary_rows
+        ],
     }
 
 
@@ -1993,7 +2030,27 @@ def _prepare_timeline_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict[str, Any]:
-    thread_rows = conn.execute(
+    event_rows = conn.execute(
+        """
+        SELECT
+            ev.event_id,
+            ev.title,
+            COUNT(DISTINCT f.fact_id) AS fact_count,
+            MAX(COALESCE(f.occurred_at, f.updated_at, f.created_at, ev.updated_at)) AS last_activity_at
+        FROM events AS ev
+        JOIN facts AS f ON f.event_id = ev.event_id
+        WHERE EXISTS (
+            SELECT 1
+            FROM fact_evidence fe
+            JOIN evidence e ON e.evidence_id = fe.evidence_id
+            WHERE fe.fact_id = f.fact_id
+              AND e.evidence_id NOT LIKE 'ev_demo_%'
+        )
+        GROUP BY ev.event_id, ev.title
+        ORDER BY last_activity_at DESC, ev.updated_at DESC, ev.event_id DESC
+        """
+    ).fetchall()
+    demo_thread_rows = conn.execute(
         """
         SELECT
             t.thread_id,
@@ -2009,6 +2066,12 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
             END) AS source_platforms
         FROM threads AS t
         LEFT JOIN evidence AS e ON e.thread_id = t.thread_id
+        WHERE EXISTS (
+            SELECT 1
+            FROM evidence demo_e
+            WHERE demo_e.thread_id = t.thread_id
+              AND demo_e.evidence_id LIKE 'ev_demo_%'
+        )
         GROUP BY
             t.thread_id, t.title, t.status, t.version, t.risk_flags, t.last_activity_at
         ORDER BY t.last_activity_at DESC, t.thread_id ASC
@@ -2045,9 +2108,77 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
         row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
         decorated_recent_rows.append(row_dict)
     return {
-        "threads": [_prepare_thread_card(row) for row in thread_rows],
+        "my_events": [_prepare_event_card(conn, row) for row in event_rows],
+        "demo_threads": [_prepare_thread_card(row) for row in demo_thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
-        "recent_records": [_prepare_recent_row(row, sandbox) for row in decorated_recent_rows],
+        "recent_records": [_prepare_recent_row(conn, row, sandbox) for row in decorated_recent_rows],
+    }
+
+
+def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None:
+    event_row = conn.execute(
+        """
+        SELECT event_id, title, status, summary, created_at, updated_at
+        FROM events
+        WHERE event_id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+    if event_row is None:
+        return None
+
+    fact_rows = conn.execute(
+        """
+        SELECT fact_id, fact_type, content, occurred_at, created_at
+        FROM facts
+        WHERE event_id = ?
+        ORDER BY COALESCE(occurred_at, created_at) ASC, created_at ASC, fact_id ASC
+        """,
+        (event_id,),
+    ).fetchall()
+
+    facts: list[dict[str, Any]] = []
+    for row in fact_rows:
+        evidence_rows = conn.execute(
+            """
+            SELECT e.evidence_id, e.occurred_at, e.source_hint
+            FROM fact_evidence fe
+            JOIN evidence e ON e.evidence_id = fe.evidence_id
+            WHERE fe.fact_id = ?
+            ORDER BY e.occurred_at ASC, e.seq ASC, e.evidence_id ASC
+            """,
+            (row["fact_id"],),
+        ).fetchall()
+        facts.append(
+            {
+                "fact_id": row["fact_id"],
+                "fact_type": row["fact_type"],
+                "content": row["content"],
+                "occurred_at_text": _format_datetime(
+                    row["occurred_at"] if row["occurred_at"] is not None else row["created_at"],
+                    "%m-%d %H:%M",
+                ),
+                "evidence_links": [
+                    {
+                        "evidence_id": item["evidence_id"],
+                        "href": f"/evidence/{item['evidence_id']}",
+                        "label": f"{source_label(item['source_hint'])[0]} · {_format_datetime(item['occurred_at'], '%m-%d %H:%M')}",
+                    }
+                    for item in evidence_rows
+                ],
+            }
+        )
+
+    return {
+        "event": {
+            "event_id": event_row["event_id"],
+            "title": event_row["title"],
+            "status": event_row["status"],
+            "summary": event_row["summary"],
+            "fact_count": len(facts),
+            "updated_at_text": _format_datetime(event_row["updated_at"], "%m-%d %H:%M"),
+        },
+        "facts": facts,
     }
 
 
@@ -2618,6 +2749,7 @@ def create_app() -> FastAPI:
             parse_status = _get_parse_status(conn, evidence_id)
             extract_note = _get_extract_note(conn, evidence_id)
             parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
+            semantic_result = _build_semantic_result(conn, evidence_id)
             return {
                 "parse_status": parse_status,
                 "slots_filled": row["slots_filled"],
@@ -2625,6 +2757,8 @@ def create_app() -> FastAPI:
                 "deliverable": row["slot_deliverable"],
                 "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
                 "caveats": _decode_json_array(row["caveats"]),
+                "semantic_fact_preview": [] if semantic_result is None else semantic_result["facts"][:2],
+                "event_match": None if semantic_result is None else semantic_result.get("event_match"),
                 "detail": parse_detail,
                 "is_verified": _is_verified(conn, evidence_id),
                 "media_type": row["media_type"],
@@ -2848,11 +2982,35 @@ def create_app() -> FastAPI:
             "index.html",
             {
                 "page_title": "WorkChain",
-                "threads": context["threads"],
+                "my_events": context["my_events"],
+                "demo_threads": context["demo_threads"],
                 "references": context["references"],
                 "recent_records": context["recent_records"],
                 "source_presets": SOURCE_PRESETS,
                 "settings": _settings_payload(sandbox.db_path),
+                "current_search_q": "",
+            },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.get("/event/{event_id}", response_class=HTMLResponse)
+    def event_detail(
+        request: Request,
+        event_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        context = _fetch_event_detail(conn, event_id)
+        if context is None:
+            raise HTTPException(status_code=404, detail="event not found")
+        response = TEMPLATES.TemplateResponse(
+            request,
+            "event.html",
+            {
+                "page_title": context["event"]["title"],
+                "event": context["event"],
+                "facts": context["facts"],
                 "current_search_q": "",
             },
         )
