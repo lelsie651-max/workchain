@@ -607,11 +607,13 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 首页不再直接展示 `历史事项 / 最近证据 / 参考信息 / 导出入口 / diagnostics`;相关路由和兼容能力保留,其中 `记录` 与导出入口已迁移到独立 `/records` 页面
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
 - Event 详情页现已升级为 Competition Event Control Center V1:可修改事项名称、纠正 Fact 的 `content / fact_type / due_at`、直接补/改相关 Evidence 的记录日期,并通过受控接口切换 `active <-> resolved`
+- Event 详情页的原始 Evidence 改为事项级集中展示:在 header/action 区之后先渲染 `相关原始记录`,按当前 Event 全部 Facts 关联到的 `evidence_id` 去重后展示图片缩略图/文字摘要/文件信息,再进入弱化说明文字与 Facts 时间线;Fact 卡内不再重复渲染"支撑它的原始证据"
 - Event 页 Fact 纠正必须走 `correct_fact_by_user(...)`;只允许修改语义字段,不得改 `fact_id / semantic_run_id / Evidence` 关联,写入后统一标记 `origin=user / review_status=corrected` 并更新 `events.updated_at`
-- Evidence 详情页改为单列阅读流,顺序固定为:记录标题/来源/时间与轻量 badge -> 原始材料 -> 事项归属(如有) -> `AI 整理` -> 图片 OCR 折叠区 -> `记录信息` 折叠区 -> diagnostics(仅 dev-only);不再使用"解析结果 / 保存与校验"并列双栏
+- Evidence 详情页改为单列阅读流,顺序固定为:记录标题/来源/时间与轻量 badge -> 原始材料 -> 事项归属(如有) -> `AI 整理` -> 真 legacy 记录的兼容编辑(如有) -> `记录信息` 折叠区 -> diagnostics(仅 dev-only);不再使用"解析结果 / 保存与校验"并列双栏
 - Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,位置固定在原始材料之后、`AI 整理` 之前,并与首页共用同一服务端确认写入逻辑;完成后展示最终事项归属结果
 - Evidence 详情页若已存在 succeeded Semantic Run,主阅读区改为按 Fact 展示:每条 Fact 内部使用左事实/右解释的局部双栏,Interpretation 必须按稳定 `fact_id` 关联到对应 Fact;`fact_id = NULL` 的 Interpretation 单独进入`整体提醒`;只有无 Semantic Run 的旧记录继续保留兼容编辑入口
 - Evidence 详情页在存在相对日期 Fact 时,会在 `AI 整理` 标题下方展示统一的"记录日期"操作区:缺少 anchor 时允许补充日期,已有 anchor 时展示来源(`你填写的` / `从记录时间中识别`)并允许修改,不把日期操作重复塞进每条 Fact
+- Production Evidence 详情页不再向普通用户展示"看看系统读到了什么"、OCR transcript、machine extraction 摘要或 provider/model 等提取层信息;相关 extraction history、OCR/视觉能力与受控接口继续保留,但不作为正式 UI 入口
 - 首页提交成功后,前端不再 `window.location.reload()` 回首页,而是根据 `/api/evidence` 返回的 `evidence_id` 立即跳转 `/evidence/{id}`;这样即使尚未形成 Event,用户也能立即看到"刚刚这条记录在哪里、当前处理到哪一步"
 - Evidence 详情页对 `ocr_running / llm_running` 增加最小状态轮询:复用 `GET /api/evidence/{id}/status` 周期性刷新进度,在 `done / failed / unsupported` 稳定状态后停止轮询并重新渲染页面;不新增业务状态,不额外调用 AI
 - `/api/evidence/{id}/record-date` 只做确定性补算:保存 `meta` 中的 anchor/source=`user`,对 latest succeeded semantic run 内 `due_raw` 为相对日期的 Facts 重新计算 `due_at / due_anchor_at`,并以原子事务更新 `origin=user / review_status=corrected`;不重跑 DeepSeek,不改 Evidence 原件,不改 Semantic Run 历史
@@ -625,7 +627,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - PDF 导出
 - 完整举证包 zip 导出(全链)
 - 普通用户页面不直接展示 provider/model、parser version、semantic run id、HTTP status/latency/timeout、schema/provider/internal routing enum 等开发诊断信息;Evidence 普通区只展示用户可理解的整理结果、原始材料、事项归属、OCR 修正入口与`记录信息`折叠,其中`记录信息`只显示保存时间、记录时间(可选)、内容摘要 prefix 与完整性状态
-- diagnostics 能力继续保留,但统一受 `WORKCHAIN_DIAGNOSTICS=1` 控制:关闭时 diagnostics UI 不渲染,`/api/diag/llm`、`/api/diag/ocr`、Evidence diagnostics / preflight / Ark 实验接口全部返回 404,且不会额外触发真实模型探测
+- diagnostics 能力继续保留,但统一受 `WORKCHAIN_DIAGNOSTICS=1` 控制:Production 应设置 `WORKCHAIN_DIAGNOSTICS=0`,Dev 环境可设置为 `1`;关闭时 diagnostics UI、按钮与对应 JS 不渲染,`/api/diag/llm`、`/api/diag/ocr`、Evidence diagnostics / preflight / Ark 实验接口全部返回 404,且不会额外触发真实模型探测
 - diagnostics-only Visual A/B Diagnostics:可对同一图片 Evidence 临时运行 Ark Vision,与当前 machine extraction 做只读对照,结果不落库不改状态
 - diagnostics-only DeepSeek text preflight:可对同一 Evidence 临时运行轻量 JSON ping,不写 DB,用于区分 Key / 余额 / 模型 / API 问题与真实 Semantic Parser 问题
 - Evidence diagnostics 可追踪 Semantic Parser provider failure stage,仅暴露安全元数据(如 stage / http status / timeout / thinking mode / safe message),不包含 prompt、transcript 或完整模型输出,且这些信息只出现在 diagnostics 区

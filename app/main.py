@@ -2695,6 +2695,31 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
             "record_date_source_label": _semantic_anchor_source_label(record_date_source),
         }
 
+    def build_related_evidence_card(row: sqlite3.Row) -> dict[str, Any]:
+        platform, scene = source_label(row["source_hint"])
+        raw_text = row["raw_text"] or ""
+        filename = _extract_filename(raw_text)
+        extracted_text = _extract_file_text(raw_text)
+        preview_text = raw_text if row["media_type"] == "text" else extracted_text
+        return {
+            "evidence_id": row["evidence_id"],
+            "href": f"/evidence/{row['evidence_id']}",
+            "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
+            "media_type": row["media_type"],
+            "media_type_label": {
+                "image": "图片记录",
+                "text": "文字记录",
+                "file": "文件记录",
+            }.get(row["media_type"], "记录"),
+            "filename": filename,
+            "preview_text": preview_text,
+            "platform": platform,
+            "scene": scene,
+            "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
+            "captured_at_text": _format_datetime(row["captured_at"], "%m-%d %H:%M"),
+            "record_date_state": build_record_date_state(row["evidence_id"]),
+        }
+
     event_row = conn.execute(
         """
         SELECT event_id, title, status, summary, created_at, updated_at
@@ -2715,19 +2740,21 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
         """,
         (event_id,),
     ).fetchall()
+    related_evidence_rows = conn.execute(
+        """
+        SELECT DISTINCT
+            e.evidence_id, e.seq, e.media_type, e.raw_text, e.source_hint, e.occurred_at, e.captured_at
+        FROM facts f
+        JOIN fact_evidence fe ON fe.fact_id = f.fact_id
+        JOIN evidence e ON e.evidence_id = fe.evidence_id
+        WHERE f.event_id = ?
+        ORDER BY e.occurred_at ASC, e.seq ASC, e.evidence_id ASC
+        """,
+        (event_id,),
+    ).fetchall()
 
     facts: list[dict[str, Any]] = []
     for row in fact_rows:
-        evidence_rows = conn.execute(
-            """
-            SELECT e.evidence_id, e.occurred_at, e.source_hint
-            FROM fact_evidence fe
-            JOIN evidence e ON e.evidence_id = fe.evidence_id
-            WHERE fe.fact_id = ?
-            ORDER BY e.occurred_at ASC, e.seq ASC, e.evidence_id ASC
-            """,
-            (row["fact_id"],),
-        ).fetchall()
         facts.append(
             {
                 "fact_id": row["fact_id"],
@@ -2742,15 +2769,6 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
                     row["occurred_at"] if row["occurred_at"] is not None else row["created_at"],
                     "%m-%d %H:%M",
                 ),
-                "evidence_links": [
-                    {
-                        "evidence_id": item["evidence_id"],
-                        "href": f"/evidence/{item['evidence_id']}",
-                        "label": f"{source_label(item['source_hint'])[0]} · {_format_datetime(item['occurred_at'], '%m-%d %H:%M')}",
-                        "record_date_state": build_record_date_state(item["evidence_id"]),
-                    }
-                    for item in evidence_rows
-                ],
             }
         )
 
@@ -2766,6 +2784,7 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
             "fact_count": len(facts),
             "updated_at_text": _format_datetime(event_row["updated_at"], "%m-%d %H:%M"),
         },
+        "related_evidence": [build_related_evidence_card(row) for row in related_evidence_rows],
         "facts": facts,
         "fact_type_options": _event_fact_type_options(),
     }
@@ -2884,6 +2903,32 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "semantic_result": semantic_result,
         "assignment_subject": {"evidence_id": row["evidence_id"]},
     }
+
+
+def _has_legacy_semantic_data(evidence: dict[str, Any]) -> bool:
+    if evidence.get("slots_filled", 0):
+        return True
+    if evidence.get("plain_summary"):
+        return True
+    if evidence.get("deliverable") or evidence.get("due_date_value") or evidence.get("due_text"):
+        return True
+    if evidence.get("caveats"):
+        return True
+    if evidence.get("kind") != "reference":
+        return True
+    return evidence.get("slot_direction") not in {None, "none"}
+
+
+def _should_show_legacy_editor(
+    *,
+    evidence: dict[str, Any],
+    parse_status: str,
+) -> bool:
+    if evidence.get("semantic_result") is not None:
+        return False
+    if parse_status in {PARSE_STATUS_OCR_RUNNING, PARSE_STATUS_LLM_RUNNING, "pending"}:
+        return False
+    return _has_legacy_semantic_data(evidence)
 
 
 def _build_evidence_diagnostics(
@@ -3930,6 +3975,7 @@ def create_app() -> FastAPI:
             {
                 "page_title": context["event"]["title"],
                 "event": context["event"],
+                "related_evidence": context["related_evidence"],
                 "facts": context["facts"],
                 "fact_type_options": context["fact_type_options"],
                 "current_search_q": "",
@@ -3976,6 +4022,10 @@ def create_app() -> FastAPI:
             {
                 "page_title": "记录详情",
                 "evidence": context,
+                "show_legacy_editor": _should_show_legacy_editor(
+                    evidence=context,
+                    parse_status=parse_status,
+                ),
                 "parse_status": parse_status,
                 "parse_status_label": _parse_status_label(parse_status),
                 "parse_detail": parse_detail,

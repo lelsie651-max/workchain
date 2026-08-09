@@ -1,6 +1,53 @@
 {% extends "base.html" %}
 
 {% block content %}
+{% macro render_related_record_date(state, evidence_id) %}
+<div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+    {% if state.record_date %}
+    <div data-record-date-display>
+        <p class="text-sm text-slate-100">记录日期：{{ state.record_date }}</p>
+        {% if state.record_date_source_label %}
+        <p class="mt-1 text-xs text-slate-400">来源：{{ state.record_date_source_label }}</p>
+        {% endif %}
+    </div>
+    {% else %}
+    <div data-record-date-display class="space-y-1">
+        <p class="text-sm text-slate-100">这条证据里有“今天 / 周五”等相对时间。</p>
+        <p class="text-sm text-slate-400">补充记录日期后，截止时间会自动换算。</p>
+    </div>
+    {% endif %}
+    <form
+        class="mt-3 {% if state.record_date %}hidden{% endif %} flex flex-wrap items-center gap-3"
+        data-record-date-form
+        data-evidence-id="{{ evidence_id }}"
+    >
+        <input
+            type="date"
+            min="1900-01-01"
+            max="2100-12-31"
+            value="{{ state.record_date or '' }}"
+            data-record-date-input
+            class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+        >
+        <button
+            type="submit"
+            class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+        >
+            确认
+        </button>
+    </form>
+    {% if state.record_date %}
+    <button
+        type="button"
+        data-record-date-toggle
+        class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+    >
+        修改
+    </button>
+    {% endif %}
+</div>
+{% endmacro %}
+
 <section class="space-y-6">
     <div
         id="event-flash"
@@ -82,8 +129,55 @@
                 </a>
             </div>
         </div>
-        <p class="mt-4 text-sm leading-7 text-slate-300">这里是这件事的主控制面。你可以改名称、纠正 AI 整理出的事实、补记录日期，以及把它结档或重新打开。</p>
     </div>
+
+    {% if related_evidence %}
+    <section class="rounded-2xl border border-slate-800 bg-slate-900/60 p-5">
+        <div class="flex items-center justify-between gap-3">
+            <h2 class="text-lg font-semibold text-white">相关原始记录</h2>
+            <p class="text-xs text-slate-500">{{ related_evidence|length }} 条</p>
+        </div>
+        <div class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {% for evidence in related_evidence %}
+            <article class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4" data-related-evidence-card="{{ evidence.evidence_id }}" data-related-evidence-type="{{ evidence.media_type }}">
+                {% if evidence.media_type == "image" and evidence.blob_url %}
+                <a href="{{ evidence.href }}" class="block overflow-hidden rounded-xl border border-slate-800 bg-slate-900/70">
+                    <img src="{{ evidence.blob_url }}" alt="{{ evidence.filename or '图片记录' }}" class="h-40 w-full object-cover">
+                </a>
+                {% elif evidence.media_type == "text" %}
+                <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+                    <p class="text-xs uppercase tracking-wide text-slate-500">原始文字摘要</p>
+                    <p class="mt-2 wc-line-clamp-3 text-sm leading-7 text-slate-200">{{ evidence.preview_text }}</p>
+                </div>
+                {% else %}
+                <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+                    <p class="text-xs uppercase tracking-wide text-slate-500">{{ evidence.media_type_label }}</p>
+                    <p class="mt-2 text-sm text-slate-100">{{ evidence.filename or "未命名文件" }}</p>
+                </div>
+                {% endif %}
+
+                <div class="mt-3 space-y-1 text-xs leading-6 text-slate-400">
+                    <p>{{ evidence.platform }}{% if evidence.scene %} / {{ evidence.scene }}{% endif %}</p>
+                    <p>记录时间 {{ evidence.occurred_at_text }} · 保存时间 {{ evidence.captured_at_text }}</p>
+                </div>
+
+                {% if evidence.record_date_state %}
+                {{ render_related_record_date(evidence.record_date_state, evidence.evidence_id) }}
+                {% endif %}
+
+                <a
+                    href="{{ evidence.href }}"
+                    class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                >
+                    查看完整记录
+                </a>
+            </article>
+            {% endfor %}
+        </div>
+    </section>
+    {% endif %}
+
+    <p class="text-sm leading-7 text-slate-400">这里是这件事的主控制面。你可以改名称、纠正 AI 整理出的事实、补记录日期，以及把它结档或重新打开。</p>
 
     <div class="space-y-4">
         {% for fact in facts %}
@@ -161,68 +255,6 @@
                     </button>
                 </div>
             </form>
-            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-                <p class="text-xs uppercase tracking-wide text-slate-500">支撑它的原始证据</p>
-                <p class="mt-2 text-xs leading-6 text-slate-400">这里既保留“查看原始证据”，也直接暴露需要补记录日期的那条证据。</p>
-                <div class="mt-3 space-y-3">
-                    {% for evidence in fact.evidence_links %}
-                    <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                        <a
-                            href="{{ evidence.href }}"
-                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            查看原始证据：{{ evidence.label }}
-                        </a>
-                        {% if evidence.record_date_state %}
-                        <div class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-                            {% if evidence.record_date_state.record_date %}
-                            <div data-record-date-display>
-                                <p class="text-sm text-slate-100">记录日期：{{ evidence.record_date_state.record_date }}</p>
-                                {% if evidence.record_date_state.record_date_source_label %}
-                                <p class="mt-1 text-xs text-slate-400">来源：{{ evidence.record_date_state.record_date_source_label }}</p>
-                                {% endif %}
-                            </div>
-                            {% else %}
-                            <div data-record-date-display class="space-y-1">
-                                <p class="text-sm text-slate-100">这条证据里有“今天 / 周五”等相对时间。</p>
-                                <p class="text-sm text-slate-400">补充记录日期后，截止时间会自动换算。</p>
-                            </div>
-                            {% endif %}
-                            <form
-                                class="mt-3 {% if evidence.record_date_state.record_date %}hidden{% endif %} flex flex-wrap items-center gap-3"
-                                data-record-date-form
-                                data-evidence-id="{{ evidence.evidence_id }}"
-                            >
-                                <input
-                                    type="date"
-                                    min="1900-01-01"
-                                    max="2100-12-31"
-                                    value="{{ evidence.record_date_state.record_date or '' }}"
-                                    data-record-date-input
-                                    class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                                >
-                                <button
-                                    type="submit"
-                                    class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-                                >
-                                    确认
-                                </button>
-                            </form>
-                            {% if evidence.record_date_state.record_date %}
-                            <button
-                                type="button"
-                                data-record-date-toggle
-                                class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                            >
-                                修改
-                            </button>
-                            {% endif %}
-                        </div>
-                        {% endif %}
-                    </div>
-                    {% endfor %}
-                </div>
-            </div>
         </article>
         {% endfor %}
     </div>

@@ -619,9 +619,12 @@ def test_event_detail_shows_facts_and_evidence_link(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     assert "事项详情" in response.text
+    assert "相关原始记录" in response.text
     assert "请今天补签供应商合同。" in response.text
     assert "修改事项名称" in response.text
-    assert "查看原始证据" in response.text
+    assert "查看完整记录" in response.text
+    assert "支撑它的原始证据" not in response.text
+    assert f'data-related-evidence-card="{evidence_id}"' in response.text
     assert f'href="/evidence/{evidence_id}"' in response.text
 
 
@@ -678,13 +681,13 @@ def test_evidence_detail_script_has_single_evidence_id_and_independent_initializ
     assert "const initRecordDateEditor = () => {" in html
     assert "const initEventAssignmentForm = () => {" in html
     assert "const initSlotsForm = () => {" in html
-    assert "const initOcrEditor = () => {" in html
     assert "initRecordDateEditor();" in html
     assert "initEventAssignmentForm();" in html
     assert "initSlotsForm();" in html
-    assert "initOcrEditor();" in html
     assert 'id="record-date-toggle"' in html
     assert "setRecordDateEditorOpen(true, elements);" in html
+    assert "看看系统读到了什么" not in html
+    assert 'id="edit-ocr-text"' not in html
 
 
 def test_evidence_detail_hides_legacy_slots_form_for_semantic_records(tmp_path, monkeypatch):
@@ -750,6 +753,20 @@ def test_legacy_evidence_detail_keeps_slots_form_without_semantic_run(tmp_path, 
     try:
         conn.execute(
             """
+            UPDATE evidence
+            SET plain_summary = ?, slot_deliverable = ?, slot_due_raw = ?, caveats = ?
+            WHERE evidence_id = ?
+            """,
+            (
+                "旧兼容摘要仍需要保留。",
+                "旧交付物",
+                "周五前",
+                json.dumps(["旧提醒"], ensure_ascii=False),
+                evidence_id,
+            ),
+        )
+        conn.execute(
+            """
             DELETE FROM interpretations
             WHERE semantic_run_id IN (
                 SELECT semantic_run_id FROM semantic_run_inputs WHERE evidence_id = ?
@@ -803,6 +820,7 @@ def test_legacy_evidence_detail_keeps_slots_form_without_semantic_run(tmp_path, 
     assert create_response.status_code == 200
     assert 'id="slots-form"' in detail_response.text
     assert 'id="slot-deliverable"' in detail_response.text
+    assert "旧兼容摘要仍需要保留。" in detail_response.text
 
 
 def test_event_title_can_be_updated(tmp_path, monkeypatch):
@@ -1208,6 +1226,8 @@ def test_image_evidence_detail_shows_processing_state_and_status_polling_script(
     assert "刚刚这条记录" not in html
     assert 'mt-6 grid gap-4 md:grid-cols-2' not in html
     assert "保存与校验" not in html
+    assert "兼容编辑" not in html
+    assert "看看系统读到了什么" not in html
     assert "记录信息" in html
     assert f'const evidenceId = "{evidence_id}";' in html
     assert 'const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);' in html
@@ -2457,13 +2477,9 @@ def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monk
 
     assert index_response.status_code == 200
     assert detail_response.status_code == 200
-    detail_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", detail_response.text)
-    assert detail_details is not None
-    assert "open" not in detail_details.group(0)
     assert 'mt-6 grid gap-4 md:grid-cols-2' not in detail_response.text
     assert "保存与校验" not in detail_response.text
-    assert detail_response.text.index("AI 整理") < detail_response.text.index("看看系统读到了什么")
-    assert detail_response.text.index("有人要求在周五前交付渠道复盘数据。") < detail_response.text.index("看看系统读到了什么")
+    assert "看看系统读到了什么" not in detail_response.text
     assert "这句话怎么理解" in detail_response.text
     assert "整体提醒" in detail_response.text
     assert "建议确认" in detail_response.text
@@ -3475,7 +3491,8 @@ def test_patch_ocr_text_updates_raw_text_without_changing_hashes_and_keeps_verif
     finally:
         conn.close()
 
-    assert "已人工校正" in detail_response.text
+    assert "已人工校正" not in detail_response.text
+    assert "看看系统读到了什么" not in detail_response.text
 
 
 def test_patch_ocr_text_triggers_reparse_without_consuming_ocr_quota(tmp_path, monkeypatch):
@@ -3893,6 +3910,25 @@ def test_detail_page_keeps_legacy_summary_when_no_semantic_run_exists(tmp_path, 
     assert "记录信息" in detail_response.text
 
 
+def test_failed_new_evidence_without_legacy_data_hides_legacy_editor(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "这条新记录会解析失败。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+            detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert "兼容编辑" not in detail_response.text
+    assert "看看系统读到了什么" not in detail_response.text
+    assert "记录信息" in detail_response.text
+
+
 def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monkeypatch):
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
@@ -3916,7 +3952,8 @@ def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monk
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert detail_response.status_code == 200
-    assert "机器提取" in detail_response.text
+    assert "看看系统读到了什么" not in detail_response.text
+    assert "机器提取" not in detail_response.text
     assert "DashScope" not in detail_response.text
     assert "vanchin/deepseek-ocr" not in detail_response.text
 
@@ -3941,6 +3978,7 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
                 deepseek_response = client.post(f"/api/evidence/{evidence_id}/diagnostics/deepseek-preflight")
 
     assert detail_response.status_code == 200
+    assert "看看系统读到了什么" not in detail_response.text
     assert "解析诊断" not in detail_response.text
     assert "Doubao Ark" not in detail_response.text
     assert "DeepSeek" not in detail_response.text
@@ -3998,6 +4036,7 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
                         diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
 
     assert detail_response.status_code == 200
+    assert "看看系统读到了什么" not in detail_response.text
     assert "解析诊断" in detail_response.text
     assert "Semantic Parser" in detail_response.text
     assert "测试 DeepSeek 连接" in detail_response.text
@@ -6001,6 +6040,8 @@ def test_event_page_can_update_record_date_for_image_evidence_and_time_only_obse
         conn.close()
 
     assert "这条证据里有“今天 / 周五”等相对时间。" in detail_before.text
+    assert "相关原始记录" in detail_before.text
+    assert f'data-related-evidence-card="{evidence_id}"' in detail_before.text
     assert f'data-evidence-id="{evidence_id}"' in detail_before.text
     assert update_response.status_code == 200
     assert update_response.json()["updated_fact_count"] == 1
@@ -6011,6 +6052,122 @@ def test_event_page_can_update_record_date_for_image_evidence_and_time_only_obse
     assert "记录日期：2026-08-09" in detail_after.text
     assert "来源：你填写的" in detail_after.text
     assert "修改" in detail_after.text
+
+
+def test_event_detail_aggregates_related_evidence_once_per_evidence_and_renders_media_types(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+            VALUES ('evt_related', '事项级原始记录', 'active', NULL, 1, 1)
+            """
+        )
+        evidence_rows = [
+            (
+                "ev_related_text",
+                901,
+                "text",
+                None,
+                "第一条文字原始记录，保留给事项级原始证据区做摘要展示。",
+                "飞书-项目复盘群",
+                1_720_000_001_000,
+                1_720_000_001_000,
+            ),
+            (
+                "ev_related_image",
+                902,
+                "image",
+                "aa/hash-image.bin",
+                "[图片] 截图.png",
+                "企业微信-私聊",
+                1_720_000_002_000,
+                1_720_000_002_000,
+            ),
+            (
+                "ev_related_file",
+                903,
+                "file",
+                "bb/hash-file.bin",
+                "[文件] 合同.pdf\n\n这是提取出来的合同正文。",
+                "邮箱-附件",
+                1_720_000_003_000,
+                1_720_000_003_000,
+            ),
+        ]
+        for evidence_id, seq, media_type, blob_path, raw_text, source_hint, occurred_at, captured_at in evidence_rows:
+            conn.execute(
+                """
+                INSERT INTO evidence (
+                    evidence_id, seq, thread_id, kind, media_type, blob_path, raw_text, source_hint,
+                    slot_requester, slot_owner, slot_deliverable, slot_due, slot_due_raw, slot_direction,
+                    slots_filled, plain_summary, caveats, occurred_at, captured_at,
+                    content_hash, prev_hash, chain_hash
+                ) VALUES (?, ?, NULL, 'reference', ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, '[]', ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    seq,
+                    media_type,
+                    blob_path,
+                    raw_text,
+                    source_hint,
+                    occurred_at,
+                    captured_at,
+                    f"hash_{evidence_id}",
+                    f"prev_{evidence_id}",
+                    f"chain_{evidence_id}",
+                ),
+            )
+        fact_rows = [
+            ("fact_related_1", "request", "第一条事实引用文字证据。", "ev_related_text"),
+            ("fact_related_2", "statement", "第二条事实也引用同一条文字证据。", "ev_related_text"),
+            ("fact_related_3", "reference", "第三条事实引用图片证据。", "ev_related_image"),
+            ("fact_related_4", "reference", "第四条事实引用文件证据。", "ev_related_file"),
+        ]
+        for index, (fact_id, fact_type, content, evidence_id) in enumerate(fact_rows, start=1):
+            conn.execute(
+                """
+                INSERT INTO facts (
+                    fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw, due_anchor_at,
+                    confidence, event_assignment, event_assignment_confidence, origin, review_status,
+                    semantic_run_id, created_at, updated_at
+                ) VALUES (?, 'evt_related', ?, ?, ?, NULL, NULL, NULL, NULL, 'confirmed', NULL, 'ai', 'unreviewed', NULL, ?, ?)
+                """,
+                (fact_id, fact_type, content, 1_720_000_000_000 + index, index, index),
+            )
+            conn.execute(
+                "INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)",
+                (fact_id, evidence_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get("/event/evt_related")
+
+    assert response.status_code == 200
+    assert "相关原始记录" in response.text
+    assert response.text.count('data-related-evidence-card="ev_related_text"') == 1
+    assert response.text.count('data-related-evidence-card="ev_related_image"') == 1
+    assert response.text.count('data-related-evidence-card="ev_related_file"') == 1
+    assert 'data-related-evidence-type="text"' in response.text
+    assert 'data-related-evidence-type="image"' in response.text
+    assert 'data-related-evidence-type="file"' in response.text
+    assert "第一条文字原始记录，保留给事项级原始证据区做摘要展示。" in response.text
+    assert "合同.pdf" in response.text
+    assert 'src="/blob/ev_related_image"' in response.text
+    assert 'href="/evidence/ev_related_text"' in response.text
+    assert 'href="/evidence/ev_related_image"' in response.text
+    assert 'href="/evidence/ev_related_file"' in response.text
+    assert "支撑它的原始证据" not in response.text
+    assert "查看原始证据" not in response.text
 
 
 def test_event_status_moves_between_active_and_history_without_touching_facts_or_chain(tmp_path, monkeypatch):
