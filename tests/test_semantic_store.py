@@ -29,6 +29,7 @@ from evidence_core.semantic_store import (
     mark_semantic_run_succeeded,
     persist_event_match_run_result,
     persist_semantic_run_result,
+    review_event_match_run_by_user,
     set_event_assignment_by_ai,
     set_event_assignment_by_user,
     update_fact_by_ai,
@@ -97,6 +98,89 @@ def _create_machine_extraction(
         warnings=[],
         created_at=created_at,
     )
+
+
+def _prepare_reviewable_match_run(
+    conn,
+    blobs_root: Path,
+    *,
+    routing_mode: str = "confirm",
+    normalized_match: dict | None = None,
+):
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    run = create_semantic_run(
+        conn,
+        semantic_run_id=f"srun-{routing_mode}",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=10,
+    )
+    persisted = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-a",
+                "fact_type": "request",
+                "content": "请补一版渠道复盘",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 11,
+                "updated_at": 11,
+            },
+            {
+                "fact_id": "fact-b",
+                "fact_type": "statement",
+                "content": "客户回访也要整理",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 12,
+                "updated_at": 12,
+            },
+        ],
+        interpretations=[],
+        completed_at=13,
+    )
+    match_run = create_event_match_run(
+        conn,
+        event_match_run_id=f"mrun-{routing_mode}",
+        semantic_run_id=run["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=14,
+    )
+    result = persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run["event_match_run_id"],
+        semantic_run_id=run["semantic_run_id"],
+        routing_mode=routing_mode,
+        normalized_match=normalized_match
+        or {
+            "groups": [
+                {
+                    "fact_indexes": [0],
+                    "target": "existing",
+                    "event_id": "evt-1",
+                    "proposed_title": None,
+                    "confidence": 0.74,
+                    "reason": "像是在延续旧事项",
+                },
+                {
+                    "fact_indexes": [1],
+                    "target": "new",
+                    "event_id": None,
+                    "proposed_title": "整理客户回访",
+                    "confidence": 0.71,
+                    "reason": "也可能是另一件事",
+                },
+            ],
+            "ambiguities": [],
+        },
+        facts=persisted["facts"],
+        completed_at=15,
+    )
+    return ev1, run, persisted, result
 
 
 def test_create_submission_keeps_evidence_order(db_file, blobs_root):
@@ -1324,6 +1408,270 @@ def test_event_match_run_auto_rolls_back_on_protected_fact(db_file, blobs_root):
     assert match_row["status"] == "running"
     assert match_row["routing_mode"] is None
     assert match_row["result_json"] is None
+
+
+def test_review_event_match_run_assigns_existing_and_new_atomically(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=1, updated_at=1)
+    ev1, run, _, reviewed_source = _prepare_reviewable_match_run(conn, blobs_root)
+
+    reviewed = review_event_match_run_by_user(
+        conn,
+        evidence_id=ev1["evidence_id"],
+        event_match_run_id=reviewed_source["event_match_run_id"],
+        decisions=[
+            {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+            {"group_index": 1, "choice": "new", "new_title": "整理客户回访"},
+        ],
+        reviewed_at=20,
+    )
+
+    fact_rows = conn.execute(
+        "SELECT fact_id, event_id, event_assignment FROM facts ORDER BY fact_id ASC"
+    ).fetchall()
+    new_event = conn.execute(
+        "SELECT event_id, title FROM events WHERE event_id != 'evt-1' ORDER BY created_at DESC LIMIT 1"
+    ).fetchone()
+
+    assert reviewed["review_status"] == "completed"
+    assert reviewed["reviewed_at"] == 20
+    assert fact_rows[0]["event_id"] == "evt-1"
+    assert fact_rows[0]["event_assignment"] == "confirmed"
+    assert fact_rows[1]["event_id"] == new_event["event_id"]
+    assert fact_rows[1]["event_assignment"] == "confirmed"
+    assert new_event["title"] == "整理客户回访"
+    assert run["semantic_run_id"] == "srun-confirm"
+
+
+def test_review_event_match_run_needs_context_can_leave_group_unassigned(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1, _, _, reviewed_source = _prepare_reviewable_match_run(
+        conn,
+        blobs_root,
+        routing_mode="needs_context",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0, 1],
+                    "target": "unassigned",
+                    "event_id": None,
+                    "proposed_title": None,
+                    "confidence": 0.0,
+                    "reason": "上下文不足",
+                }
+            ],
+            "ambiguities": [],
+        },
+    )
+
+    reviewed = review_event_match_run_by_user(
+        conn,
+        evidence_id=ev1["evidence_id"],
+        event_match_run_id=reviewed_source["event_match_run_id"],
+        decisions=[{"group_index": 0, "choice": "unassigned"}],
+        reviewed_at=21,
+    )
+
+    rows = conn.execute(
+        "SELECT event_id, event_assignment FROM facts ORDER BY fact_id ASC"
+    ).fetchall()
+    assert reviewed["review_status"] == "completed"
+    assert all(row["event_id"] is None and row["event_assignment"] == "unassigned" for row in rows)
+
+
+def test_review_event_match_run_deduplicates_same_new_title_in_single_submit(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1, _, _, reviewed_source = _prepare_reviewable_match_run(
+        conn,
+        blobs_root,
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0],
+                    "target": "new",
+                    "event_id": None,
+                    "proposed_title": "事项A",
+                    "confidence": 0.7,
+                    "reason": "第一组",
+                },
+                {
+                    "fact_indexes": [1],
+                    "target": "new",
+                    "event_id": None,
+                    "proposed_title": "事项B",
+                    "confidence": 0.7,
+                    "reason": "第二组",
+                },
+            ],
+            "ambiguities": [],
+        },
+    )
+
+    review_event_match_run_by_user(
+        conn,
+        evidence_id=ev1["evidence_id"],
+        event_match_run_id=reviewed_source["event_match_run_id"],
+        decisions=[
+            {"group_index": 0, "choice": "new", "new_title": "  同一个事项  "},
+            {"group_index": 1, "choice": "new", "new_title": "同一个事项"},
+        ],
+        reviewed_at=22,
+    )
+
+    events = conn.execute("SELECT event_id, title FROM events ORDER BY created_at ASC").fetchall()
+    fact_rows = conn.execute("SELECT fact_id, event_id FROM facts ORDER BY fact_id ASC").fetchall()
+    assert len(events) == 1
+    assert events[0]["title"] == "同一个事项"
+    assert fact_rows[0]["event_id"] == events[0]["event_id"]
+    assert fact_rows[1]["event_id"] == events[0]["event_id"]
+
+
+def test_review_event_match_run_rejects_stale_run(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=1, updated_at=1)
+    ev1, _, _, first_review_source = _prepare_reviewable_match_run(conn, blobs_root)
+
+    run2 = create_semantic_run(
+        conn,
+        semantic_run_id="srun-newer",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        inputs=[{"evidence_id": ev1["evidence_id"], "position": 0}],
+        created_at=30,
+    )
+    persisted2 = persist_semantic_run_result(
+        conn,
+        semantic_run_id=run2["semantic_run_id"],
+        facts=[
+            {
+                "fact_id": "fact-newer",
+                "fact_type": "statement",
+                "content": "新的事实",
+                "evidence_ids": [ev1["evidence_id"]],
+                "created_at": 31,
+                "updated_at": 31,
+            }
+        ],
+        interpretations=[],
+        completed_at=32,
+    )
+    match_run2 = create_event_match_run(
+        conn,
+        event_match_run_id="mrun-newer",
+        semantic_run_id=run2["semantic_run_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        matcher_version="1.0",
+        created_at=33,
+    )
+    persist_event_match_run_result(
+        conn,
+        event_match_run_id=match_run2["event_match_run_id"],
+        semantic_run_id=run2["semantic_run_id"],
+        routing_mode="confirm",
+        normalized_match={
+            "groups": [
+                {
+                    "fact_indexes": [0],
+                    "target": "existing",
+                    "event_id": "evt-1",
+                    "proposed_title": None,
+                    "confidence": 0.8,
+                    "reason": "更新后的建议",
+                }
+            ],
+            "ambiguities": [],
+        },
+        facts=persisted2["facts"],
+        completed_at=34,
+    )
+
+    with pytest.raises(SemanticStoreError, match="stale"):
+        review_event_match_run_by_user(
+            conn,
+            evidence_id=ev1["evidence_id"],
+            event_match_run_id=first_review_source["event_match_run_id"],
+            decisions=[
+                {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+                {"group_index": 1, "choice": "new", "new_title": "整理客户回访"},
+            ],
+            reviewed_at=35,
+        )
+
+    stale_run = conn.execute(
+        "SELECT review_status FROM event_match_runs WHERE event_match_run_id = ?",
+        (first_review_source["event_match_run_id"],),
+    ).fetchone()
+    assert stale_run["review_status"] == "pending"
+
+
+def test_review_event_match_run_rejects_non_active_event_and_rolls_back(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=1, updated_at=1)
+    create_event(conn, event_id="evt-2", title="旧事项", status="resolved", created_at=2, updated_at=2)
+    ev1, _, _, reviewed_source = _prepare_reviewable_match_run(conn, blobs_root)
+
+    with pytest.raises(SemanticStoreError, match="active event not found"):
+        review_event_match_run_by_user(
+            conn,
+            evidence_id=ev1["evidence_id"],
+            event_match_run_id=reviewed_source["event_match_run_id"],
+            decisions=[
+                {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+                {"group_index": 1, "choice": "existing", "event_id": "evt-2"},
+            ],
+            reviewed_at=36,
+        )
+
+    fact_rows = conn.execute(
+        "SELECT fact_id, event_id, event_assignment FROM facts ORDER BY fact_id ASC"
+    ).fetchall()
+    reviewed_row = conn.execute(
+        "SELECT review_status, reviewed_at FROM event_match_runs WHERE event_match_run_id = ?",
+        (reviewed_source["event_match_run_id"],),
+    ).fetchone()
+    assert all(row["event_id"] is None and row["event_assignment"] == "unassigned" for row in fact_rows)
+    assert reviewed_row["review_status"] == "pending"
+    assert reviewed_row["reviewed_at"] is None
+
+
+def test_review_event_match_run_cannot_be_submitted_twice_and_ai_cannot_override(db_file, blobs_root):
+    conn = init_db(db_file)
+    create_event(conn, event_id="evt-1", title="渠道复盘", created_at=1, updated_at=1)
+    ev1, _, _, reviewed_source = _prepare_reviewable_match_run(conn, blobs_root)
+
+    review_event_match_run_by_user(
+        conn,
+        evidence_id=ev1["evidence_id"],
+        event_match_run_id=reviewed_source["event_match_run_id"],
+        decisions=[
+            {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+            {"group_index": 1, "choice": "new", "new_title": "整理客户回访"},
+        ],
+        reviewed_at=37,
+    )
+
+    with pytest.raises(SemanticStoreError, match="already completed"):
+        review_event_match_run_by_user(
+            conn,
+            evidence_id=ev1["evidence_id"],
+            event_match_run_id=reviewed_source["event_match_run_id"],
+            decisions=[
+                {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+                {"group_index": 1, "choice": "new", "new_title": "整理客户回访"},
+            ],
+            reviewed_at=38,
+        )
+    with pytest.raises(ProtectedFactError, match="confirmed event assignment"):
+        set_event_assignment_by_ai(
+            conn,
+            fact_id="fact-a",
+            event_id="evt-1",
+            assignment="suggested",
+            event_assignment_confidence=0.2,
+            updated_at=39,
+        )
 
 
 def test_event_match_run_lifecycle_failed_and_supersedes_history(db_file, blobs_root):

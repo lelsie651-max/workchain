@@ -80,15 +80,15 @@
 - **可解释**:用户看到的是"系统识别到谁说了什么、谁确认了什么、哪里发生了变更",而不是"AI 觉得这是不是我的活"
 - 身份缺失、身份变化或多人协作场景下,底层模型仍然稳定
 
-### D4. 归档不追求全自动
+### D4. 归入事项不追求全自动
 **决策**:
-- 高置信度且语义单一时,允许自动归档到已有事件
+- 高置信度且语义单一时,允许自动归入已有事项
 - 存在分叉、多事件候选或冲突语义时,只给建议并要求用户确认
-- 低置信度或上下文不足时,进入"待归档",不得自动瞎建事件
+- 低置信度或上下文不足时,进入"待确认归属",不得自动瞎建事件
 - **是否 auto / confirm / needs_context 由确定性代码策略决定,不由模型决定**
 
 **理由**:
-- 事实层一旦错误归档,后续所有事件时间线都会被污染
+- 事实层一旦错误归入事项,后续所有事件时间线都会被污染
 - 把不确定性显式暴露出来,比假装全自动更可靠
 - 用户确认本身就是高价值标注数据
 
@@ -103,7 +103,7 @@
 - Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
 - Production 路由现为 `Semantic Parser succeeded -> Event Matcher -> deterministic routing`;仅当本次 Semantic Run 成功且生成了新 Fact 时才运行 Event Matcher
 - Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
-- 只有 `routing_mode=auto` 才会实际写入 `facts.event_id / event_assignment`; `confirm / needs_context` 只保存建议结果,等待后续用户决定
+- 只有 `routing_mode=auto` 才会自动写入 `facts.event_id / event_assignment`; `confirm / needs_context` 会保存建议结果并进入用户确认归属流程
 
 **理由**:
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
@@ -428,6 +428,38 @@ V2 的目标底层关系为:
 - `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
 - `semantic_runs / semantic_run_inputs / facts.semantic_run_id / interpretations.semantic_run_id` 同样不进入 Evidence 哈希链
 
+### 3.10 V8 事项归属确认履历
+
+#### event_match_runs
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| event_match_run_id | TEXT PK | 一次 Event Matcher 运行 |
+| semantic_run_id | TEXT NOT NULL | 对应的 Semantic Run |
+| provider | TEXT NOT NULL | 供应方 |
+| model | TEXT NOT NULL | 模型名 |
+| matcher_version | TEXT NOT NULL | Matcher 版本 |
+| status | TEXT NOT NULL | running / succeeded / failed |
+| routing_mode | TEXT NULL | auto / confirm / needs_context |
+| result_json | TEXT NULL | 仅保存 Fact ID 映射后的安全快照 |
+| failure_type | TEXT NULL | 失败类型 |
+| created_at | INTEGER NOT NULL | 创建时间 |
+| completed_at | INTEGER NULL | matcher 完成时间 |
+| supersedes_run_id | TEXT NULL | 指向旧 run |
+| review_status | TEXT NOT NULL | pending / completed |
+| reviewed_at | INTEGER NULL | 用户完成确认归属的时间 |
+
+确认语义边界:
+- `auto` 成功后直接写入 Fact 归属,并把 `review_status` 记为 `completed`
+- `confirm / needs_context` 成功后只保存建议结果,`review_status=pending`,等待用户确认归属
+- 用户提交时客户端只允许提交 `event_match_run_id + group_index + choice(existing/new/unassigned) + event_id/new_title`;不得提交 `fact_ids`
+- 服务端必须从已保存的安全 `result_json` 重新取出真实 `fact_ids`,并校验该 run 仍然是当前 Evidence 最新的 succeeded match run
+- `existing` 只能指向 active Event;`new_title` 必须 trim 后非空且长度受限;所有 groups 必须一次性给出决定
+- 用户确认写入必须整批原子完成:existing/new 写成 `event_assignment=confirmed`,unassigned 保持 `event_id=NULL` 但视为用户已决定
+- 同一次提交里若多个 new group 的规范化标题完全相同,只创建一个 Event 并共同归入
+- 完成后统一更新相关 `events.updated_at`,并把 run 标记为 `review_status=completed`
+- 用户确认后的 `event_assignment=confirmed` 后续不得被 AI 覆盖;该流程不得改写 Fact 内容,也不得影响 Evidence 哈希链
+
 ---
 
 ## 4. 哈希链算法(核心)
@@ -554,7 +586,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 **正在收口**
 - Event Matcher:Fact 分组 + 归属建议
 - `auto / confirm / needs_context` 由确定性 routing policy 决定,不由模型决定
-- V1 production apply:matcher result 以 run 履历保存;仅 auto 真正归档,confirm / needs_context 不自动改 Fact
+- V1 production apply:matcher result 以 run 履历保存;`auto` 自动归入事项,`confirm / needs_context` 通过用户确认归属一次性落库
 
 ### 阶段四:界面与导出
 **已完成首版**
@@ -563,6 +595,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 旧 demo threads 已降级为 `看看示例`,与真实 Event 分区展示,不再混为同一数据体系
 - `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要与事件归档状态;没有 Semantic Run 的旧记录继续回退兼容层
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
+- Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,完成后展示最终事项归属结果
 - Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、原件完整保存与校验、以及 `auto / confirm / needs_context` 的真实行为
 - 访客沙箱(`wc_sid`)与 24 小时过期清理
 - 图片/文档上传、预览、Lightbox
@@ -604,6 +637,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-08 | V6 新增 Semantic Run / Fact Extraction Provenance | 让 Fact / Interpretation 能追溯到具体 parser run、模型版本与精确 Evidence / Extraction 输入,同时继续保持其在哈希链之外 |
 | 2026-08-08 | Production Semantic Pipeline V2 接管旧 `extract_slots`,详情页最小展示最新 Semantic Run 结果 | 新 Evidence 的生产语义入口已统一切到 latest Extraction -> Semantic Parser V2.2,旧 slot 字段降级为兼容展示层 |
 | 2026-08-09 | V7 新增 Event Match Run 履历,Production 改为 Semantic succeeded 后运行 Event Matcher | 让 Event 建议/自动归档同样具备 provenance,并明确只有 auto 会实际改写 Fact 归属 |
+| 2026-08-09 | V8 新增 Event Assignment Confirmation:pending/completed review 状态、Evidence 详情确认归属 UI、整批原子提交 | 让 confirm / needs_context 不再停留在只读建议,而是能由用户一次性确认归入已有事项、新建事项或暂不归入 |
 | 2026-08-09 | Competition UX V1:首页主体验切到真实 Event / Fact,新增只读 Event 详情页,Help 同步真实能力 | 让用户首先看到 `我的事项` 与可回看原始证据的事实链路,同时把 demo threads 降级为示例区并清理过时文案 |
 
 ---

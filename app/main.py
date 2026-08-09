@@ -72,6 +72,7 @@ from evidence_core.semantic_store import (
     mark_semantic_run_failed,
     persist_event_match_run_result,
     persist_semantic_run_result,
+    review_event_match_run_by_user,
 )
 from evidence_core.export import export_evidence_package
 from evidence_core.store import append_evidence, update_slots, verify_chain
@@ -746,24 +747,94 @@ def _event_title(conn: sqlite3.Connection, event_id: str | None) -> str | None:
     return row["title"]
 
 
-def _event_match_titles(result: dict[str, Any]) -> list[dict[str, Any]]:
-    groups = result.get("groups")
-    if not isinstance(groups, list):
-        return []
-    suggestions: list[dict[str, Any]] = []
-    for group in groups:
-        if not isinstance(group, dict):
+def _event_match_fact_items(
+    conn: sqlite3.Connection,
+    fact_ids: list[str],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for fact_id in fact_ids:
+        row = conn.execute(
+            """
+            SELECT f.fact_id, f.fact_type, f.content, f.event_id, f.event_assignment, ev.title AS event_title
+            FROM facts f
+            LEFT JOIN events ev ON ev.event_id = f.event_id
+            WHERE f.fact_id = ?
+            """,
+            (fact_id,),
+        ).fetchone()
+        if row is None:
             continue
-        title = group.get("event_title") or group.get("proposed_title")
-        if not isinstance(title, str) or not title.strip():
-            continue
-        suggestions.append(
+        items.append(
             {
-                "title": title.strip(),
-                "reason": group.get("reason") if isinstance(group.get("reason"), str) else "",
+                "fact_id": row["fact_id"],
+                "fact_type": row["fact_type"],
+                "content": row["content"],
+                "event_id": row["event_id"],
+                "event_title": row["event_title"],
+                "event_assignment": row["event_assignment"],
             }
         )
-    return suggestions
+    return items
+
+
+def _build_event_match_groups(
+    conn: sqlite3.Connection,
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    raw_groups = result.get("groups")
+    if not isinstance(raw_groups, list):
+        return []
+
+    groups: list[dict[str, Any]] = []
+    for group_index, group in enumerate(raw_groups):
+        if not isinstance(group, dict):
+            continue
+        fact_ids = group.get("fact_ids")
+        if not isinstance(fact_ids, list):
+            continue
+        normalized_fact_ids = [item for item in fact_ids if isinstance(item, str) and item.strip()]
+        event_id = group.get("event_id") if isinstance(group.get("event_id"), str) else None
+        proposed_title = group.get("proposed_title") if isinstance(group.get("proposed_title"), str) else None
+        target = group.get("target") if isinstance(group.get("target"), str) else "unassigned"
+        default_choice = "unassigned"
+        if target == "existing" and event_id:
+            default_choice = "existing"
+        elif target == "new":
+            default_choice = "new"
+        groups.append(
+            {
+                "group_index": group_index,
+                "ai_title": _event_title(conn, event_id) or proposed_title or "AI 未给出标题",
+                "reason": group.get("reason") if isinstance(group.get("reason"), str) else "",
+                "fact_items": _event_match_fact_items(conn, normalized_fact_ids),
+                "default_choice": default_choice,
+                "default_event_id": event_id,
+                "default_new_title": proposed_title or "",
+            }
+        )
+    return groups
+
+
+def _build_completed_group_outcome(group: dict[str, Any]) -> dict[str, Any]:
+    fact_items = group.get("fact_items", [])
+    assigned_titles = []
+    seen_titles = set()
+    for item in fact_items:
+        if not isinstance(item, dict):
+            continue
+        title = item.get("event_title")
+        if isinstance(title, str) and title and title not in seen_titles:
+            seen_titles.add(title)
+            assigned_titles.append(title)
+    if not assigned_titles:
+        return {
+            "group_index": group["group_index"],
+            "label": "暂不归入事项",
+        }
+    return {
+        "group_index": group["group_index"],
+        "label": f"已归入事项：{' / '.join(assigned_titles)}",
+    }
 
 
 def _build_event_match_result(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any] | None:
@@ -775,54 +846,86 @@ def _build_event_match_result(conn: sqlite3.Connection, semantic_run_id: str) ->
         return {
             "status": "failed",
             "routing_mode": None,
-            "message": "事件归档暂不可用，事实解析已保存。",
+            "review_status": "pending",
+            "event_match_run_id": run["event_match_run_id"],
+            "message": "事项归属暂不可用，事实整理结果已保存。",
             "reason": None,
             "suggestions": [],
+            "groups": [],
+            "completed_groups": [],
+            "active_events": [],
         }
     if not isinstance(result, dict):
         return None
 
-    groups = result.get("groups")
-    if isinstance(groups, list):
-        for group in groups:
-            if not isinstance(group, dict):
-                continue
-            event_id = group.get("event_id")
-            if isinstance(event_id, str) and event_id.strip():
-                group["event_title"] = _event_title(conn, event_id)
+    groups = _build_event_match_groups(conn, result)
+    active_events = [
+        {"event_id": item["event_id"], "title": item["title"]}
+        for item in list_event_candidates(conn, recent_facts_per_event=0)
+    ]
 
     routing_mode = run.get("routing_mode")
     if routing_mode == "auto":
         auto_group = next(
             (
                 group
-                for group in result.get("groups", [])
-                if isinstance(group, dict) and group.get("target") in {"existing", "new"}
+                for group in groups
+                if group["default_choice"] in {"existing", "new"}
             ),
             None,
         )
         return {
             "status": "succeeded",
             "routing_mode": "auto",
-            "message": None if auto_group is None else f"已自动归入：{auto_group.get('event_title') or auto_group.get('proposed_title') or '未命名事项'}",
+            "review_status": run.get("review_status"),
+            "event_match_run_id": run["event_match_run_id"],
+            "message": None if auto_group is None else f"已自动归入事项：{auto_group['ai_title']}",
             "reason": None if auto_group is None else auto_group.get("reason"),
             "suggestions": [],
+            "groups": groups,
+            "completed_groups": [],
+            "active_events": active_events,
+        }
+    if run.get("review_status") == "completed" and routing_mode in {"confirm", "needs_context"}:
+        return {
+            "status": "succeeded",
+            "routing_mode": routing_mode,
+            "review_status": "completed",
+            "event_match_run_id": run["event_match_run_id"],
+            "message": "事项归属已确认",
+            "reason": None,
+            "suggestions": [],
+            "groups": groups,
+            "completed_groups": [_build_completed_group_outcome(group) for group in groups],
+            "active_events": active_events,
         }
     if routing_mode == "confirm":
         return {
             "status": "succeeded",
             "routing_mode": "confirm",
-            "message": "这段记录可能涉及多个事项，等待你确认归档。",
+            "review_status": run.get("review_status"),
+            "event_match_run_id": run["event_match_run_id"],
+            "message": "AI认为这属于以下事项，请你确认。"
+            if len(groups) == 1
+            else "这段记录可能涉及多个事项，请分别确认。",
             "reason": None,
-            "suggestions": _event_match_titles(result),
+            "suggestions": [],
+            "groups": groups,
+            "completed_groups": [],
+            "active_events": active_events,
         }
     if routing_mode == "needs_context":
         return {
             "status": "succeeded",
             "routing_mode": "needs_context",
-            "message": "暂时无法可靠判断属于哪件事，需要补充上下文。",
+            "review_status": run.get("review_status"),
+            "event_match_run_id": run["event_match_run_id"],
+            "message": "暂时无法可靠判断属于哪件事，请选择归属。",
             "reason": None,
             "suggestions": [],
+            "groups": groups,
+            "completed_groups": [],
+            "active_events": active_events,
         }
     return None
 
@@ -2764,6 +2867,68 @@ def create_app() -> FastAPI:
                 "media_type": row["media_type"],
                 "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
             }
+        finally:
+            conn.close()
+
+    @app.post("/api/evidence/{evidence_id}/event-assignment")
+    async def confirm_event_assignment(
+        evidence_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_top_level = sorted(set(payload) - {"event_match_run_id", "groups"})
+        if unexpected_top_level:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported fields: {', '.join(unexpected_top_level)}",
+            )
+
+        event_match_run_id = payload.get("event_match_run_id")
+        if not isinstance(event_match_run_id, str) or not event_match_run_id.strip():
+            raise HTTPException(status_code=400, detail="event_match_run_id is required")
+        groups = payload.get("groups")
+        if not isinstance(groups, list) or not groups:
+            raise HTTPException(status_code=400, detail="groups must be a non-empty list")
+
+        normalized_groups: list[dict[str, Any]] = []
+        for item in groups:
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail="each group decision must be an object")
+            unexpected_group_fields = sorted(set(item) - {"group_index", "choice", "event_id", "new_title"})
+            if unexpected_group_fields:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"unsupported group fields: {', '.join(unexpected_group_fields)}",
+                )
+            normalized_groups.append(item)
+
+        conn = init_db(sandbox.db_path)
+        try:
+            evidence_row = conn.execute(
+                "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if evidence_row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            try:
+                reviewed_run = review_event_match_run_by_user(
+                    conn,
+                    evidence_id=evidence_id,
+                    event_match_run_id=event_match_run_id.strip(),
+                    decisions=normalized_groups,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return JSONResponse(
+                {
+                    "event_match_run_id": reviewed_run["event_match_run_id"],
+                    "review_status": reviewed_run["review_status"],
+                    "reviewed_at": reviewed_run["reviewed_at"],
+                }
+            )
         finally:
             conn.close()
 

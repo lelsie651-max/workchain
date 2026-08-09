@@ -491,7 +491,7 @@ def test_recent_record_prefers_semantic_facts_and_event_status(tmp_path, monkeyp
 
     assert create_response.status_code == 200
     assert "系统整理：补签供应商合同。" in index_response.text
-    assert "已自动归入：补签供应商合同" in index_response.text
+    assert "已自动归入事项：补签供应商合同" in index_response.text
 
 
 def test_recent_record_falls_back_for_legacy_row_without_semantic_run(tmp_path, monkeypatch):
@@ -3800,7 +3800,7 @@ def test_event_matcher_auto_existing_updates_facts_and_detail_status(tmp_path, m
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert create_response.status_code == 200
-    assert "已自动归入：渠道复盘" in detail_response.text
+    assert "已自动归入事项：渠道复盘" in detail_response.text
     assert "这是同一件已存在的渠道复盘事项" in detail_response.text
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
@@ -3815,7 +3815,7 @@ def test_event_matcher_auto_existing_updates_facts_and_detail_status(tmp_path, m
         ).fetchone()
         match_row = conn.execute(
             """
-            SELECT status, routing_mode, result_json
+            SELECT status, routing_mode, result_json, review_status
             FROM event_match_runs
             ORDER BY created_at DESC, event_match_run_id DESC
             LIMIT 1
@@ -3826,6 +3826,7 @@ def test_event_matcher_auto_existing_updates_facts_and_detail_status(tmp_path, m
         assert fact_row["event_assignment_confidence"] == 0.95
         assert match_row["status"] == "succeeded"
         assert match_row["routing_mode"] == "auto"
+        assert match_row["review_status"] == "completed"
     finally:
         conn.close()
 
@@ -3872,7 +3873,7 @@ def test_event_matcher_auto_new_creates_event_and_updates_detail_status(tmp_path
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert create_response.status_code == 200
-    assert "已自动归入：补签供应商合同" in detail_response.text
+    assert "已自动归入事项：补签供应商合同" in detail_response.text
     assert "这是一件新的合同处理事项" in detail_response.text
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
@@ -3900,54 +3901,7 @@ def test_event_matcher_auto_new_creates_event_and_updates_detail_status(tmp_path
         conn.close()
 
 
-@pytest.mark.parametrize(
-    ("normalized_match", "expected_text", "extra_text"),
-    [
-        (
-            {
-                "groups": [
-                    {
-                        "fact_indexes": [0],
-                        "target": "existing",
-                        "event_id": "evt-1",
-                        "proposed_title": None,
-                        "confidence": 0.72,
-                        "reason": "像是在延续旧事项",
-                    },
-                    {
-                        "fact_indexes": [1],
-                        "target": "new",
-                        "event_id": None,
-                        "proposed_title": "整理客户回访",
-                        "confidence": 0.71,
-                        "reason": "也可能是另一件事",
-                    },
-                ],
-                "ambiguities": [],
-            },
-            "这段记录可能涉及多个事项，等待你确认归档。",
-            "整理客户回访",
-        ),
-        (
-            {
-                "groups": [
-                    {
-                        "fact_indexes": [0, 1],
-                        "target": "unassigned",
-                        "event_id": None,
-                        "proposed_title": None,
-                        "confidence": 0.0,
-                        "reason": "上下文不足",
-                    }
-                ],
-                "ambiguities": [],
-            },
-            "暂时无法可靠判断属于哪件事，需要补充上下文。",
-            None,
-        ),
-    ],
-)
-def test_event_matcher_detail_shows_confirm_and_needs_context_status(tmp_path, monkeypatch, normalized_match, expected_text, extra_text):
+def test_event_matcher_single_group_confirm_copy_and_options(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     parsed = _semantic_result(
@@ -3962,18 +3916,21 @@ def test_event_matcher_detail_shows_confirm_and_needs_context_status(tmp_path, m
                 "occurred_date": None,
                 "confidence": 0.8,
             },
-            {
-                "fact_type": "statement",
-                "content": "客户回访也要整理。",
-                "actors": [],
-                "due_raw": None,
-                "due_date": None,
-                "due_anchor_date": None,
-                "occurred_date": None,
-                "confidence": 0.7,
-            },
         ]
     )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            }
+        ],
+        "ambiguities": [],
+    }
 
     with client:
         client.get("/")
@@ -4000,9 +3957,11 @@ def test_event_matcher_detail_shows_confirm_and_needs_context_status(tmp_path, m
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert create_response.status_code == 200
-    assert expected_text in detail_response.text
-    if extra_text is not None:
-        assert extra_text in detail_response.text
+    assert "AI认为这属于以下事项，请你确认。" in detail_response.text
+    assert "这段记录可能涉及多个事项，请分别确认。" not in detail_response.text
+    assert "渠道复盘" in detail_response.text
+    assert "＋新建事项…" in detail_response.text
+    assert "暂不归入" in detail_response.text
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:
@@ -4016,6 +3975,371 @@ def test_event_matcher_detail_shows_confirm_and_needs_context_status(tmp_path, m
         assert all(row["event_id"] is None and row["event_assignment"] == "unassigned" for row in rows)
     finally:
         conn.close()
+
+
+def test_event_matcher_multi_group_shows_groups_for_separate_confirmation(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请补一版渠道复盘。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            },
+            {
+                "fact_type": "statement",
+                "content": "客户回访也要整理。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.7,
+            },
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            },
+            {
+                "fact_indexes": [1],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "整理客户回访",
+                "confidence": 0.71,
+                "reason": "也可能是另一件事",
+            },
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "渠道复盘", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请补一版渠道复盘，客户回访也要整理。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert "这段记录可能涉及多个事项，请分别确认。" in detail_response.text
+    assert "第 1 组" in detail_response.text
+    assert "第 2 组" in detail_response.text
+    assert "整理客户回访" in detail_response.text
+    assert "客户回访也要整理。" in detail_response.text
+
+
+def test_event_matcher_needs_context_shows_existing_new_and_unassigned_choices(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请补一版渠道复盘。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "unassigned",
+                "event_id": None,
+                "proposed_title": None,
+                "confidence": 0.0,
+                "reason": "上下文不足",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "渠道复盘", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请补一版渠道复盘。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert "暂时无法可靠判断属于哪件事，请选择归属。" in detail_response.text
+    assert "渠道复盘" in detail_response.text
+    assert "＋新建事项…" in detail_response.text
+    assert "暂不归入" in detail_response.text
+
+
+def test_event_assignment_confirmation_creates_event_and_marks_completed(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请补一版渠道复盘。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            },
+            {
+                "fact_type": "statement",
+                "content": "客户回访也要整理。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.7,
+            },
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            },
+            {
+                "fact_indexes": [1],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "整理客户回访",
+                "confidence": 0.71,
+                "reason": "也可能是另一件事",
+            },
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "渠道复盘", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请补一版渠道复盘，客户回访也要整理。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+
+        conn = init_db(db_path)
+        try:
+            match_run_id = conn.execute(
+                """
+                SELECT event_match_run_id
+                FROM event_match_runs
+                ORDER BY created_at DESC, event_match_run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()["event_match_run_id"]
+        finally:
+            conn.close()
+
+        confirm_response = client.post(
+            f"/api/evidence/{evidence_id}/event-assignment",
+            json={
+                "event_match_run_id": match_run_id,
+                "groups": [
+                    {"group_index": 0, "choice": "existing", "event_id": "evt-1"},
+                    {"group_index": 1, "choice": "new", "new_title": "整理客户回访"},
+                ],
+            },
+        )
+        detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert confirm_response.status_code == 200
+    assert detail_response.status_code == 200
+    assert "事项归属已确认" in detail_response.text
+    assert "已归入事项：渠道复盘" in detail_response.text
+    assert "已归入事项：整理客户回访" in detail_response.text
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        match_row = conn.execute(
+            """
+            SELECT review_status
+            FROM event_match_runs
+            WHERE event_match_run_id = ?
+            """,
+            (match_run_id,),
+        ).fetchone()
+        fact_rows = conn.execute(
+            """
+            SELECT content, event_id, event_assignment
+            FROM facts
+            ORDER BY content ASC
+            """
+        ).fetchall()
+        new_event = conn.execute(
+            "SELECT title FROM events WHERE event_id != 'evt-1' ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        assert match_row["review_status"] == "completed"
+        assert fact_rows[0]["content"] == "客户回访也要整理。"
+        assert fact_rows[0]["event_assignment"] == "confirmed"
+        assert fact_rows[1]["content"] == "请补一版渠道复盘。"
+        assert fact_rows[1]["event_id"] == "evt-1"
+        assert fact_rows[1]["event_assignment"] == "confirmed"
+        assert new_event["title"] == "整理客户回访"
+    finally:
+        conn.close()
+
+
+def test_event_assignment_confirmation_rejects_tampered_fact_ids(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请补一版渠道复盘。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "渠道复盘", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请补一版渠道复盘。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+
+        conn = init_db(db_path)
+        try:
+            match_run_id = conn.execute(
+                """
+                SELECT event_match_run_id
+                FROM event_match_runs
+                ORDER BY created_at DESC, event_match_run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()["event_match_run_id"]
+        finally:
+            conn.close()
+
+        confirm_response = client.post(
+            f"/api/evidence/{evidence_id}/event-assignment",
+            json={
+                "event_match_run_id": match_run_id,
+                "groups": [
+                    {
+                        "group_index": 0,
+                        "choice": "existing",
+                        "event_id": "evt-1",
+                        "fact_ids": ["fact-hacked"],
+                    }
+                ],
+            },
+        )
+
+    assert create_response.status_code == 200
+    assert confirm_response.status_code == 400
+    assert "unsupported group fields: fact_ids" in confirm_response.text
 
 
 def test_event_matcher_failure_keeps_semantic_parse_done_and_shows_failed_status(tmp_path, monkeypatch):
@@ -4049,7 +4373,7 @@ def test_event_matcher_failure_keeps_semantic_parse_done_and_shows_failed_status
 
     assert create_response.status_code == 200
     assert status_response.json()["parse_status"] == "done"
-    assert "事件归档暂不可用，事实解析已保存。" in detail_response.text
+    assert "事项归属暂不可用，事实整理结果已保存。" in detail_response.text
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:

@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -403,6 +403,25 @@ def _create_v7_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_v8_schema(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "event_match_runs", "review_status"):
+        conn.execute(
+            """
+            ALTER TABLE event_match_runs
+            ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                review_status IN ('pending', 'completed')
+            )
+            """
+        )
+    if not _column_exists(conn, "event_match_runs", "reviewed_at"):
+        conn.execute(
+            """
+            ALTER TABLE event_match_runs
+            ADD COLUMN reviewed_at INTEGER
+            """
+        )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -453,6 +472,27 @@ def _migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 7)
 
 
+def _migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    _create_v8_schema(conn)
+    conn.execute(
+        """
+        UPDATE event_match_runs
+        SET review_status = 'completed',
+            reviewed_at = completed_at
+        WHERE status = 'succeeded' AND routing_mode = 'auto'
+        """
+    )
+    conn.execute(
+        """
+        UPDATE event_match_runs
+        SET review_status = 'pending',
+            reviewed_at = NULL
+        WHERE NOT (status = 'succeeded' AND routing_mode = 'auto')
+        """
+    )
+    _set_schema_version(conn, 8)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -479,6 +519,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v5_schema(conn)
         _create_v6_schema(conn)
         _create_v7_schema(conn)
+        _create_v8_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -498,6 +539,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v4_to_v5(conn)
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -506,6 +548,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v4_to_v5(conn)
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -514,6 +557,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v4_to_v5(conn)
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 4:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -522,6 +566,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v4_to_v5(conn)
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 5:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -530,6 +575,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v5_schema(conn)
         _migrate_v5_to_v6(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 6:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -538,6 +584,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v5_schema(conn)
         _create_v6_schema(conn)
         _migrate_v6_to_v7(conn)
+        _migrate_v7_to_v8(conn)
     elif schema_version == 7:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -546,6 +593,16 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v5_schema(conn)
         _create_v6_schema(conn)
         _create_v7_schema(conn)
+        _migrate_v7_to_v8(conn)
+    elif schema_version == 8:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
+        _create_v5_schema(conn)
+        _create_v6_schema(conn)
+        _create_v7_schema(conn)
+        _create_v8_schema(conn)
     else:
         conn.close()
         raise ValueError(

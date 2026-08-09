@@ -40,7 +40,7 @@ def _append_text(conn, blobs_root, *, text: str, captured_at: int):
 def test_fresh_db_supports_evidence_extractions(db_file):
     conn = init_db(db_file)
 
-    assert get_schema_version(conn) == 7
+    assert get_schema_version(conn) == 8
     row = conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evidence_extractions'"
     ).fetchone()

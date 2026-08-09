@@ -17,6 +17,7 @@ _FACT_MUTABLE_FIELDS = (
     "due_raw",
     "due_anchor_at",
 )
+MAX_EVENT_TITLE_LENGTH = 120
 
 
 class SemanticStoreError(ValueError):
@@ -58,6 +59,20 @@ def _coerce_required_text(name: str, value: Any) -> str:
     normalized = _coerce_optional_text(value)
     if normalized is None:
         raise SemanticStoreError(f"{name} must be a non-empty string")
+    return normalized
+
+
+def _normalize_title_key(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _coerce_event_title(name: str, value: Any) -> str:
+    normalized = _coerce_required_text(name, value)
+    normalized = " ".join(normalized.split())
+    if len(normalized) > MAX_EVENT_TITLE_LENGTH:
+        raise SemanticStoreError(
+            f"{name} must be at most {MAX_EVENT_TITLE_LENGTH} characters"
+        )
     return normalized
 
 
@@ -136,6 +151,16 @@ def _ensure_event_exists(conn: sqlite3.Connection, event_id: str) -> None:
     ).fetchone()
     if row is None:
         raise SemanticStoreError(f"event not found: {event_id}")
+
+
+def _get_active_event_row(conn: sqlite3.Connection, event_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM events WHERE event_id = ? AND status = 'active'",
+        (event_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"active event not found: {event_id}")
+    return row
 
 
 def _get_extraction_row(conn: sqlite3.Connection, extraction_id: str) -> sqlite3.Row:
@@ -409,6 +434,32 @@ def _normalize_event_match_result_for_storage(
         "groups": normalized_groups,
         "ambiguities": normalized_ambiguities,
     }
+
+
+def _normalize_review_decisions(
+    decisions: Sequence[Mapping[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    normalized: dict[int, dict[str, Any]] = {}
+    for item in decisions:
+        if not isinstance(item, Mapping):
+            raise SemanticStoreError("each review decision must be an object")
+        raw_group_index = item.get("group_index")
+        if not isinstance(raw_group_index, int) or isinstance(raw_group_index, bool) or raw_group_index < 0:
+            raise SemanticStoreError("group_index must be an integer >= 0")
+        if raw_group_index in normalized:
+            raise SemanticStoreError("group_index must not repeat")
+        choice = _coerce_required_text("choice", item.get("choice"))
+        if choice not in {"existing", "new", "unassigned"}:
+            raise SemanticStoreError("choice must be existing, new, or unassigned")
+        normalized[raw_group_index] = {
+            "group_index": raw_group_index,
+            "choice": choice,
+            "event_id": _coerce_optional_text(item.get("event_id")),
+            "new_title": _coerce_optional_text(item.get("new_title")),
+        }
+    if not normalized:
+        raise SemanticStoreError("decisions must contain at least one item")
+    return normalized
 
 
 def _load_fact(conn: sqlite3.Connection, fact_id: str) -> dict[str, Any]:
@@ -701,9 +752,7 @@ def create_event(
     created_at: int | None = None,
     updated_at: int | None = None,
 ) -> dict[str, Any]:
-    normalized_title = title.strip()
-    if not normalized_title:
-        raise SemanticStoreError("title must not be blank")
+    normalized_title = _coerce_event_title("title", title)
     if status not in {"active", "resolved", "archived"}:
         raise SemanticStoreError(f"unsupported event status: {status}")
 
@@ -1149,8 +1198,9 @@ def create_event_match_run(
             """
             INSERT INTO event_match_runs (
                 event_match_run_id, semantic_run_id, provider, model, matcher_version,
-                status, routing_mode, result_json, failure_type, created_at, completed_at, supersedes_run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, routing_mode, result_json, failure_type, created_at, completed_at,
+                supersedes_run_id, review_status, reviewed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_match_run_id,
@@ -1165,6 +1215,8 @@ def create_event_match_run(
                 created_at,
                 None,
                 supersedes_run_id,
+                "pending",
+                None,
             ),
         )
         result = _load_event_match_run(conn, event_match_run_id)
@@ -1197,10 +1249,11 @@ def mark_event_match_run_failed(
         conn.execute(
             """
             UPDATE event_match_runs
-            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?
+            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?,
+                review_status = ?, reviewed_at = ?
             WHERE event_match_run_id = ?
             """,
-            ("failed", None, None, failure_type, completed_at, event_match_run_id),
+            ("failed", None, None, failure_type, completed_at, "pending", None, event_match_run_id),
         )
         result = _load_event_match_run(conn, event_match_run_id)
         if started_transaction:
@@ -1281,7 +1334,8 @@ def persist_event_match_run_result(
         conn.execute(
             """
             UPDATE event_match_runs
-            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?
+            SET status = ?, routing_mode = ?, result_json = ?, failure_type = ?, completed_at = ?,
+                review_status = ?, reviewed_at = ?
             WHERE event_match_run_id = ?
             """,
             (
@@ -1290,6 +1344,8 @@ def persist_event_match_run_result(
                 json.dumps(safe_result, ensure_ascii=False, separators=(",", ":")),
                 None,
                 completed_at,
+                "completed" if routing_mode == "auto" else "pending",
+                completed_at if routing_mode == "auto" else None,
                 event_match_run_id,
             ),
         )
@@ -1358,9 +1414,11 @@ def set_event_assignment_by_user(
 ) -> dict[str, Any]:
     updated_at = _now_ms() if updated_at is None else updated_at
     assignment = "unassigned" if event_id is None else "confirmed"
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         _get_fact_row(conn, fact_id)
         if event_id is not None:
             _ensure_event_exists(conn, event_id)
@@ -1373,10 +1431,140 @@ def set_event_assignment_by_user(
             (event_id, assignment, None, updated_at, fact_id),
         )
         result = _load_fact(conn, fact_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def review_event_match_run_by_user(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    event_match_run_id: str,
+    decisions: Sequence[Mapping[str, Any]],
+    reviewed_at: int | None = None,
+) -> dict[str, Any]:
+    reviewed_at = _now_ms() if reviewed_at is None else reviewed_at
+    normalized_decisions = _normalize_review_decisions(decisions)
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
+
+        current = _load_event_match_run(conn, event_match_run_id)
+        if current["status"] != "succeeded":
+            raise SemanticStoreError("event match run must be succeeded before review")
+        if current.get("review_status") != "pending":
+            raise SemanticStoreError("event match run review is already completed")
+        if current.get("routing_mode") not in {"confirm", "needs_context"}:
+            raise SemanticStoreError("event match run does not require user review")
+
+        latest = get_latest_event_match_for_evidence(conn, evidence_id, status="succeeded")
+        if latest is None or latest["event_match_run_id"] != event_match_run_id:
+            raise SemanticStoreError("event match run is stale for this evidence")
+
+        result = current.get("result")
+        groups = result.get("groups") if isinstance(result, dict) else None
+        if not isinstance(groups, list) or not groups:
+            raise SemanticStoreError("event match run has no reviewable groups")
+        if set(normalized_decisions) != set(range(len(groups))):
+            raise SemanticStoreError("all groups must have exactly one decision")
+
+        created_events_by_title: dict[str, dict[str, Any]] = {}
+        touched_event_ids: set[str] = set()
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, Mapping):
+                raise SemanticStoreError("event match group must be an object")
+            fact_ids = _normalize_non_empty_ids(
+                "fact_ids",
+                group.get("fact_ids") if isinstance(group.get("fact_ids"), Sequence) else [],
+            )
+            for fact_id in fact_ids:
+                fact_row = _get_fact_row(conn, fact_id)
+                if fact_row["semantic_run_id"] != current["semantic_run_id"]:
+                    raise SemanticStoreError("fact semantic_run_id does not match event match run")
+
+            decision = normalized_decisions[group_index]
+            choice = decision["choice"]
+            if choice == "existing":
+                event_id = _coerce_required_text("event_id", decision.get("event_id"))
+                event_row = _get_active_event_row(conn, event_id)
+                for fact_id in fact_ids:
+                    set_event_assignment_by_user(
+                        conn,
+                        fact_id=fact_id,
+                        event_id=event_row["event_id"],
+                        updated_at=reviewed_at,
+                    )
+                touched_event_ids.add(event_row["event_id"])
+                continue
+
+            if choice == "new":
+                title = _coerce_event_title("new_title", decision.get("new_title"))
+                title_key = _normalize_title_key(title)
+                event_row = created_events_by_title.get(title_key)
+                if event_row is None:
+                    event_row = create_event(
+                        conn,
+                        title=title,
+                        status="active",
+                        created_at=reviewed_at,
+                        updated_at=reviewed_at,
+                    )
+                    created_events_by_title[title_key] = event_row
+                for fact_id in fact_ids:
+                    set_event_assignment_by_user(
+                        conn,
+                        fact_id=fact_id,
+                        event_id=event_row["event_id"],
+                        updated_at=reviewed_at,
+                    )
+                touched_event_ids.add(event_row["event_id"])
+                continue
+
+            if decision.get("event_id") is not None:
+                raise SemanticStoreError("unassigned decision must not include event_id")
+            if decision.get("new_title") is not None:
+                raise SemanticStoreError("unassigned decision must not include new_title")
+            for fact_id in fact_ids:
+                set_event_assignment_by_user(
+                    conn,
+                    fact_id=fact_id,
+                    event_id=None,
+                    updated_at=reviewed_at,
+                )
+
+        for event_id in touched_event_ids:
+            _touch_event_updated_at(conn, event_id=event_id, updated_at=reviewed_at)
+
+        conn.execute(
+            """
+            UPDATE event_match_runs
+            SET review_status = ?, reviewed_at = ?
+            WHERE event_match_run_id = ?
+            """,
+            ("completed", reviewed_at, event_match_run_id),
+        )
+        reviewed_run = _load_event_match_run(conn, event_match_run_id)
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        return reviewed_run
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
         raise
 
 
