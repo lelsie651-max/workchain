@@ -45,6 +45,9 @@ VISION_SYSTEM_PROMPT = """你是 WorkChain 的 Visual Extraction 实验 provider
 3. 如果能看到 reaction 存在,但反应者身份在画面中不可见,只能记录 reaction 存在或身份未知,不得猜是谁点的。
 4. transcript 只记录画面中实际能看到的文字; observations 不要把 transcript 改写成结论。
 5. 如果某项不确定,宁可省略或写 warning,不要脑补。
+6. 如果画面里直接显示了完整年月日,或完整日期+时间,额外增加一条 observation,其中 kind 必须是 "timestamp",content 必须保留画面中可见的完整日期文本。
+7. 如果画面里只有 "19:21" 这类时分,不得补出年月日,也不要伪造 timestamp observation。
+8. 不得使用上传时间、保存时间或任何画面外时间去推断聊天日期。
 """
 
 VISION_USER_PROMPT = """请基于图片做提取,返回 transcript + observations + warnings 的 JSON。"""

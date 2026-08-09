@@ -117,8 +117,8 @@ _RELIABLE_TEXT_DATE_PATTERNS = (
     ),
 )
 _OBSERVATION_ANCHOR_LABELS = ("消息日期", "消息时间", "日期", "timestamp", "时间戳")
-_OBSERVATION_FULL_DATETIME_PATTERN = re.compile(
-    r"(\d{4})(?:[./-]|年)(\d{1,2})(?:[./-]|月)(\d{1,2})(?:日)?\s+\d{1,2}:\d{2}(?::\d{2})?"
+_OBSERVATION_FULL_DATE_PATTERN = re.compile(
+    r"(\d{4})(?:[./-]|年)(\d{1,2})(?:[./-]|月)(\d{1,2})(?:日)?(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?"
 )
 
 
@@ -241,7 +241,7 @@ def _reliable_observation_anchor_candidates(observations: Any) -> set[str]:
         label_text = f"{kind} {content}"
         if not any(token in label_text for token in _OBSERVATION_ANCHOR_LABELS):
             continue
-        match = _OBSERVATION_FULL_DATETIME_PATTERN.search(content)
+        match = _OBSERVATION_FULL_DATE_PATTERN.search(content)
         if match is None:
             continue
         candidate = _normalize_candidate_date(*match.groups())

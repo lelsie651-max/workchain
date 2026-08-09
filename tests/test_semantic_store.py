@@ -645,6 +645,44 @@ def test_correct_fact_by_user_sets_origin_and_review_status_and_keeps_evidence_l
     assert corrected["actors"] == [{"actor_id": "act-2", "role": "owner"}]
 
 
+def test_correct_fact_by_user_respects_outer_transaction(db_file, blobs_root):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    create_event(conn, event_id="evt-1", title="补材料", created_at=10, updated_at=10)
+    create_fact(
+        conn,
+        fact_id="fact-1",
+        event_id="evt-1",
+        event_assignment="confirmed",
+        fact_type="statement",
+        content="原始事实",
+        evidence_ids=["ev-1"],
+        created_at=10,
+        updated_at=10,
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    correct_fact_by_user(
+        conn,
+        fact_id="fact-1",
+        content="事务内修正后的事实",
+        updated_at=20,
+    )
+    conn.execute("UPDATE events SET updated_at = ? WHERE event_id = ?", (21, "evt-1"))
+    conn.rollback()
+
+    fact_row = conn.execute(
+        "SELECT content, origin, review_status, updated_at FROM facts WHERE fact_id = 'fact-1'"
+    ).fetchone()
+    event_row = conn.execute("SELECT updated_at FROM events WHERE event_id = 'evt-1'").fetchone()
+
+    assert fact_row["content"] == "原始事实"
+    assert fact_row["origin"] == "ai"
+    assert fact_row["review_status"] == "unreviewed"
+    assert fact_row["updated_at"] == 10
+    assert event_row["updated_at"] == 10
+
+
 def test_correct_relative_due_dates_by_user_updates_due_fields_and_event_timestamp(db_file, blobs_root):
     conn = init_db(db_file)
     ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="周五前补材料", captured_at=1)

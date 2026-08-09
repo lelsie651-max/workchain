@@ -395,6 +395,7 @@
                 </div>
             </details>
             {% endif %}
+            {% if not evidence.semantic_result %}
             <form id="slots-form" class="mt-4 space-y-4" data-evidence-id="{{ evidence.evidence_id }}">
                 <div>
                     <label class="mb-2 block text-sm text-slate-300">交付物</label>
@@ -465,6 +466,7 @@
                     保存修改
                 </button>
             </form>
+            {% endif %}
         </div>
 
         <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
@@ -484,36 +486,14 @@
 
 <script>
     (() => {
-        const form = document.getElementById("slots-form");
-        if (!form) {
-            return;
-        }
-        const flash = document.getElementById("evidence-flash");
-        const saveButton = document.getElementById("save-slots");
-        const addCaveatButton = document.getElementById("add-caveat");
-        const caveatList = document.getElementById("caveat-list");
-        const evidenceId = form.dataset.evidenceId;
-        const isDemo = evidenceId.startsWith("ev_demo_");
-        const editOcrTextButton = document.getElementById("edit-ocr-text");
-        const saveOcrTextButton = document.getElementById("save-ocr-text");
-        const cancelOcrTextButton = document.getElementById("cancel-ocr-text");
-        const ocrTextReadonly = document.getElementById("ocr-text-readonly");
-        const ocrTextEditor = document.getElementById("ocr-text-editor");
-        const ocrTextInput = document.getElementById("ocr-text-input");
-        const runArkVisionDiagnosticButton = document.getElementById("run-ark-vision-diagnostic");
-        const arkVisionResult = document.getElementById("ark-vision-result");
-        const runDeepseekPreflightButton = document.getElementById("run-deepseek-preflight");
-        const deepseekPreflightResult = document.getElementById("deepseek-preflight-result");
-        const eventAssignmentForm = document.querySelector("[data-event-assignment-form]");
-        const eventAssignmentSaveButton = document.querySelector("[data-event-assignment-save]");
-        const recordDateDisplay = document.getElementById("record-date-display");
-        const recordDateForm = document.getElementById("record-date-form");
-        const recordDateInput = document.getElementById("record-date-input");
-        const recordDateSubmitButton = document.getElementById("record-date-submit");
-        const recordDateToggleButton = document.getElementById("record-date-toggle");
         const evidenceId = "{{ evidence.evidence_id }}";
+        const isDemo = evidenceId.startsWith("ev_demo_");
+        const flash = document.getElementById("evidence-flash");
 
         const showFlash = (text, tone) => {
+            if (!flash) {
+                return;
+            }
             flash.textContent = text;
             flash.className = "mb-4 rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500";
             if (tone === "success") {
@@ -524,29 +504,31 @@
             flash.classList.remove("hidden");
         };
 
-        const setOcrEditorOpen = (open) => {
-            if (!ocrTextEditor || !ocrTextReadonly || !editOcrTextButton) {
+        const setOcrEditorOpen = (open, elements) => {
+            const { editor, readonly, editButton } = elements;
+            if (!editor || !readonly || !editButton) {
                 return;
             }
-            ocrTextEditor.classList.toggle("hidden", !open);
-            ocrTextReadonly.classList.toggle("hidden", open);
-            editOcrTextButton.classList.toggle("hidden", open);
+            editor.classList.toggle("hidden", !open);
+            readonly.classList.toggle("hidden", open);
+            editButton.classList.toggle("hidden", open);
         };
 
-        const setRecordDateEditorOpen = (open) => {
-            if (!recordDateForm) {
+        const setRecordDateEditorOpen = (open, elements) => {
+            const { display, form, toggleButton } = elements;
+            if (!form) {
                 return;
             }
-            recordDateForm.classList.toggle("hidden", !open);
-            if (recordDateDisplay) {
-                recordDateDisplay.classList.toggle("hidden", open && Boolean(recordDateToggleButton));
+            form.classList.toggle("hidden", !open);
+            if (display) {
+                display.classList.toggle("hidden", open && Boolean(toggleButton));
             }
-            if (recordDateToggleButton) {
-                recordDateToggleButton.classList.toggle("hidden", open);
+            if (toggleButton) {
+                toggleButton.classList.toggle("hidden", open);
             }
         };
 
-        const syncEventAssignmentInputs = () => {
+        const syncEventAssignmentInputs = (eventAssignmentForm) => {
             if (!eventAssignmentForm) {
                 return;
             }
@@ -560,7 +542,7 @@
             });
         };
 
-        const buildEventAssignmentPayload = () => {
+        const buildEventAssignmentPayload = (eventAssignmentForm) => {
             if (!eventAssignmentForm) {
                 return null;
             }
@@ -594,51 +576,6 @@
             };
         };
 
-        if (recordDateToggleButton) {
-            recordDateToggleButton.addEventListener("click", () => {
-                setRecordDateEditorOpen(true);
-            });
-        }
-
-        if (recordDateForm) {
-            recordDateForm.addEventListener("submit", async (event) => {
-                event.preventDefault();
-                if (!recordDateInput || !recordDateInput.value) {
-                    showFlash("请选择记录发生日期", "error");
-                    return;
-                }
-                if (!recordDateInput.checkValidity()) {
-                    recordDateInput.reportValidity();
-                    return;
-                }
-                if (recordDateSubmitButton) {
-                    recordDateSubmitButton.disabled = true;
-                    recordDateSubmitButton.classList.add("opacity-60", "cursor-not-allowed");
-                }
-                try {
-                    const response = await fetch(`/api/evidence/${evidenceId}/record-date`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ record_date: recordDateInput.value }),
-                    });
-                    const data = await response.json();
-                    if (!response.ok) {
-                        showFlash(data.detail || "记录日期更新失败", "error");
-                        return;
-                    }
-                    showFlash("记录日期已更新", "success");
-                    window.setTimeout(() => window.location.reload(), 300);
-                } catch (error) {
-                    showFlash("记录日期更新失败，请稍后再试", "error");
-                } finally {
-                    if (recordDateSubmitButton) {
-                        recordDateSubmitButton.disabled = false;
-                        recordDateSubmitButton.classList.remove("opacity-60", "cursor-not-allowed");
-                    }
-                }
-            });
-        }
-
         const escapeHtml = (value) => {
             return String(value)
                 .replaceAll("&", "&amp;")
@@ -648,7 +585,7 @@
                 .replaceAll("'", "&#39;");
         };
 
-        const renderArkVisionResult = (payload) => {
+        const renderArkVisionResult = (payload, arkVisionResult) => {
             if (!arkVisionResult) {
                 return;
             }
@@ -732,7 +669,7 @@
             `;
         };
 
-        const renderDeepseekPreflightResult = (payload) => {
+        const renderDeepseekPreflightResult = (payload, deepseekPreflightResult) => {
             if (!deepseekPreflightResult) {
                 return;
             }
@@ -759,214 +696,293 @@
             `;
         };
 
-        const caveatRow = (value = "") => {
-            const wrapper = document.createElement("div");
-            wrapper.className = "flex gap-3";
-            wrapper.innerHTML = `
-                <input type="text" value="${value}" data-caveat-input class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                <button type="button" data-remove-caveat class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
-            `;
-            wrapper.querySelector("[data-remove-caveat]").addEventListener("click", () => {
-                wrapper.remove();
-                syncDirty();
-            });
-            wrapper.querySelector("[data-caveat-input]").addEventListener("input", syncDirty);
-            return wrapper;
-        };
-
-        const serialize = () => {
-            const direction = form.querySelector("input[name='slot-direction']:checked")?.value || "none";
-            return JSON.stringify({
-                slot_deliverable: document.getElementById("slot-deliverable").value.trim() || null,
-                slot_due_raw: document.getElementById("slot-due-raw").value.trim() || null,
-                slot_due_date: document.getElementById("slot-due-date").value || null,
-                slot_direction: direction,
-                kind: document.getElementById("kind-input").value,
-                plain_summary: document.getElementById("plain-summary").value.trim() || null,
-                caveats: [...form.querySelectorAll("[data-caveat-input]")].map((node) => node.value.trim()).filter(Boolean),
-            });
-        };
-
-        const initialState = serialize();
-
-        function syncDirty() {
-            if (isDemo) {
-                saveButton.disabled = true;
+        const initRecordDateEditor = () => {
+            const elements = {
+                display: document.getElementById("record-date-display"),
+                form: document.getElementById("record-date-form"),
+                input: document.getElementById("record-date-input"),
+                submitButton: document.getElementById("record-date-submit"),
+                toggleButton: document.getElementById("record-date-toggle"),
+            };
+            if (!elements.form) {
                 return;
             }
-            saveButton.disabled = serialize() === initialState;
-        }
-
-        addCaveatButton.addEventListener("click", () => {
-            caveatList.appendChild(caveatRow());
-            syncDirty();
-        });
-
-        form.querySelectorAll("input, textarea, select").forEach((node) => {
-            node.addEventListener("input", syncDirty);
-            node.addEventListener("change", syncDirty);
-        });
-        form.querySelectorAll("[data-remove-caveat]").forEach((button) => {
-            button.addEventListener("click", () => {
-                button.closest(".flex").remove();
-                syncDirty();
+            elements.toggleButton?.addEventListener("click", () => {
+                setRecordDateEditorOpen(true, elements);
             });
-        });
-
-        eventAssignmentForm?.querySelectorAll("[data-assignment-select]").forEach((node) => {
-            node.addEventListener("change", syncEventAssignmentInputs);
-        });
-
-        eventAssignmentForm?.addEventListener("submit", async (event) => {
-            event.preventDefault();
-            const payload = buildEventAssignmentPayload();
-            if (!payload) {
-                return;
-            }
-            if (eventAssignmentSaveButton) {
-                eventAssignmentSaveButton.disabled = true;
-                eventAssignmentSaveButton.classList.add("opacity-60", "cursor-not-allowed");
-            }
-            try {
-                const response = await fetch(`/api/evidence/${evidenceId}/event-assignment`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload),
-                });
-                const data = await response.json();
-                if (!response.ok) {
-                    showFlash(data.detail || "确认归属失败", "error");
+            elements.form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                if (!elements.input || !elements.input.value) {
+                    showFlash("请选择记录发生日期", "error");
                     return;
                 }
-                showFlash("事项归属已确认", "success");
-                window.location.reload();
-            } catch (error) {
-                showFlash("确认归属失败，请稍后再试", "error");
-            } finally {
+                if (!elements.input.checkValidity()) {
+                    elements.input.reportValidity();
+                    return;
+                }
+                if (elements.submitButton) {
+                    elements.submitButton.disabled = true;
+                    elements.submitButton.classList.add("opacity-60", "cursor-not-allowed");
+                }
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/record-date`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ record_date: elements.input.value }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "记录日期更新失败", "error");
+                        return;
+                    }
+                    showFlash("记录日期已更新", "success");
+                    window.setTimeout(() => window.location.reload(), 300);
+                } catch (error) {
+                    showFlash("记录日期更新失败，请稍后再试", "error");
+                } finally {
+                    if (elements.submitButton) {
+                        elements.submitButton.disabled = false;
+                        elements.submitButton.classList.remove("opacity-60", "cursor-not-allowed");
+                    }
+                }
+            });
+        };
+
+        const initEventAssignmentForm = () => {
+            const eventAssignmentForm = document.querySelector("[data-event-assignment-form]");
+            const eventAssignmentSaveButton = document.querySelector("[data-event-assignment-save]");
+            if (!eventAssignmentForm) {
+                return;
+            }
+            eventAssignmentForm.querySelectorAll("[data-assignment-select]").forEach((node) => {
+                node.addEventListener("change", () => syncEventAssignmentInputs(eventAssignmentForm));
+            });
+            eventAssignmentForm.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                const payload = buildEventAssignmentPayload(eventAssignmentForm);
+                if (!payload) {
+                    return;
+                }
                 if (eventAssignmentSaveButton) {
-                    eventAssignmentSaveButton.disabled = false;
-                    eventAssignmentSaveButton.classList.remove("opacity-60", "cursor-not-allowed");
+                    eventAssignmentSaveButton.disabled = true;
+                    eventAssignmentSaveButton.classList.add("opacity-60", "cursor-not-allowed");
                 }
-            }
-        });
-
-        form.addEventListener("submit", async (event) => {
-            event.preventDefault();
-            const payload = JSON.parse(serialize());
-            try {
-                const response = await fetch(`/api/evidence/${evidenceId}/slots`, {
-                    method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload),
-                });
-                const data = await response.json();
-                if (!response.ok) {
-                    showFlash(data.detail || "保存失败", "error");
-                    return;
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/event-assignment`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "确认归属失败", "error");
+                        return;
+                    }
+                    showFlash("事项归属已确认", "success");
+                    window.location.reload();
+                } catch (error) {
+                    showFlash("确认归属失败，请稍后再试", "error");
+                } finally {
+                    if (eventAssignmentSaveButton) {
+                        eventAssignmentSaveButton.disabled = false;
+                        eventAssignmentSaveButton.classList.remove("opacity-60", "cursor-not-allowed");
+                    }
                 }
-                showFlash("已更新", "success");
-                window.location.reload();
-            } catch (error) {
-                showFlash("保存失败,请稍后再试", "error");
-            }
-        });
+            });
+            syncEventAssignmentInputs(eventAssignmentForm);
+        };
 
-        editOcrTextButton?.addEventListener("click", () => {
-            setOcrEditorOpen(true);
-            ocrTextInput?.focus();
-        });
-
-        cancelOcrTextButton?.addEventListener("click", () => {
-            if (ocrTextInput && ocrTextReadonly) {
-                ocrTextInput.value = ocrTextReadonly.textContent || "";
-            }
-            setOcrEditorOpen(false);
-        });
-
-        saveOcrTextButton?.addEventListener("click", async () => {
-            if (!ocrTextInput) {
+        const initSlotsForm = () => {
+            const form = document.getElementById("slots-form");
+            const saveButton = document.getElementById("save-slots");
+            const addCaveatButton = document.getElementById("add-caveat");
+            const caveatList = document.getElementById("caveat-list");
+            if (!form || !saveButton || !addCaveatButton || !caveatList) {
                 return;
             }
-            saveOcrTextButton.disabled = true;
-            saveOcrTextButton.classList.add("opacity-60", "cursor-not-allowed");
-            try {
-                const response = await fetch(`/api/evidence/${evidenceId}/ocr_text`, {
-                    method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ text: ocrTextInput.value }),
+            const caveatRow = (value = "") => {
+                const wrapper = document.createElement("div");
+                wrapper.className = "flex gap-3";
+                wrapper.innerHTML = `
+                    <input type="text" value="${value}" data-caveat-input class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                    <button type="button" data-remove-caveat class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                `;
+                wrapper.querySelector("[data-remove-caveat]").addEventListener("click", () => {
+                    wrapper.remove();
+                    syncDirty();
                 });
-                const data = await response.json();
-                if (!response.ok) {
-                    showFlash(data.detail || "保存失败", "error");
+                wrapper.querySelector("[data-caveat-input]").addEventListener("input", syncDirty);
+                return wrapper;
+            };
+            const serialize = () => {
+                const direction = form.querySelector("input[name='slot-direction']:checked")?.value || "none";
+                return JSON.stringify({
+                    slot_deliverable: document.getElementById("slot-deliverable")?.value.trim() || null,
+                    slot_due_raw: document.getElementById("slot-due-raw")?.value.trim() || null,
+                    slot_due_date: document.getElementById("slot-due-date")?.value || null,
+                    slot_direction: direction,
+                    kind: document.getElementById("kind-input")?.value,
+                    plain_summary: document.getElementById("plain-summary")?.value.trim() || null,
+                    caveats: [...form.querySelectorAll("[data-caveat-input]")].map((node) => node.value.trim()).filter(Boolean),
+                });
+            };
+            const initialState = serialize();
+
+            function syncDirty() {
+                if (isDemo) {
+                    saveButton.disabled = true;
                     return;
                 }
-                showFlash("已保存,正在重新理解这段对话…", "success");
-                window.location.reload();
-            } catch (error) {
-                showFlash("保存失败,请稍后再试", "error");
-            } finally {
-                saveOcrTextButton.disabled = false;
-                saveOcrTextButton.classList.remove("opacity-60", "cursor-not-allowed");
+                saveButton.disabled = serialize() === initialState;
             }
-        });
 
-        runArkVisionDiagnosticButton?.addEventListener("click", async () => {
-            if (!arkVisionResult) {
+            addCaveatButton.addEventListener("click", () => {
+                caveatList.appendChild(caveatRow());
+                syncDirty();
+            });
+            form.querySelectorAll("input, textarea, select").forEach((node) => {
+                node.addEventListener("input", syncDirty);
+                node.addEventListener("change", syncDirty);
+            });
+            form.querySelectorAll("[data-remove-caveat]").forEach((button) => {
+                button.addEventListener("click", () => {
+                    button.closest(".flex")?.remove();
+                    syncDirty();
+                });
+            });
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                const payload = JSON.parse(serialize());
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/slots`, {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(payload),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "保存失败", "error");
+                        return;
+                    }
+                    showFlash("已更新", "success");
+                    window.location.reload();
+                } catch (error) {
+                    showFlash("保存失败,请稍后再试", "error");
+                }
+            });
+            syncDirty();
+        };
+
+        const initOcrEditor = () => {
+            const elements = {
+                editButton: document.getElementById("edit-ocr-text"),
+                saveButton: document.getElementById("save-ocr-text"),
+                cancelButton: document.getElementById("cancel-ocr-text"),
+                readonly: document.getElementById("ocr-text-readonly"),
+                editor: document.getElementById("ocr-text-editor"),
+                input: document.getElementById("ocr-text-input"),
+            };
+            if (!elements.editButton || !elements.saveButton || !elements.readonly || !elements.editor || !elements.input) {
                 return;
             }
-            runArkVisionDiagnosticButton.disabled = true;
-            runArkVisionDiagnosticButton.classList.add("opacity-60", "cursor-not-allowed");
-            arkVisionResult.textContent = "正在运行 Ark Vision 实验解析…";
-            try {
-                const response = await fetch(`/api/evidence/${evidenceId}/diagnostics/ark-vision`, {
-                    method: "POST",
-                });
-                const payload = await response.json();
-                renderArkVisionResult(payload);
-                if (!response.ok) {
-                    showFlash(payload?.ark_vision?.detail || payload.detail || "Ark Vision 实验解析失败", "error");
+            elements.editButton.addEventListener("click", () => {
+                setOcrEditorOpen(true, elements);
+                elements.input.focus();
+            });
+            elements.cancelButton?.addEventListener("click", () => {
+                elements.input.value = elements.readonly.textContent || "";
+                setOcrEditorOpen(false, elements);
+            });
+            elements.saveButton.addEventListener("click", async () => {
+                elements.saveButton.disabled = true;
+                elements.saveButton.classList.add("opacity-60", "cursor-not-allowed");
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/ocr_text`, {
+                        method: "PATCH",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ text: elements.input.value }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "保存失败", "error");
+                        return;
+                    }
+                    showFlash("已保存,正在重新理解这段对话…", "success");
+                    window.location.reload();
+                } catch (error) {
+                    showFlash("保存失败,请稍后再试", "error");
+                } finally {
+                    elements.saveButton.disabled = false;
+                    elements.saveButton.classList.remove("opacity-60", "cursor-not-allowed");
+                }
+            });
+            setOcrEditorOpen(false, elements);
+        };
+
+        const initDiagnostics = () => {
+            const runArkVisionDiagnosticButton = document.getElementById("run-ark-vision-diagnostic");
+            const arkVisionResult = document.getElementById("ark-vision-result");
+            const runDeepseekPreflightButton = document.getElementById("run-deepseek-preflight");
+            const deepseekPreflightResult = document.getElementById("deepseek-preflight-result");
+            runArkVisionDiagnosticButton?.addEventListener("click", async () => {
+                if (!arkVisionResult) {
                     return;
                 }
-                showFlash("Ark Vision 实验结果已更新,不会保存到当前记录。", "success");
-            } catch (error) {
-                arkVisionResult.textContent = "Ark Vision 实验解析失败,请稍后再试。";
-                showFlash("Ark Vision 实验解析失败,请稍后再试", "error");
-            } finally {
-                runArkVisionDiagnosticButton.disabled = false;
-                runArkVisionDiagnosticButton.classList.remove("opacity-60", "cursor-not-allowed");
-            }
-        });
-
-        runDeepseekPreflightButton?.addEventListener("click", async () => {
-            if (!deepseekPreflightResult) {
-                return;
-            }
-            runDeepseekPreflightButton.disabled = true;
-            runDeepseekPreflightButton.classList.add("opacity-60", "cursor-not-allowed");
-            deepseekPreflightResult.textContent = "正在运行 DeepSeek text preflight…";
-            try {
-                const response = await fetch(`/api/evidence/${evidenceId}/diagnostics/deepseek-preflight`, {
-                    method: "POST",
-                });
-                const payload = await response.json();
-                renderDeepseekPreflightResult(payload);
-                if (!response.ok) {
-                    showFlash(payload.detail || "DeepSeek text preflight 失败", "error");
+                runArkVisionDiagnosticButton.disabled = true;
+                runArkVisionDiagnosticButton.classList.add("opacity-60", "cursor-not-allowed");
+                arkVisionResult.textContent = "正在运行 Ark Vision 实验解析…";
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/diagnostics/ark-vision`, {
+                        method: "POST",
+                    });
+                    const payload = await response.json();
+                    renderArkVisionResult(payload, arkVisionResult);
+                    if (!response.ok) {
+                        showFlash(payload?.ark_vision?.detail || payload.detail || "Ark Vision 实验解析失败", "error");
+                        return;
+                    }
+                    showFlash("Ark Vision 实验结果已更新,不会保存到当前记录。", "success");
+                } catch (error) {
+                    arkVisionResult.textContent = "Ark Vision 实验解析失败,请稍后再试。";
+                    showFlash("Ark Vision 实验解析失败,请稍后再试", "error");
+                } finally {
+                    runArkVisionDiagnosticButton.disabled = false;
+                    runArkVisionDiagnosticButton.classList.remove("opacity-60", "cursor-not-allowed");
+                }
+            });
+            runDeepseekPreflightButton?.addEventListener("click", async () => {
+                if (!deepseekPreflightResult) {
                     return;
                 }
-                showFlash("DeepSeek text preflight 已完成，不会保存到当前记录。", "success");
-            } catch (error) {
-                deepseekPreflightResult.textContent = "DeepSeek text preflight 失败，请稍后再试。";
-                showFlash("DeepSeek text preflight 失败，请稍后再试", "error");
-            } finally {
-                runDeepseekPreflightButton.disabled = false;
-                runDeepseekPreflightButton.classList.remove("opacity-60", "cursor-not-allowed");
-            }
-        });
+                runDeepseekPreflightButton.disabled = true;
+                runDeepseekPreflightButton.classList.add("opacity-60", "cursor-not-allowed");
+                deepseekPreflightResult.textContent = "正在运行 DeepSeek text preflight…";
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/diagnostics/deepseek-preflight`, {
+                        method: "POST",
+                    });
+                    const payload = await response.json();
+                    renderDeepseekPreflightResult(payload, deepseekPreflightResult);
+                    if (!response.ok) {
+                        showFlash(payload.detail || "DeepSeek text preflight 失败", "error");
+                        return;
+                    }
+                    showFlash("DeepSeek text preflight 已完成，不会保存到当前记录。", "success");
+                } catch (error) {
+                    deepseekPreflightResult.textContent = "DeepSeek text preflight 失败，请稍后再试。";
+                    showFlash("DeepSeek text preflight 失败，请稍后再试", "error");
+                } finally {
+                    runDeepseekPreflightButton.disabled = false;
+                    runDeepseekPreflightButton.classList.remove("opacity-60", "cursor-not-allowed");
+                }
+            });
+        };
 
-        syncDirty();
-        syncEventAssignmentInputs();
-        setOcrEditorOpen(false);
+        initRecordDateEditor();
+        initEventAssignmentForm();
+        initSlotsForm();
+        initOcrEditor();
+        initDiagnostics();
     })();
 </script>
 {% endblock %}

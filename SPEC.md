@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.3 · 最后更新 2026-08-08
+> 版本 v1.3 · 最后更新 2026-08-09
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -115,7 +115,8 @@
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
 - production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;不传 `self_names`,也不使用 `counterpart` 参与事实判断
 - `anchor_date` 优先级固定为:1) 用户明确填写的 `record_date`;2) `infer_reliable_anchor_date(...)` 从 transcript / observation 中确定性识别出的同日消息时间;3) `None`
-- 自动识别 `anchor_date` 只允许命中明确消息时间结构(如 `小李(2026-08-09): ...`、`[2026-08-09 10:30] 小李：...`);若出现多个不同日期、普通正文交付日期,或 observation 里没有明确 `消息日期/日期/timestamp + 完整年月日时`,一律返回 `None`
+- 自动识别 `anchor_date` 只允许命中明确消息时间结构(如 `小李(2026-08-09): ...`、`[2026-08-09 10:30] 小李：...`);若出现多个不同日期、普通正文交付日期,或 observation 里没有明确 `消息日期/日期/timestamp + 完整年月日`(可带时间),一律返回 `None`
+- 截图/图片 observation 若直接可见完整年月日或完整日期+时间,允许提取为 `kind="timestamp"`;若只有 `19:21` 这类时分,不得补造年月日,也不得拿上传时间冒充聊天日期
 - 无论用户填写还是正文可靠识别,都绝不能自动拿 `captured_at` / 上传时间冒充发生日期;当前 Evidence 会在 `meta` 中额外记录 anchor source(`user` / `content`)
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - Observation 可以支持 Fact / Interpretation 生成,但不得越过“画面直接可观察事实”边界;若与 transcript 冲突,应显式保留 uncertainty / ambiguity,不得静默脑补
@@ -599,10 +600,15 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 旧 demo threads 已降级为 `看看示例`,与真实 Event 分区展示,不再混为同一数据体系
 - `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要;若 latest Event Match 为 `pending` 且 routing_mode 为 `confirm / needs_context`,首页直接复用与详情页相同的事项归属确认面板,无需先进入详情页
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
+- Event 详情页现已升级为 Competition Event Control Center V1:可修改事项名称、纠正 Fact 的 `content / fact_type / due_at`、直接补/改相关 Evidence 的记录日期,并通过受控接口切换 `active <-> resolved`
+- Event 页 Fact 纠正必须走 `correct_fact_by_user(...)`;只允许修改语义字段,不得改 `fact_id / semantic_run_id / Evidence` 关联,写入后统一标记 `origin=user / review_status=corrected` 并更新 `events.updated_at`
 - Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,并与首页共用同一服务端确认写入逻辑;完成后展示最终事项归属结果
+- Evidence 详情页若已存在 succeeded Semantic Run,不再展示旧兼容层 slots 编辑区(`交付物 / 时限原文 / 方向 / kind / caveat`);只有无 Semantic Run 的旧记录继续保留兼容编辑入口
 - Evidence 详情页在存在相对日期 Fact 时,会展示"记录日期"操作区:缺少 anchor 时允许补充日期,已有 anchor 时展示来源(`你填写的` / `从记录时间中识别`)并允许修改
 - `/api/evidence/{id}/record-date` 只做确定性补算:保存 `meta` 中的 anchor/source=`user`,对 latest succeeded semantic run 内 `due_raw` 为相对日期的 Facts 重新计算 `due_at / due_anchor_at`,并以原子事务更新 `origin=user / review_status=corrected`;不重跑 DeepSeek,不改 Evidence 原件,不改 Semantic Run 历史
 - 首页 `我的事项` 卡片会读取 Event 关联 Facts 中最早的有效 `due_at`;有明确日期时显示 `截止：MM-DD`(跨年则显示完整日期),没有 `due_at` 时不显示占位文案
+- 首页 `我的事项` 现只展示 `status=active` 的事项;`status=resolved` 的事项进入单独的 `历史事项` 区,支持回看与重新打开,结档不会删除任何 Fact / Evidence
+- 首页原 `我刚存的` 文案已改为 `最近证据`,说明固定为 `按保存顺序保留的原始材料，用于回看和核对。`
 - 用户可见文案不得直接暴露 `anchor_date / due_date / fact_index / event_assignment` 等内部字段名;相对日期缺少可靠锚点时,统一改写为用户能理解的提示,并明确只有补充"记录发生日期"后才能换算
 - 当 Evidence 已有可靠 anchor 后,当前视图要过滤掉"缺少记录发生日期 / 无法换算今天或周五"这类 stale date uncertainty;历史 Interpretation 保留,但可补充一条轻量提示: `已按 YYYY-MM-DD 换算相对日期。`
 - Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、原件完整保存与校验、以及 `auto / confirm / needs_context` 的真实行为
@@ -626,6 +632,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 
 | 日期 | 变更 | 原因 |
 |---|---|---|
+| 2026-08-09 | Competition Event Control Center V1:Event 页支持改名 / Fact 纠正 / 记录日期补改 / 结档与重开,首页新增历史事项并将 `我刚存的` 改为 `最近证据` | 让 `我的事项` 成为用户纠正 AI 结果、补日期、结档和回看历史的主入口,同时保持旧记录兼容与哈希链不受影响 |
 | 2026-08-07 | v1.0 初始版本 | — |
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 | 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |

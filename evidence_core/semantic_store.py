@@ -1618,9 +1618,11 @@ def correct_fact_by_user(
         raise SemanticStoreError("correct_fact_by_user requires at least one semantic change")
 
     updated_at = _now_ms() if updated_at is None else updated_at
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         current = _get_fact_row(conn, fact_id)
         assignments = {
             "fact_type": current["fact_type"],
@@ -1658,10 +1660,12 @@ def correct_fact_by_user(
         if normalized_actor_roles is not None:
             _replace_fact_actors(conn, fact_id=fact_id, actor_roles=normalized_actor_roles)
         result = _load_fact(conn, fact_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 

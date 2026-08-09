@@ -791,6 +791,16 @@ def test_infer_reliable_anchor_date_accepts_explicit_timestamp_observation():
     assert semantic_llm.infer_reliable_anchor_date("", observations=observations) == "2026-08-09"
 
 
+def test_infer_reliable_anchor_date_accepts_explicit_full_date_observation_without_time():
+    observations = [{"kind": "timestamp", "content": "日期 2026-08-09", "confidence": 0.9}]
+    assert semantic_llm.infer_reliable_anchor_date("", observations=observations) == "2026-08-09"
+
+
+def test_infer_reliable_anchor_date_rejects_time_only_timestamp_observation():
+    observations = [{"kind": "timestamp", "content": "消息时间 19:21", "confidence": 0.9}]
+    assert semantic_llm.infer_reliable_anchor_date("", observations=observations) is None
+
+
 def test_infer_reliable_anchor_date_ignores_observation_without_explicit_label():
     observations = [{"kind": "message", "content": "2026-08-09 10:30", "confidence": 0.9}]
     assert semantic_llm.infer_reliable_anchor_date("", observations=observations) is None

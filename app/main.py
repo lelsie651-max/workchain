@@ -63,6 +63,7 @@ from evidence_core.semantic_store import (
     SemanticStoreError,
     create_semantic_run,
     create_event_match_run,
+    correct_fact_by_user,
     correct_relative_due_dates_by_user,
     get_latest_event_match_for_evidence,
     get_latest_event_match_for_semantic_run,
@@ -88,6 +89,7 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_SANDBOX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_LLM_TEXT_LENGTH = 8_000
 MAX_OCR_TEXT_LENGTH = 50_000
+MAX_USER_EVENT_TITLE_LENGTH = 80
 MIN_RECORD_DATE = "1900-01-01"
 MAX_RECORD_DATE = "2100-12-31"
 WORKCHAIN_DIAGNOSTICS_ENV = "WORKCHAIN_DIAGNOSTICS"
@@ -141,6 +143,55 @@ def _friendly_interpretation_label(kind: str | None) -> str:
         "uncertainty": "还需要补充",
     }
     return mapping.get(kind or "", "说明")
+
+
+def _event_status_label(status: str | None) -> str:
+    mapping = {
+        "active": "进行中",
+        "resolved": "已结档",
+        "archived": "已归档",
+    }
+    return mapping.get(status or "", status or "未知状态")
+
+
+def _event_fact_type_label(fact_type: str | None) -> str:
+    mapping = {
+        "request": "要求",
+        "commitment": "承诺",
+        "confirmation": "确认",
+        "scope_change": "范围变化",
+        "responsibility_change": "责任变化",
+        "deadline_change": "截止变化",
+        "delivery": "交付",
+        "cancellation": "取消",
+        "denial": "否认",
+        "statement": "说明",
+        "reference": "参考",
+    }
+    return mapping.get(fact_type or "", fact_type or "说明")
+
+
+def _event_fact_type_options() -> list[dict[str, str]]:
+    return [
+        {"value": "request", "label": "要求"},
+        {"value": "commitment", "label": "承诺"},
+        {"value": "confirmation", "label": "确认"},
+        {"value": "scope_change", "label": "范围变化"},
+        {"value": "responsibility_change", "label": "责任变化"},
+        {"value": "deadline_change", "label": "截止变化"},
+        {"value": "delivery", "label": "交付"},
+        {"value": "cancellation", "label": "取消"},
+        {"value": "denial", "label": "否认"},
+        {"value": "statement", "label": "说明"},
+        {"value": "reference", "label": "参考"},
+    ]
+
+
+def _parse_due_date_input(value: Any) -> int | None:
+    normalized = _normalize_record_date_input(value)
+    if normalized is None:
+        return None
+    return llm.due_date_to_millis(normalized)
 
 
 def _first_quoted_phrase(text: str) -> str | None:
@@ -2217,6 +2268,8 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
     return {
         "event_id": row["event_id"],
         "title": row["title"],
+        "status": row["status"],
+        "status_label": _event_status_label(row["status"]),
         "fact_count": row["fact_count"],
         "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d %H:%M"),
         "due_text": _format_due_display(row["due_at"]),
@@ -2415,6 +2468,7 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
         SELECT
             ev.event_id,
             ev.title,
+            ev.status,
             COUNT(DISTINCT f.fact_id) AS fact_count,
             MIN(f.due_at) AS due_at,
             MAX(COALESCE(f.occurred_at, f.updated_at, f.created_at, ev.updated_at)) AS last_activity_at
@@ -2427,7 +2481,7 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
             WHERE fe.fact_id = f.fact_id
               AND e.evidence_id NOT LIKE 'ev_demo_%'
         )
-        GROUP BY ev.event_id, ev.title
+        GROUP BY ev.event_id, ev.title, ev.status
         ORDER BY last_activity_at DESC, ev.updated_at DESC, ev.event_id DESC
         """
     ).fetchall()
@@ -2488,8 +2542,10 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
         row_dict["extract_note"] = extract_note_map.get(row["evidence_id"])
         row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
         decorated_recent_rows.append(row_dict)
+    prepared_events = [_prepare_event_card(conn, row) for row in event_rows]
     return {
-        "my_events": [_prepare_event_card(conn, row) for row in event_rows],
+        "my_events": [item for item in prepared_events if item["status"] == "active"],
+        "history_events": [item for item in prepared_events if item["status"] == "resolved"],
         "demo_threads": [_prepare_thread_card(row) for row in demo_thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
         "recent_records": [_prepare_recent_row(conn, row, sandbox) for row in decorated_recent_rows],
@@ -2497,6 +2553,26 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
 
 
 def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, Any] | None:
+    def build_record_date_state(evidence_id: str) -> dict[str, Any] | None:
+        latest_run = get_latest_semantic_run_for_evidence(conn, evidence_id, status="succeeded")
+        if latest_run is None:
+            return None
+        facts_for_evidence = list_facts_for_semantic_run(
+            conn,
+            latest_run["semantic_run_id"],
+            evidence_id=evidence_id,
+        )
+        if not any(semantic_llm.is_relative_due_raw(item.get("due_raw")) for item in facts_for_evidence):
+            return None
+        record_date = _get_semantic_anchor_date(conn, evidence_id)
+        record_date_source = _get_semantic_anchor_source(conn, evidence_id)
+        return {
+            "evidence_id": evidence_id,
+            "record_date": record_date,
+            "record_date_source": record_date_source,
+            "record_date_source_label": _semantic_anchor_source_label(record_date_source),
+        }
+
     event_row = conn.execute(
         """
         SELECT event_id, title, status, summary, created_at, updated_at
@@ -2510,7 +2586,7 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
 
     fact_rows = conn.execute(
         """
-        SELECT fact_id, fact_type, content, occurred_at, created_at
+        SELECT fact_id, fact_type, content, occurred_at, created_at, due_at, origin, review_status
         FROM facts
         WHERE event_id = ?
         ORDER BY COALESCE(occurred_at, created_at) ASC, created_at ASC, fact_id ASC
@@ -2534,7 +2610,12 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
             {
                 "fact_id": row["fact_id"],
                 "fact_type": row["fact_type"],
+                "fact_type_label": _event_fact_type_label(row["fact_type"]),
                 "content": row["content"],
+                "due_text": _format_due_display(row["due_at"]),
+                "due_date_value": _format_datetime(row["due_at"], "%Y-%m-%d"),
+                "origin": row["origin"],
+                "review_status": row["review_status"],
                 "occurred_at_text": _format_datetime(
                     row["occurred_at"] if row["occurred_at"] is not None else row["created_at"],
                     "%m-%d %H:%M",
@@ -2544,6 +2625,7 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
                         "evidence_id": item["evidence_id"],
                         "href": f"/evidence/{item['evidence_id']}",
                         "label": f"{source_label(item['source_hint'])[0]} · {_format_datetime(item['occurred_at'], '%m-%d %H:%M')}",
+                        "record_date_state": build_record_date_state(item["evidence_id"]),
                     }
                     for item in evidence_rows
                 ],
@@ -2555,11 +2637,15 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
             "event_id": event_row["event_id"],
             "title": event_row["title"],
             "status": event_row["status"],
+            "status_label": _event_status_label(event_row["status"]),
+            "can_resolve": event_row["status"] == "active",
+            "can_reopen": event_row["status"] == "resolved",
             "summary": event_row["summary"],
             "fact_count": len(facts),
             "updated_at_text": _format_datetime(event_row["updated_at"], "%m-%d %H:%M"),
         },
         "facts": facts,
+        "fact_type_options": _event_fact_type_options(),
     }
 
 
@@ -3514,6 +3600,7 @@ def create_app() -> FastAPI:
             {
                 "page_title": "WorkChain",
                 "my_events": context["my_events"],
+                "history_events": context["history_events"],
                 "demo_threads": context["demo_threads"],
                 "references": context["references"],
                 "recent_records": context["recent_records"],
@@ -3521,6 +3608,162 @@ def create_app() -> FastAPI:
                 "settings": _settings_payload(sandbox.db_path),
                 "current_search_q": "",
             },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/events/{event_id}/title")
+    async def update_event_title(
+        event_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"title"})
+        if unexpected_fields:
+            raise HTTPException(status_code=400, detail=f"unsupported fields: {', '.join(unexpected_fields)}")
+        raw_title = payload.get("title")
+        if not isinstance(raw_title, str):
+            raise HTTPException(status_code=400, detail="事项名称不能为空")
+        title = " ".join(raw_title.strip().split())
+        if not title:
+            raise HTTPException(status_code=400, detail="事项名称不能为空")
+        if len(title) > MAX_USER_EVENT_TITLE_LENGTH:
+            raise HTTPException(status_code=400, detail=f"事项名称不能超过 {MAX_USER_EVENT_TITLE_LENGTH} 个字")
+
+        updated_at = int(time.time() * 1000)
+        conn = init_db(sandbox.db_path)
+        try:
+            row = conn.execute("SELECT event_id FROM events WHERE event_id = ?", (event_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="event not found")
+            conn.execute(
+                "UPDATE events SET title = ?, updated_at = ? WHERE event_id = ?",
+                (title, updated_at, event_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        response = JSONResponse({"event_id": event_id, "title": title, "updated_at": updated_at})
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/events/{event_id}/status")
+    async def update_event_status(
+        event_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"status"})
+        if unexpected_fields:
+            raise HTTPException(status_code=400, detail=f"unsupported fields: {', '.join(unexpected_fields)}")
+        target_status = str(payload.get("status", "")).strip()
+        if target_status not in {"active", "resolved"}:
+            raise HTTPException(status_code=400, detail="status must be active or resolved")
+
+        updated_at = int(time.time() * 1000)
+        conn = init_db(sandbox.db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="event not found")
+            current_status = row["status"]
+            allowed = {("active", "resolved"), ("resolved", "active")}
+            if (current_status, target_status) not in allowed:
+                raise HTTPException(status_code=400, detail="unsupported status transition")
+            conn.execute(
+                "UPDATE events SET status = ?, updated_at = ? WHERE event_id = ?",
+                (target_status, updated_at, event_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        response = JSONResponse(
+            {
+                "event_id": event_id,
+                "status": target_status,
+                "status_label": _event_status_label(target_status),
+                "updated_at": updated_at,
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/events/{event_id}/facts/{fact_id}/correct")
+    async def correct_event_fact(
+        event_id: str,
+        fact_id: str,
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"content", "fact_type", "due_at"})
+        if unexpected_fields:
+            raise HTTPException(status_code=400, detail=f"unsupported fields: {', '.join(unexpected_fields)}")
+
+        content = str(payload.get("content", "")).strip()
+        fact_type = str(payload.get("fact_type", "")).strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="事实内容不能为空")
+        if fact_type not in {item["value"] for item in _event_fact_type_options()}:
+            raise HTTPException(status_code=400, detail="fact_type 不合法")
+        due_at = _parse_due_date_input(payload.get("due_at"))
+        updated_at = int(time.time() * 1000)
+
+        conn = init_db(sandbox.db_path)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            fact_row = conn.execute(
+                "SELECT event_id FROM facts WHERE fact_id = ?",
+                (fact_id,),
+            ).fetchone()
+            if fact_row is None:
+                raise HTTPException(status_code=404, detail="fact not found")
+            if fact_row["event_id"] != event_id:
+                raise HTTPException(status_code=400, detail="fact does not belong to event")
+            try:
+                corrected = correct_fact_by_user(
+                    conn,
+                    fact_id=fact_id,
+                    fact_type=fact_type,
+                    content=content,
+                    due_at=due_at,
+                    due_raw=None,
+                    due_anchor_at=None,
+                    updated_at=updated_at,
+                )
+            except SemanticStoreError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            conn.execute("UPDATE events SET updated_at = ? WHERE event_id = ?", (updated_at, event_id))
+            conn.commit()
+        except HTTPException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+        response = JSONResponse(
+            {
+                "event_id": event_id,
+                "fact_id": fact_id,
+                "origin": corrected["origin"],
+                "review_status": corrected["review_status"],
+                "due_at": corrected["due_at"],
+            }
         )
         apply_sandbox_cookie(response, sandbox)
         return response
@@ -3542,6 +3785,7 @@ def create_app() -> FastAPI:
                 "page_title": context["event"]["title"],
                 "event": context["event"],
                 "facts": context["facts"],
+                "fact_type_options": context["fact_type_options"],
                 "current_search_q": "",
             },
         )
