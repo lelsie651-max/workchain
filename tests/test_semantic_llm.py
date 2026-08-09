@@ -548,6 +548,7 @@ def test_malformed_provider_result_and_invalid_fields_are_safe(monkeypatch):
         lambda messages, *, max_tokens, temperature=0: "```json\nnot valid\n```",
     )
     assert semantic_llm.extract_semantics("留档") is None
+    assert semantic_llm.pop_last_extract_diagnostic() is None
 
     monkeypatch.setattr(
         semantic_llm,
@@ -555,6 +556,7 @@ def test_malformed_provider_result_and_invalid_fields_are_safe(monkeypatch):
         lambda messages, *, max_tokens, temperature=0: None,
     )
     assert semantic_llm.extract_semantics("留档") is None
+    assert semantic_llm.pop_last_extract_diagnostic() is None
 
     normalized = semantic_llm.parse_semantic_json(
         json.dumps(
@@ -607,6 +609,49 @@ def test_malformed_provider_result_and_invalid_fields_are_safe(monkeypatch):
         ],
         "interpretations": [],
         "ambiguities": ["还有歧义"],
+    }
+
+
+def test_extract_semantics_records_model_json_diagnostic_with_real_provider_path(monkeypatch):
+    monkeypatch.setattr(
+        semantic_llm.ai_provider,
+        "chat_json",
+        semantic_llm.chat_json,
+    )
+    monkeypatch.setattr(
+        semantic_llm,
+        "chat_semantic_json_diagnostic_result",
+        lambda messages, *, max_tokens, temperature=0: {
+            "content": '{"facts": [}',
+            "diagnostic": {
+                "success": True,
+                "stage": "success",
+                "status_code": 200,
+                "error_code": None,
+                "error_type": None,
+                "safe_message": None,
+                "request_id": "req-model-json",
+                "latency_ms": 12,
+                "timeout_seconds": 60.0,
+                "thinking_mode": "disabled",
+                "model": "deepseek-v4-flash",
+            },
+        },
+    )
+
+    assert semantic_llm.extract_semantics("留档") is None
+    assert semantic_llm.pop_last_extract_diagnostic() == {
+        "success": False,
+        "stage": "model_json",
+        "status_code": 200,
+        "error_code": "invalid_semantic_json",
+        "error_type": "semantic_invalid_json",
+        "safe_message": "DeepSeek returned content, but Semantic Parser JSON was invalid",
+        "request_id": "req-model-json",
+        "latency_ms": 12,
+        "timeout_seconds": 60.0,
+        "thinking_mode": "disabled",
+        "model": "deepseek-v4-flash",
     }
 
 

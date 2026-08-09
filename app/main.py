@@ -26,7 +26,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from app import llm, ocr, semantic_llm, vision_provider
-from app.ai_provider import get_text_model
+from app.ai_provider import (
+    build_text_config_diagnostic,
+    diagnose_deepseek_text_preflight,
+    get_text_api_key,
+    get_text_model,
+    get_text_timeout_seconds,
+)
 from app.evidence_extractor import (
     ARK_FALLBACK_WARNING,
     get_image_extraction_provider,
@@ -839,6 +845,10 @@ def _parse_detail_key(evidence_id: str) -> str:
     return f"parse_detail:{evidence_id}"
 
 
+def _semantic_diagnostic_key(semantic_run_id: str) -> str:
+    return f"semantic_diagnostic:{semantic_run_id}"
+
+
 def _verified_key(evidence_id: str) -> str:
     return f"verified:{evidence_id}"
 
@@ -875,6 +885,93 @@ def _get_parse_status(conn: sqlite3.Connection, evidence_id: str) -> str:
 
 def _get_parse_detail(conn: sqlite3.Connection, evidence_id: str) -> str | None:
     return _get_meta_value(conn, _parse_detail_key(evidence_id))
+
+
+def _set_semantic_diagnostic(
+    conn: sqlite3.Connection,
+    semantic_run_id: str,
+    diagnostic: dict[str, Any] | None,
+) -> None:
+    if diagnostic is None:
+        return
+    safe_diagnostic = {
+        "success": bool(diagnostic.get("success")),
+        "stage": diagnostic.get("stage"),
+        "status_code": diagnostic.get("status_code"),
+        "error_code": diagnostic.get("error_code"),
+        "error_type": diagnostic.get("error_type"),
+        "safe_message": diagnostic.get("safe_message"),
+        "request_id": diagnostic.get("request_id"),
+        "latency_ms": diagnostic.get("latency_ms"),
+        "timeout_seconds": diagnostic.get("timeout_seconds"),
+        "thinking_mode": diagnostic.get("thinking_mode"),
+        "model": diagnostic.get("model"),
+    }
+    _set_meta_value(
+        conn,
+        _semantic_diagnostic_key(semantic_run_id),
+        json.dumps(safe_diagnostic, ensure_ascii=False, separators=(",", ":")),
+    )
+    conn.commit()
+
+
+def _get_semantic_diagnostic(conn: sqlite3.Connection, semantic_run_id: str | None) -> dict[str, Any] | None:
+    if not semantic_run_id:
+        return None
+    raw = _get_meta_value(conn, _semantic_diagnostic_key(semantic_run_id))
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _semantic_failure_type_from_diagnostic(diagnostic: dict[str, Any] | None) -> str:
+    if not diagnostic:
+        return "provider_invalid_response"
+    stage = diagnostic.get("stage")
+    status_code = diagnostic.get("status_code")
+    if stage == "config":
+        return "provider_config"
+    if stage == "network":
+        return "provider_network"
+    if stage == "timeout":
+        return "provider_timeout"
+    if stage == "http":
+        if isinstance(status_code, int):
+            return f"provider_http_{status_code}"
+        return "provider_http"
+    if stage == "empty_content":
+        return "provider_empty_content"
+    if stage == "model_json":
+        return "semantic_invalid_json"
+    if stage in {"response_json", "output_text"}:
+        return "provider_invalid_response"
+    return "provider_invalid_response"
+
+
+def _semantic_failure_detail(diagnostic: dict[str, Any] | None) -> str:
+    if not diagnostic:
+        return "解析暂不可用,记录已完整保存"
+    safe_message = diagnostic.get("safe_message")
+    if isinstance(safe_message, str) and safe_message.strip():
+        return safe_message
+    failure_type = _semantic_failure_type_from_diagnostic(diagnostic)
+    if failure_type == "provider_timeout":
+        timeout_seconds = diagnostic.get("timeout_seconds")
+        if isinstance(timeout_seconds, (int, float)):
+            return f"DeepSeek 请求超时（{timeout_seconds:g} 秒）"
+    if failure_type.startswith("provider_http_"):
+        return f"DeepSeek 接口返回 {failure_type.removeprefix('provider_http_')}"
+    if failure_type == "provider_empty_content":
+        return "DeepSeek 返回成功,但内容为空"
+    if failure_type == "semantic_invalid_json":
+        return "DeepSeek 已返回内容,但 Semantic JSON 无法解析"
+    return "解析暂不可用,记录已完整保存"
 
 
 def _set_verified(conn: sqlite3.Connection, evidence_id: str) -> None:
@@ -1118,10 +1215,27 @@ def _run_parse_pipeline(
             "failure_type": None,
         },
     )
-    api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
     if not should_call_model:
         conn = init_db(sandbox_db_path)
         try:
+            if semantic_run_id is not None:
+                _set_semantic_diagnostic(
+                    conn,
+                    semantic_run_id,
+                    {
+                        "success": True,
+                        "stage": "success",
+                        "status_code": None,
+                        "error_code": None,
+                        "error_type": None,
+                        "safe_message": "No transcript or visual observations; semantic parse short-circuited",
+                        "request_id": None,
+                        "latency_ms": 0,
+                        "timeout_seconds": get_text_timeout_seconds(),
+                        "thinking_mode": "disabled",
+                        "model": get_text_model(),
+                    },
+                )
             fact_payloads = _semantic_fact_payloads(
                 conn,
                 evidence_id=evidence_id,
@@ -1181,15 +1295,17 @@ def _run_parse_pipeline(
             conn.close()
         return
 
-    if not api_key:
+    if not get_text_api_key():
+        diagnostic = build_text_config_diagnostic()
         conn = init_db(sandbox_db_path)
         try:
             if semantic_run_id is not None:
+                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
                 try:
                     mark_semantic_run_failed(
                         conn,
                         semantic_run_id=semantic_run_id,
-                        failure_type="not_configured",
+                        failure_type=_semantic_failure_type_from_diagnostic(diagnostic),
                     )
                 except Exception:
                     pass
@@ -1205,7 +1321,7 @@ def _run_parse_pipeline(
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
-                "failure_type": "not_configured",
+                "failure_type": _semantic_failure_type_from_diagnostic(diagnostic),
             },
         )
         return
@@ -1240,6 +1356,7 @@ def _run_parse_pipeline(
         )
         return
 
+    diagnostic = None
     try:
         parsed = semantic_llm.extract_semantics(
             _llm_input_text(transcript) if transcript is not None else None,
@@ -1248,17 +1365,50 @@ def _run_parse_pipeline(
             glossary=glossary,
             source_hint=evidence_row["source_hint"],
         )
-    except Exception:
+        diagnostic = semantic_llm.pop_last_extract_diagnostic()
+    except Exception as exc:
+        diagnostic = semantic_llm.pop_last_extract_diagnostic()
+        if diagnostic is None:
+            if isinstance(exc, httpx.TimeoutException):
+                diagnostic = {
+                    "success": False,
+                    "stage": "timeout",
+                    "status_code": None,
+                    "error_code": "timeout",
+                    "error_type": type(exc).__name__,
+                    "safe_message": f"DeepSeek request timed out after {get_text_timeout_seconds():g} seconds",
+                    "request_id": None,
+                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                    "timeout_seconds": get_text_timeout_seconds(),
+                    "thinking_mode": "disabled",
+                    "model": get_text_model(),
+                }
+            else:
+                diagnostic = {
+                    "success": False,
+                    "stage": "network",
+                    "status_code": None,
+                    "error_code": "request_error",
+                    "error_type": type(exc).__name__,
+                    "safe_message": "DeepSeek request failed before a safe provider diagnostic was available",
+                    "request_id": None,
+                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
+                    "timeout_seconds": get_text_timeout_seconds(),
+                    "thinking_mode": "disabled",
+                    "model": get_text_model(),
+                }
         parsed = None
     if parsed is None:
+        failure_type = _semantic_failure_type_from_diagnostic(diagnostic)
         conn = init_db(sandbox_db_path)
         try:
             if semantic_run_id is not None:
+                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
                 try:
                     mark_semantic_run_failed(
                         conn,
                         semantic_run_id=semantic_run_id,
-                        failure_type="provider_unavailable_or_invalid_response",
+                        failure_type=failure_type,
                     )
                 except Exception:
                     pass
@@ -1274,13 +1424,15 @@ def _run_parse_pipeline(
                 "status": "failed",
                 "latency_ms": int((time.perf_counter() - parse_start) * 1000),
                 "parse_success": False,
-                "failure_type": "provider_unavailable_or_invalid_response",
+                "failure_type": failure_type,
             },
         )
         return
 
     conn = init_db(sandbox_db_path)
     try:
+        if semantic_run_id is not None:
+            _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
         fact_payloads = _semantic_fact_payloads(
             conn,
             evidence_id=evidence_id,
@@ -1844,6 +1996,8 @@ def _build_evidence_diagnostics(
     parse_status: str,
     parse_detail: str | None,
 ) -> dict[str, Any]:
+    latest_run = get_latest_semantic_run_for_evidence(conn, evidence["evidence_id"])
+    semantic_diagnostic = None if latest_run is None else _get_semantic_diagnostic(conn, latest_run["semantic_run_id"])
     return {
         "evidence_id": evidence["evidence_id"],
         "parse_status": parse_status,
@@ -1867,6 +2021,16 @@ def _build_evidence_diagnostics(
             "provider_label": _provider_label("deepseek"),
             "model": get_text_model(),
             "parser_version": semantic_llm.SEMANTIC_PARSER_VERSION,
+        },
+        "semantic_parser": None if latest_run is None else {
+            "semantic_run_id": latest_run["semantic_run_id"],
+            "run_status": latest_run["status"],
+            "provider": latest_run["provider"],
+            "provider_label": _provider_label(latest_run["provider"]),
+            "model": latest_run["model"],
+            "parser_version": latest_run["parser_version"],
+            "failure_type": latest_run["failure_type"],
+            "diagnostic": semantic_diagnostic,
         },
     }
 
@@ -1981,6 +2145,35 @@ def _ark_diagnostic_http_status(preflight: dict[str, Any], diagnostic: dict[str,
     if not diagnostic.get("success") and diagnostic.get("stage") == "config":
         return 503
     return 502
+
+
+def _deepseek_preflight_detail(preflight: dict[str, Any]) -> str:
+    if preflight.get("success"):
+        return "DeepSeek text preflight 成功；若当前 Semantic Parser 仍失败，可继续聚焦真实 Prompt、模型 JSON 或 parser。"
+    stage = preflight.get("stage")
+    if stage == "config":
+        return "DeepSeek text preflight 失败，优先排查 API Key、模型配置或环境变量。"
+    if stage == "http":
+        return "DeepSeek text preflight 失败，优先排查余额、模型权限或上游接口状态。"
+    if stage == "timeout":
+        return "DeepSeek text preflight 超时，优先排查网络与上游响应时延。"
+    safe_message = preflight.get("safe_message")
+    if isinstance(safe_message, str) and safe_message.strip():
+        return safe_message
+    return "DeepSeek text preflight 失败。"
+
+
+def _deepseek_preflight_http_status(preflight: dict[str, Any]) -> int:
+    if preflight.get("success"):
+        return 200
+    stage = preflight.get("stage")
+    if stage == "config":
+        return 503
+    if stage == "http" and preflight.get("status_code") in {401, 402, 422, 429}:
+        return 502
+    if stage in {"network", "timeout", "http"}:
+        return 502
+    return 500
 
 
 def create_app() -> FastAPI:
@@ -2175,6 +2368,32 @@ def create_app() -> FastAPI:
                 text_preflight=text_preflight,
                 diagnostic=diagnostic,
             )
+        )
+
+    @app.post("/api/evidence/{evidence_id}/diagnostics/deepseek-preflight")
+    def evidence_deepseek_preflight(
+        evidence_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        if not _diagnostics_enabled():
+            raise HTTPException(status_code=404, detail="diagnostics disabled")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            evidence = _fetch_evidence_detail(conn, evidence_id)
+            if evidence is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+        finally:
+            conn.close()
+
+        preflight = diagnose_deepseek_text_preflight()
+        return JSONResponse(
+            status_code=_deepseek_preflight_http_status(preflight),
+            content={
+                "status": "succeeded" if preflight.get("success") else "failed",
+                "detail": _deepseek_preflight_detail(preflight),
+                "deepseek_text_preflight": preflight,
+            },
         )
 
     @app.get("/api/evidence/{evidence_id}/diagnostics")

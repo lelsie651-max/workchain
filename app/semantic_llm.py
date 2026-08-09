@@ -5,10 +5,12 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from app.ai_provider import chat_json
+from app import ai_provider
+from app.ai_provider import chat_json, chat_semantic_json_diagnostic_result
 from evidence_core.extraction_contract import normalize_observations
 
 SEMANTIC_PARSER_VERSION = "2.2"
+_LAST_EXTRACT_DIAGNOSTIC: dict[str, Any] | None = None
 
 FACT_TYPES = {
     "request",
@@ -102,6 +104,18 @@ def _default_result() -> dict[str, Any]:
         "interpretations": [],
         "ambiguities": [],
     }
+
+
+def _set_last_extract_diagnostic(diagnostic: dict[str, Any] | None) -> None:
+    global _LAST_EXTRACT_DIAGNOSTIC
+    _LAST_EXTRACT_DIAGNOSTIC = None if diagnostic is None else dict(diagnostic)
+
+
+def pop_last_extract_diagnostic() -> dict[str, Any] | None:
+    global _LAST_EXTRACT_DIAGNOSTIC
+    diagnostic = _LAST_EXTRACT_DIAGNOSTIC
+    _LAST_EXTRACT_DIAGNOSTIC = None
+    return None if diagnostic is None else dict(diagnostic)
 
 
 def _coerce_text(value: Any) -> str | None:
@@ -403,6 +417,7 @@ def extract_semantics(
     source_hint: str | None = None,
 ) -> dict[str, Any] | None:
     transcript, normalized_observations = _normalize_semantic_inputs(text, observations)
+    _set_last_extract_diagnostic(None)
     if transcript is None and not normalized_observations:
         return _default_result()
 
@@ -415,5 +430,29 @@ def extract_semantics(
         source_hint=source_hint,
     )
 
-    content = chat_json(messages, max_tokens=4096, temperature=0)
-    return parse_semantic_json(content, anchor_date=anchor_date)
+    if chat_json is ai_provider.chat_json:
+        provider_result = chat_semantic_json_diagnostic_result(
+            messages,
+            max_tokens=4096,
+            temperature=0,
+        )
+        _set_last_extract_diagnostic(provider_result["diagnostic"])
+        content = provider_result["content"]
+    else:
+        content = chat_json(messages, max_tokens=4096, temperature=0)
+        provider_result = {"content": content, "diagnostic": None}
+    parsed = parse_semantic_json(content, anchor_date=anchor_date)
+    if content is not None and parsed is None:
+        if provider_result["diagnostic"] is not None:
+            diagnostic = dict(provider_result["diagnostic"])
+            diagnostic.update(
+                {
+                    "success": False,
+                    "stage": "model_json",
+                    "error_code": "invalid_semantic_json",
+                    "error_type": "semantic_invalid_json",
+                    "safe_message": "DeepSeek returned content, but Semantic Parser JSON was invalid",
+                }
+            )
+            _set_last_extract_diagnostic(diagnostic)
+    return parsed

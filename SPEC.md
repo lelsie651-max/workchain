@@ -99,6 +99,7 @@
 - 文档 → 文:`pypdf` / `python-docx` / 文本解码
 - `Evidence -> Extraction(transcript + visual observations) -> Fact -> Event`
 - Extraction(`transcript + visual observations`) → Fact / Interpretation:DeepSeek OpenAI-compatible 接口,模型由 `DEEPSEEK_MODEL` 配置(默认 `deepseek-v4-flash`)
+- Production Semantic Parsing 固定使用 DeepSeek V4 Flash 的 non-thinking 模式(`thinking: {"type":"disabled"}`),并使用独立 `DEEPSEEK_TEXT_TIMEOUT_SECONDS`(默认 60 秒,仅作用于文本语义链路)
 - Fact → Event 建议:独立 Event Matcher,同样使用 `DEEPSEEK_MODEL`,只输出分组与归属建议
 - Event 路由模式(`auto / confirm / needs_context`)由本地确定性策略计算,不交给模型
 
@@ -561,6 +562,8 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 完整举证包 zip 导出(全链)
 - `/api/diag/llm` 与 `/api/diag/ocr` 连通性自检
 - diagnostics-only Visual A/B Diagnostics:可对同一图片 Evidence 临时运行 Ark Vision,与当前 machine extraction 做只读对照,结果不落库不改状态
+- diagnostics-only DeepSeek text preflight:可对同一 Evidence 临时运行轻量 JSON ping,不写 DB,用于区分 Key / 余额 / 模型 / API 问题与真实 Semantic Parser 问题
+- Evidence diagnostics 现可追踪 Semantic Parser provider failure stage,仅暴露安全元数据(如 stage / http status / timeout / thinking mode / safe message),不包含 prompt、transcript 或完整模型输出
 
 ### 下一阶段
 - TSA/外部时间锚点,进一步补强 checkpoint 之后的链尾截断问题

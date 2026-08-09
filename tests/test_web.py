@@ -18,6 +18,7 @@ from docx import Document
 from fastapi.testclient import TestClient
 import httpx
 from PIL import Image
+import pytest
 from pypdf import PdfReader
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -2525,16 +2526,7 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": None,
-        "owner_name": None,
-        "deliverable": "渠道复盘数据",
-        "due_date": "2026-08-08",
-        "due_raw": "周五前",
-        "direction": "none",
-        "plain_summary": "审批通过,周五前交付渠道复盘数据",
-        "caveats": [],
-    }
+    parsed = _semantic_result()
 
     with patch("app.extract.ocr.image_to_text", return_value=("原始识别文字", "")):
         with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
@@ -2545,13 +2537,16 @@ def test_evidence_diagnostics_off_does_not_expose_ui_or_endpoint(tmp_path, monke
                 diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
                 ocr_diag_response = client.get("/api/diag/ocr")
                 ark_response = client.post(f"/api/evidence/{evidence_id}/diagnostics/ark-vision")
+                deepseek_response = client.post(f"/api/evidence/{evidence_id}/diagnostics/deepseek-preflight")
 
     assert detail_response.status_code == 200
     assert "解析诊断" not in detail_response.text
     assert "用 Ark Vision 实验解析" not in detail_response.text
+    assert "测试 DeepSeek 连接" not in detail_response.text
     assert diag_response.status_code == 404
     assert ocr_diag_response.status_code == 404
     assert ark_response.status_code == 404
+    assert deepseek_response.status_code == 404
 
 
 def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, monkeypatch):
@@ -2560,16 +2555,7 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     monkeypatch.setenv("ARK_API_KEY", "ark-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
-    parsed = {
-        "requester_name": None,
-        "owner_name": None,
-        "deliverable": "渠道复盘数据",
-        "due_date": "2026-08-08",
-        "due_raw": "周五前",
-        "direction": "none",
-        "plain_summary": "审批通过,周五前交付渠道复盘数据",
-        "caveats": [],
-    }
+    parsed = _semantic_result()
     ark_extraction = {
         "transcript": "Ark 识别到的文字",
         "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}],
@@ -2577,18 +2563,34 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
         "model": "doubao-seed-2-0-lite-260215",
         "warnings": ["画面局部遮挡"],
     }
+    semantic_diagnostic = {
+        "success": True,
+        "stage": "success",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-success",
+        "latency_ms": 11,
+        "timeout_seconds": 60.0,
+        "thinking_mode": "disabled",
+        "model": "deepseek-v4-flash",
+    }
 
     with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
         with patch("app.extract.ocr.image_to_text") as mock_ocr:
             with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
-                with client:
-                    create_response = _upload_png(client, filename="diag-on.png")
-                    evidence_id = create_response.json()["evidence_id"]
-                    detail_response = client.get(f"/evidence/{evidence_id}")
-                    diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
+                with patch("app.main.semantic_llm.pop_last_extract_diagnostic", return_value=semantic_diagnostic):
+                    with client:
+                        create_response = _upload_png(client, filename="diag-on.png")
+                        evidence_id = create_response.json()["evidence_id"]
+                        detail_response = client.get(f"/evidence/{evidence_id}")
+                        diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
 
     assert detail_response.status_code == 200
     assert "解析诊断" in detail_response.text
+    assert "Semantic Parser" in detail_response.text
+    assert "测试 DeepSeek 连接" in detail_response.text
     assert "用 Ark Vision 实验解析" in detail_response.text
     assert diag_response.status_code == 200
     payload = diag_response.json()
@@ -2606,6 +2608,12 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     assert payload["text_llm"]["provider"] == "deepseek"
     assert payload["text_llm"]["model"] == main_module.get_text_model()
     assert payload["text_llm"]["parser_version"] == "2.2"
+    assert payload["semantic_parser"]["run_status"] == "succeeded"
+    assert payload["semantic_parser"]["failure_type"] is None
+    assert payload["semantic_parser"]["diagnostic"]["success"] is True
+    assert payload["semantic_parser"]["diagnostic"]["stage"] == "success"
+    assert payload["semantic_parser"]["diagnostic"]["timeout_seconds"] == 60.0
+    assert payload["semantic_parser"]["diagnostic"]["thinking_mode"] == "disabled"
     assert payload["extraction_history"] == [
         {
             "origin": "machine",
@@ -2623,6 +2631,161 @@ def test_evidence_diagnostics_on_returns_safe_actual_pipeline_info(tmp_path, mon
     assert "Ark 识别到的文字" not in diag_response.text
     mock_vision.assert_called_once()
     mock_ocr.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_failure_type"),
+    [
+        (
+            {
+                "success": False,
+                "stage": "http",
+                "status_code": 402,
+                "error_code": "http_402",
+                "error_type": "http_error",
+                "safe_message": "DeepSeek API returned HTTP 402",
+                "request_id": "req-402",
+                "latency_ms": 23,
+                "timeout_seconds": 60.0,
+                "thinking_mode": "disabled",
+                "model": "deepseek-v4-flash",
+            },
+            "provider_http_402",
+        ),
+        (
+            {
+                "success": False,
+                "stage": "empty_content",
+                "status_code": 200,
+                "error_code": "empty_content",
+                "error_type": "empty_content",
+                "safe_message": "DeepSeek returned HTTP 200 but model content was empty",
+                "request_id": "req-empty",
+                "latency_ms": 14,
+                "timeout_seconds": 60.0,
+                "thinking_mode": "disabled",
+                "model": "deepseek-v4-flash",
+            },
+            "provider_empty_content",
+        ),
+        (
+            {
+                "success": False,
+                "stage": "model_json",
+                "status_code": 200,
+                "error_code": "invalid_semantic_json",
+                "error_type": "semantic_invalid_json",
+                "safe_message": "DeepSeek returned content, but Semantic Parser JSON was invalid",
+                "request_id": "req-model-json",
+                "latency_ms": 19,
+                "timeout_seconds": 60.0,
+                "thinking_mode": "disabled",
+                "model": "deepseek-v4-flash",
+            },
+            "semantic_invalid_json",
+        ),
+    ],
+)
+def test_semantic_run_failure_type_uses_precise_safe_category(tmp_path, monkeypatch, diagnostic, expected_failure_type):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=None):
+        with patch("app.main.semantic_llm.pop_last_extract_diagnostic", return_value=diagnostic):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "张总:把材料补一下。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+                diag_response = client.get(f"/api/evidence/{evidence_id}/diagnostics")
+
+    assert create_response.status_code == 200
+    assert detail_response.status_code == 200
+    assert expected_failure_type in detail_response.text
+    assert diagnostic["safe_message"] in detail_response.text
+    payload = diag_response.json()
+    assert payload["semantic_parser"]["failure_type"] == expected_failure_type
+    assert payload["semantic_parser"]["diagnostic"]["stage"] == diagnostic["stage"]
+    assert payload["semantic_parser"]["diagnostic"]["status_code"] == diagnostic["status_code"]
+    assert payload["semantic_parser"]["diagnostic"]["safe_message"] == diagnostic["safe_message"]
+    assert payload["semantic_parser"]["diagnostic"]["thinking_mode"] == "disabled"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        run_row = conn.execute(
+            """
+            SELECT sr.failure_type
+            FROM semantic_runs sr
+            JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+            WHERE sri.evidence_id = ?
+            ORDER BY sr.created_at DESC, sr.semantic_run_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert run_row["failure_type"] == expected_failure_type
+    finally:
+        conn.close()
+
+
+def test_deepseek_preflight_does_not_write_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_DIAGNOSTICS", "1")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=_semantic_result()):
+        with client:
+            create_response = client.post(
+                "/api/evidence",
+                json={"text": "只是留档。", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+            evidence_id = create_response.json()["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        before_runs = conn.execute("SELECT COUNT(*) AS count FROM semantic_runs").fetchone()["count"]
+        before_inputs = conn.execute("SELECT COUNT(*) AS count FROM semantic_run_inputs").fetchone()["count"]
+        before_extractions = conn.execute("SELECT COUNT(*) AS count FROM evidence_extractions").fetchone()["count"]
+    finally:
+        conn.close()
+
+    preflight = {
+        "success": True,
+        "stage": "success",
+        "status_code": 200,
+        "error_code": None,
+        "error_type": None,
+        "safe_message": None,
+        "request_id": "req-preflight",
+        "latency_ms": 7,
+        "timeout_seconds": 60.0,
+        "thinking_mode": "disabled",
+        "model": "deepseek-v4-flash",
+    }
+    with patch("app.main.diagnose_deepseek_text_preflight", return_value=preflight):
+        with client:
+            response = client.post(f"/api/evidence/{evidence_id}/diagnostics/deepseek-preflight")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "succeeded"
+    assert payload["deepseek_text_preflight"] == preflight
+
+    conn = init_db(db_path)
+    try:
+        after_runs = conn.execute("SELECT COUNT(*) AS count FROM semantic_runs").fetchone()["count"]
+        after_inputs = conn.execute("SELECT COUNT(*) AS count FROM semantic_run_inputs").fetchone()["count"]
+        after_extractions = conn.execute("SELECT COUNT(*) AS count FROM evidence_extractions").fetchone()["count"]
+        assert after_runs == before_runs
+        assert after_inputs == before_inputs
+        assert after_extractions == before_extractions
+    finally:
+        conn.close()
 
 
 def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_path, monkeypatch):
@@ -3327,7 +3490,7 @@ def test_unstable_pronouns_do_not_create_permanent_actor(tmp_path, monkeypatch):
 
 def test_parse_timeout_exception_marks_failed_without_breaking_post(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-    client, _, _ = _make_client(tmp_path, monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with patch("app.main.semantic_llm.extract_semantics", side_effect=httpx.TimeoutException("boom")):
         with client:
@@ -3341,6 +3504,24 @@ def test_parse_timeout_exception_marks_failed_without_breaking_post(tmp_path, mo
     assert create_response.status_code == 200
     assert status_response.status_code == 200
     assert status_response.json()["parse_status"] == "failed"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        run_row = conn.execute(
+            """
+            SELECT sr.failure_type
+            FROM semantic_runs sr
+            JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+            WHERE sri.evidence_id = ?
+            ORDER BY sr.created_at DESC, sr.semantic_run_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        assert run_row["failure_type"] == "provider_timeout"
+    finally:
+        conn.close()
 
 
 def test_parse_limit_marks_21st_record_failed(tmp_path, monkeypatch):
