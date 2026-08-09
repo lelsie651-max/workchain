@@ -303,10 +303,12 @@ def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_p
     assert response.status_code == 200
     html = response.text
     assert ">WC<" not in html
+    assert html.count(">首页</a>") == 2
     assert html.count('href="/records"') == 2
-    assert "把散落的沟通，整理成可以回看的事实。" in html
-    assert "原始材料独立保存，AI 整理结果可以纠正。" in html
-    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" in html
+    assert html.index(">首页</a>") < html.index(">我的事项</a>")
+    assert html.count("把散落的沟通，整理成可以回看的事实。") == 1
+    assert "原始材料独立保存，AI 整理结果可以纠正。" not in html
+    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" not in html
     assert "我的事项" in html
     assert "记录" in html
     assert "我的词典" in html
@@ -316,7 +318,10 @@ def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_p
     assert 'id="mobile-nav-panel"' in html
     assert "补充信息（可选）" in html
     assert "开始整理" in html
-    assert "放进记录" in html
+    assert "STEP 1" in html
+    assert "STEP 2" in html
+    assert "STEP 3" in html
+    assert "STEP 4" not in html
     assert "看看示例" not in html
     assert "不知道放什么？试试看：" not in html
     assert 'data-fill-example=' not in html
@@ -416,6 +421,144 @@ def test_index_shows_real_event_in_my_events_without_secondary_home_sections(tmp
         assert event_row["title"] == "补签供应商合同"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    ("routing_mode", "expected_title"),
+    [
+        ("confirm", "补签供应商合同"),
+        ("needs_context", "补签供应商合同"),
+    ],
+)
+def test_home_pending_event_card_shows_for_pending_assignments(tmp_path, monkeypatch, routing_mode, expected_title):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请今天补签供应商合同。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": expected_title,
+                "confidence": 0.95,
+                "reason": "先请用户确认",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with patch("app.main.event_matcher.decide_assignment_mode", return_value=routing_mode):
+                with client:
+                    create_response = client.post(
+                        "/api/evidence",
+                        json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    )
+                    evidence_id = create_response.json()["evidence_id"]
+                    index_response = client.get("/")
+
+    assert create_response.status_code == 200
+    html = index_response.text
+    assert "待确认事项" in html
+    assert 'data-testid="pending-event-card"' in html
+    assert "待确认" in html
+    assert expected_title in html
+    assert "请今天补签供应商合同。" in html
+    assert f'href="/evidence/{evidence_id}"' in html
+    assert "还没有事项。放进第一条记录后，WorkChain 会帮你把相关事实串起来。" not in html
+
+
+def test_home_pending_card_disappears_after_assignment_confirmation_and_active_event_appears(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请今天补签供应商合同。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "补签供应商合同",
+                "confidence": 0.95,
+                "reason": "先请用户确认",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with patch("app.main.event_matcher.decide_assignment_mode", return_value="confirm"):
+                with client:
+                    create_response = client.post(
+                        "/api/evidence",
+                        json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    )
+                    evidence_id = create_response.json()["evidence_id"]
+                    home_before = client.get("/")
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        match_run_id = conn.execute(
+            """
+            SELECT event_match_run_id
+            FROM event_match_runs
+            ORDER BY created_at DESC, event_match_run_id DESC
+            LIMIT 1
+            """
+        ).fetchone()["event_match_run_id"]
+    finally:
+        conn.close()
+
+    with client:
+        confirm_response = client.post(
+            f"/api/evidence/{evidence_id}/event-assignment",
+            json={
+                "event_match_run_id": match_run_id,
+                "groups": [
+                    {"group_index": 0, "choice": "new", "new_title": "补签供应商合同"},
+                ],
+            },
+        )
+        home_after = client.get("/")
+
+    assert create_response.status_code == 200
+    assert confirm_response.status_code == 200
+    assert "待确认事项" in home_before.text
+    assert "补签供应商合同" in home_before.text
+    assert "还没有事项。放进第一条记录后，WorkChain 会帮你把相关事实串起来。" not in home_before.text
+    assert 'data-testid="pending-event-card"' not in home_after.text
+    assert 'data-testid="event-card"' in home_after.text
+    assert "进行中的事项" in home_after.text
+    assert "补签供应商合同" in home_after.text
 
 
 def test_event_detail_shows_facts_and_evidence_link(tmp_path, monkeypatch):
@@ -977,6 +1120,10 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert 'id="file-picker-region"' in response.text
     assert 'id="text-mode-hint"' in response.text
     assert "清空文字后可改用文件" in response.text
+    assert "STEP 1" in response.text
+    assert "STEP 2" in response.text
+    assert "STEP 3" in response.text
+    assert "STEP 4" not in response.text
     assert 'data-fill-example=' not in response.text
     assert "EXAMPLE_TEXTS" not in response.text
     assert "counterpart" not in response.text

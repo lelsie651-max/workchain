@@ -595,13 +595,14 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 ### 阶段四:界面与导出
 **已完成首版**
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
-- 首页主体验已切到单列聚焦布局:Header 后直接进入主输入区,输入区下方只保留轻量产品说明与一行简化流程,再往下才是 `我的事项`
+- 首页主体验已切到单列聚焦布局:Header 后直接进入主输入区,输入区下方保留独立的 `STEP 1 / STEP 2 / STEP 3` 轻量流程区,再往下才是 `我的事项`
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
 - 首页补充信息现仅保留 `source / source_detail / record_date`,继续收纳进"补充信息(可选)"折叠区;前端已移除 `counterpart`,但服务端兼容字段仍保留
 - 首页示例 chips 已移除,避免次要引导继续抢占首屏与主输入动作
+- 首页主输入区下方不再保留额外产品说明或营销文案,只保留三步流程说明;Header 品牌副标题继续作为轻量品牌信息
 - `我的词典` 已退出首页侧栏,改为 Header 入口打开的右侧抽屉;继续复用现有 `GET/POST /api/settings` 保存 glossary,关闭后保持当前首页状态
 - 旧 demo threads 兼容路由仍保留,但普通用户首页不再公开展示;仅在 diagnostics/debug 场景下保留只读入口,避免与真实 Event 体系混淆
-- Header 当前正式导航为 `我的事项 / 记录 / 使用说明`,并保留 `搜索 / 我的词典` 工具入口;品牌区恢复为紧凑的 `WorkChain` 文字标题,不再显示 `WC` 方形 logo
+- Header 当前正式导航为 `首页 / 我的事项 / 记录 / 使用说明`,并保留 `搜索 / 我的词典` 工具入口;品牌区恢复为紧凑的 `WorkChain` 文字标题,不再显示 `WC` 方形 logo
 - 新增 `/records` 页面作为正式入口:复用现有 Evidence 历史查询能力,按保存时间倒序列出当前 sandbox 的记录,展示来源、媒体类型、解析状态、最新 1~2 条 Fact 摘要、所属事项与详情入口,顶部提供 `导出完整记录(PDF)` 链接
 - 首页不再直接展示 `历史事项 / 最近证据 / 参考信息 / 导出入口 / diagnostics`;相关路由和兼容能力保留,其中 `记录` 与导出入口已迁移到独立 `/records` 页面
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
@@ -613,7 +614,8 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 首页提交成功后,前端不再 `window.location.reload()` 回首页,而是根据 `/api/evidence` 返回的 `evidence_id` 立即跳转 `/evidence/{id}`;这样即使尚未形成 Event,用户也能立即看到"刚刚这条记录在哪里、当前处理到哪一步"
 - Evidence 详情页对 `ocr_running / llm_running` 增加最小状态轮询:复用 `GET /api/evidence/{id}/status` 周期性刷新进度,在 `done / failed / unsupported` 稳定状态后停止轮询并重新渲染页面;不新增业务状态,不额外调用 AI
 - `/api/evidence/{id}/record-date` 只做确定性补算:保存 `meta` 中的 anchor/source=`user`,对 latest succeeded semantic run 内 `due_raw` 为相对日期的 Facts 重新计算 `due_at / due_anchor_at`,并以原子事务更新 `origin=user / review_status=corrected`;不重跑 DeepSeek,不改 Evidence 原件,不改 Semantic Run 历史
-- 首页 `我的事项` 现只展示 `status=active` 的事项,并安全截取最近 6 个;卡片只保留标题、截止日期(若有)、fact count 与最近 1 条 Fact 摘要,避免继续堆叠大块事实卡片
+- 首页 `我的事项` 现分为两类:已建立的 `进行中的事项` 与尚未确认归属的 `待确认事项`;前者仍只展示 `status=active` 的事项并安全截取最近 6 个,后者展示 latest succeeded Semantic Run 对应、且 `routing_mode in (confirm, needs_context) + review_status=pending` 的 Evidence 待确认卡,每条 Evidence 只出现一次
+- `待确认事项` 卡只展示 `待确认` 标签、AI 建议标题(多组时显示 `可能涉及 N 个事项`)、最近 1 条 Fact 摘要和 `去确认` 入口,不会为了首页展示而提前创建假 Event
 - 用户可见文案不得直接暴露 `anchor_date / due_date / fact_index / event_assignment` 等内部字段名;相对日期缺少可靠锚点时,统一改写为用户能理解的提示,并明确只有补充"记录发生日期"后才能换算
 - 当 Evidence 已有可靠 anchor 后,当前视图要过滤掉"缺少记录发生日期 / 无法换算今天或周五"这类 stale date uncertainty;历史 Interpretation 保留,但可补充一条轻量提示: `已按 YYYY-MM-DD 换算相对日期。`
 - Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、AI 结果可继续纠正、原件独立保存与完整性校验;用户可见文案统一改成人话,不直接暴露 `AUTO / CONFIRM / NEEDS_CONTEXT` 等实现术语
@@ -638,6 +640,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 
 | 日期 | 变更 | 原因 |
 |---|---|---|
+| 2026-08-09 | Competition UI Round 1 验收返修(问题 2～5):首页移除产品说明文案,恢复独立三步流程,导航补 `首页`,并把 pending confirm / needs_context 归属显示为 `待确认事项` | 修复 active Event 尚未形成时首页像“空的”这一体验断层,同时把首页信息架构收回到更明确的输入与确认主路径 |
 | 2026-08-09 | Competition UI Round 1.1:移除 `WC` logo、首页输入区前置并缩小、删示例与 counterpart、补 `/records` 正式入口、提交后直达 Evidence 详情并轮询处理状态 | 根据桌面与手机验收反馈修正主次关系,避免"刚提交的记录消失在空首页"这一致命路径问题,同时把记录历史从首页迁到独立入口 |
 | 2026-08-09 | Competition Event Control Center V1:Event 页支持改名 / Fact 纠正 / 记录日期补改 / 结档与重开,首页新增历史事项并将 `我刚存的` 改为 `最近证据` | 让 `我的事项` 成为用户纠正 AI 结果、补日期、结档和回看历史的主入口,同时保持旧记录兼容与哈希链不受影响 |
 | 2026-08-09 | Competition Release Hardening:普通页清理 provider/model/parser/run id 等 dev 痕迹,diagnostics 关闭即整组 404,Help 与 demo surface 做正式版收口 | 发布版默认只保留用户能理解的界面与安全错误面,同时继续保留同一套代码下的 diagnostics 能力 |

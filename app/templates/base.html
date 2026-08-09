@@ -49,6 +49,7 @@
 
                 <div class="mt-3 hidden items-center gap-4 lg:flex">
                     <nav class="flex flex-1 items-center gap-2 text-sm text-slate-300">
+                        <a href="/" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">首页</a>
                         <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">我的事项</a>
                         <a href="/records" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">记录</a>
                         <a href="/help" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">使用说明</a>
@@ -77,6 +78,7 @@
                 <div id="mobile-nav-panel" class="mt-3 hidden border-t border-slate-800/80 pt-3 lg:hidden">
                     <div class="grid gap-3">
                         <nav class="grid gap-2 text-sm text-slate-200">
+                            <a href="/" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">首页</a>
                             <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">我的事项</a>
                             <a href="/records" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">记录</a>
                             <a href="/help" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">使用说明</a>

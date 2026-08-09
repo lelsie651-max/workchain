@@ -125,18 +125,23 @@
         </form>
     </section>
 
-    <section class="space-y-3 px-1">
-        <h1 class="text-xl font-semibold text-white sm:text-2xl">把散落的沟通，整理成可以回看的事实。</h1>
-        <p class="text-sm leading-7 text-slate-300">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。</p>
-        <p class="text-sm leading-7 text-slate-400">原始材料独立保存，AI 整理结果可以纠正。</p>
-        <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs leading-6 text-slate-500">
-            <span>放进记录</span>
-            <span>·</span>
-            <span>AI 整理</span>
-            <span>·</span>
-            <span>串成事项</span>
-            <span>·</span>
-            <span>随时回看</span>
+    <section class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 p-5 sm:p-6">
+        <div class="grid gap-4 md:grid-cols-3">
+            <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200">STEP 1</p>
+                <h2 class="text-lg font-semibold text-white">放进记录</h2>
+                <p class="text-sm leading-7 text-slate-400">粘贴文字，或上传截图 / 文件</p>
+            </div>
+            <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200">STEP 2</p>
+                <h2 class="text-lg font-semibold text-white">AI 帮你整理</h2>
+                <p class="text-sm leading-7 text-slate-400">还原事实，并解释难懂的表达</p>
+            </div>
+            <div class="space-y-2">
+                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200">STEP 3</p>
+                <h2 class="text-lg font-semibold text-white">形成事项</h2>
+                <p class="text-sm leading-7 text-slate-400">明确时自动归入，有疑问时由你确认，之后可以随时回看</p>
+            </div>
         </div>
     </section>
 
@@ -144,38 +149,78 @@
         <div class="flex items-end justify-between gap-4">
             <div>
                 <h2 class="text-2xl font-semibold text-white">我的事项</h2>
-                <p class="mt-2 text-sm leading-7 text-slate-400">当前体验空间里，正在进行中的事项会先放在这里。</p>
+                <p class="mt-2 text-sm leading-7 text-slate-400">当前体验空间里，已形成的进行中事项和待确认归属的记录会先放在这里。</p>
             </div>
         </div>
 
         {% if my_events %}
-        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            {% for event in my_events %}
-            <a
-                href="/event/{{ event.event_id }}"
-                class="block rounded-[28px] border border-slate-800/80 bg-slate-900/55 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900/80"
-                data-testid="event-card"
-            >
-                <div class="space-y-3">
-                    <h3 class="text-lg font-semibold leading-8 text-white">{{ event.title }}</h3>
-                    <div class="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-slate-400">
-                        <span>{{ event.fact_count }} 条事实</span>
-                        {% if event.due_text %}
-                        <span class="text-amber-200">截止：{{ event.due_text }}</span>
+        <div class="space-y-4">
+            <div>
+                <h3 class="text-lg font-semibold text-white">进行中的事项</h3>
+            </div>
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {% for event in my_events %}
+                <a
+                    href="/event/{{ event.event_id }}"
+                    class="block rounded-[28px] border border-slate-800/80 bg-slate-900/55 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900/80"
+                    data-testid="event-card"
+                >
+                    <div class="space-y-3">
+                        <h3 class="text-lg font-semibold leading-8 text-white">{{ event.title }}</h3>
+                        <div class="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-slate-400">
+                            <span>{{ event.fact_count }} 条事实</span>
+                            {% if event.due_text %}
+                            <span class="text-amber-200">截止：{{ event.due_text }}</span>
+                            {% endif %}
+                        </div>
+                        {% if event.recent_facts %}
+                        <div class="space-y-2">
+                            <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{{ event.recent_facts[0].fact_type_label or event.recent_facts[0].fact_type }}</p>
+                            <p class="wc-line-clamp-3 text-sm leading-7 text-slate-300">{{ event.recent_facts[0].content }}</p>
+                        </div>
                         {% endif %}
+                        <p class="text-xs text-slate-500">最近活动 {{ event.last_activity_text }}</p>
                     </div>
-                    {% if event.recent_facts %}
-                    <div class="space-y-2">
-                        <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{{ event.recent_facts[0].fact_type_label or event.recent_facts[0].fact_type }}</p>
-                        <p class="wc-line-clamp-3 text-sm leading-7 text-slate-300">{{ event.recent_facts[0].content }}</p>
-                    </div>
-                    {% endif %}
-                    <p class="text-xs text-slate-500">最近活动 {{ event.last_activity_text }}</p>
-                </div>
-            </a>
-            {% endfor %}
+                </a>
+                {% endfor %}
+            </div>
         </div>
-        {% else %}
+        {% endif %}
+
+        {% if pending_event_cards %}
+        <div class="space-y-4">
+            <div>
+                <h3 class="text-lg font-semibold text-white">待确认事项</h3>
+            </div>
+            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {% for item in pending_event_cards %}
+                <div
+                    class="rounded-[28px] border border-slate-800/80 bg-slate-900/55 p-5"
+                    data-testid="pending-event-card"
+                >
+                    <div class="space-y-3">
+                        <p class="text-xs font-semibold uppercase tracking-[0.18em] text-amber-200">{{ item.label }}</p>
+                        <h4 class="text-lg font-semibold leading-8 text-white">{{ item.title }}</h4>
+                        {% if item.fact_preview %}
+                        <div class="space-y-2">
+                            <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{{ item.fact_preview.fact_type_label or item.fact_preview.fact_type }}</p>
+                            <p class="wc-line-clamp-3 text-sm leading-7 text-slate-300">{{ item.fact_preview.content }}</p>
+                        </div>
+                        {% endif %}
+                        <a
+                            href="/evidence/{{ item.evidence_id }}"
+                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            去确认
+                        </a>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if not my_events and not pending_event_cards %}
         <div class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 p-6 text-sm leading-7 text-slate-300">
             还没有事项。放进第一条记录后，WorkChain 会帮你把相关事实串起来。
         </div>

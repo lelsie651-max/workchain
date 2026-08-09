@@ -2304,6 +2304,83 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
     }
 
 
+def _prepare_pending_event_card(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    semantic_result: dict[str, Any],
+) -> dict[str, Any] | None:
+    event_match = semantic_result.get("event_match")
+    if not _should_show_event_assignment_panel(event_match):
+        return None
+
+    groups = event_match.get("groups") or []
+    if not groups:
+        return None
+
+    latest_fact_row = conn.execute(
+        """
+        SELECT f.fact_type, f.content
+        FROM facts f
+        JOIN fact_evidence fe ON fe.fact_id = f.fact_id
+        WHERE f.semantic_run_id = ?
+          AND fe.evidence_id = ?
+        ORDER BY COALESCE(f.occurred_at, f.updated_at, f.created_at) DESC, f.fact_id DESC
+        LIMIT 1
+        """,
+        (semantic_result["semantic_run_id"], evidence_id),
+    ).fetchone()
+
+    if len(groups) == 1:
+        title = groups[0].get("ai_title") or "AI 未给出标题"
+    else:
+        title = f"可能涉及 {len(groups)} 个事项"
+
+    fact_preview = None
+    if latest_fact_row is not None:
+        fact_preview = {
+            "fact_type": latest_fact_row["fact_type"],
+            "fact_type_label": _event_fact_type_label(latest_fact_row["fact_type"]),
+            "content": latest_fact_row["content"],
+        }
+
+    return {
+        "evidence_id": evidence_id,
+        "label": "待确认",
+        "title": title,
+        "fact_preview": fact_preview,
+        "routing_mode": event_match.get("routing_mode"),
+    }
+
+
+def _fetch_pending_event_cards(
+    conn: sqlite3.Connection,
+    sandbox: SandboxContext,
+) -> list[dict[str, Any]]:
+    evidence_rows = conn.execute(
+        """
+        SELECT evidence_id
+        FROM evidence
+        WHERE evidence_id NOT LIKE 'ev_demo_%'
+        ORDER BY seq DESC
+        """
+    ).fetchall()
+
+    pending_cards: list[dict[str, Any]] = []
+    for row in evidence_rows:
+        semantic_result = _build_semantic_result(conn, row["evidence_id"])
+        if semantic_result is None:
+            continue
+        card = _prepare_pending_event_card(
+            conn,
+            evidence_id=row["evidence_id"],
+            semantic_result=semantic_result,
+        )
+        if card is not None:
+            pending_cards.append(card)
+    return pending_cards
+
+
 def _fetch_recent_records_data(
     conn: sqlite3.Connection,
     sandbox: SandboxContext,
@@ -2580,6 +2657,7 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
     prepared_events = [_prepare_event_card(conn, row) for row in event_rows]
     return {
         "my_events": [item for item in prepared_events if item["status"] == "active"][:6],
+        "pending_event_cards": _fetch_pending_event_cards(conn, sandbox),
         "history_events": [item for item in prepared_events if item["status"] == "resolved"],
         "demo_threads": [_prepare_thread_card(row) for row in demo_thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
@@ -3657,6 +3735,7 @@ def create_app() -> FastAPI:
             {
                 "page_title": "WorkChain",
                 "my_events": context["my_events"],
+                "pending_event_cards": context["pending_event_cards"],
                 "history_events": context["history_events"],
                 "demo_threads": context["demo_threads"],
                 "diagnostics_enabled": _diagnostics_enabled(),
