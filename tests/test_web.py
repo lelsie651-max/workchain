@@ -302,11 +302,13 @@ def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_p
 
     assert response.status_code == 200
     html = response.text
+    assert ">WC<" not in html
+    assert html.count('href="/records"') == 2
     assert "把散落的沟通，整理成可以回看的事实。" in html
-    assert "聊天截图、文字、文件都可以" in html
     assert "原始材料独立保存，AI 整理结果可以纠正。" in html
-    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事慢慢串起来。" in html
+    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" in html
     assert "我的事项" in html
+    assert "记录" in html
     assert "我的词典" in html
     assert 'id="glossary-drawer"' in html
     assert 'data-open-glossary' in html
@@ -314,14 +316,21 @@ def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_p
     assert 'id="mobile-nav-panel"' in html
     assert "补充信息（可选）" in html
     assert "开始整理" in html
-    assert "① 放进记录" in html
+    assert "放进记录" in html
     assert "看看示例" not in html
+    assert "不知道放什么？试试看：" not in html
+    assert 'data-fill-example=' not in html
     assert 'data-testid="thread-card"' not in html
     assert "历史事项" not in html
     assert "最近证据" not in html
     assert "导出完整举证包" not in html
     assert "参考信息" not in html
     assert 'lg:grid-cols-[300px_minmax(0,1fr)]' not in html
+    assert 'name="counterpart"' not in html
+    assert 'rows="8"' not in html
+    assert 'min-h-[220px]' not in html
+    assert 'rows="4"' in html
+    assert 'min-h-[120px]' in html
 
 
 def test_index_contains_glossary_drawer_shell_and_settings_controls(tmp_path, monkeypatch):
@@ -957,7 +966,7 @@ def test_home_event_card_prefers_semantic_fact_summary(tmp_path, monkeypatch):
     assert "截止：" not in index_response.text
 
 
-def test_home_page_contains_optional_meta_fields_example_chips_and_mutually_exclusive_input(tmp_path, monkeypatch):
+def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -968,13 +977,9 @@ def test_home_page_contains_optional_meta_fields_example_chips_and_mutually_excl
     assert 'id="file-picker-region"' in response.text
     assert 'id="text-mode-hint"' in response.text
     assert "清空文字后可改用文件" in response.text
-    assert 'data-fill-example="temporary-change"' in response.text
-    assert 'data-fill-example="two-things"' in response.text
-    assert 'data-fill-example="office-jargon"' in response.text
-    assert "不知道放什么？试试看：" in response.text
-    assert "EXAMPLE_TEXTS" in response.text
-    assert "clearSelectedFile();" in response.text
-    assert "textarea.value = exampleText;" in response.text
+    assert 'data-fill-example=' not in response.text
+    assert "EXAMPLE_TEXTS" not in response.text
+    assert "counterpart" not in response.text
     assert "syncInputMode();" in response.text
     assert 'min="1900-01-01"' in response.text
     assert 'max="2100-12-31"' in response.text
@@ -983,9 +988,83 @@ def test_home_page_contains_optional_meta_fields_example_chips_and_mutually_excl
     assert 'textModeHint.classList.toggle("hidden", !hasTextInput || hasFile);' in response.text
     assert "fileInput.disabled = disableFileInput" in response.text
     assert 'name="record_date"' in response.text
-    assert "这段记录发生日期（可选）" in response.text
+    assert "记录发生日期" in response.text
     assert "有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。" in response.text
     assert "recordDateInput.reportValidity();" in response.text
+    assert 'formData.append("counterpart"' not in response.text
+    assert 'window.location.reload()' not in response.text
+    assert 'window.location.href = `/evidence/${encodeURIComponent(parsed.value.evidence_id)}`;' in response.text
+
+
+def test_records_page_lists_current_sandbox_evidence_and_links_to_detail(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client_a, _, _ = _make_client(tmp_path, monkeypatch)
+    client_b, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client_a:
+        response_a = client_a.post(
+            "/api/evidence",
+            json={"text": "只在 A 里出现的记录", "source": "飞书", "source_detail": "项目复盘群"},
+        )
+        evidence_id_a = response_a.json()["evidence_id"]
+        records_a = client_a.get("/records")
+
+    with client_b:
+        response_b = client_b.post(
+            "/api/evidence",
+            json={"text": "只在 B 里出现的记录", "source": "Slack", "source_detail": "growth-sync"},
+        )
+        evidence_id_b = response_b.json()["evidence_id"]
+        records_b = client_b.get("/records")
+
+    assert response_a.status_code == 200
+    assert response_b.status_code == 200
+    assert records_a.status_code == 200
+    assert records_b.status_code == 200
+    assert "导出完整记录(PDF)" in records_a.text
+    assert 'href="/export/pdf?scope=mine"' in records_a.text
+    assert "只在 A 里出现的记录" in records_a.text
+    assert "只在 B 里出现的记录" not in records_a.text
+    assert f'href="/evidence/{evidence_id_a}"' in records_a.text
+    assert "来源：飞书 / 项目复盘群" in records_a.text
+    assert "媒体类型：文字" in records_a.text
+    assert "解析状态：" in records_a.text
+    assert "只在 B 里出现的记录" in records_b.text
+    assert "只在 A 里出现的记录" not in records_b.text
+    assert f'href="/evidence/{evidence_id_b}"' in records_b.text
+
+
+def test_image_evidence_detail_shows_processing_state_and_status_polling_script(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with patch(
+        "app.main.get_image_extraction_startup",
+        return_value={
+            "supported": True,
+            "configured": True,
+            "requires_ocr_budget_on_start": False,
+            "detail": None,
+        },
+    ):
+        with patch("app.main._run_image_pipeline", return_value=None):
+            with client:
+                create_response = _upload_png(client)
+                evidence_id = create_response.json()["evidence_id"]
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert create_response.status_code == 200
+    assert create_response.json()["parse_status"] == "ocr_running"
+    assert detail_response.status_code == 200
+    html = detail_response.text
+    assert "正在读取这份记录…" in html
+    assert "刚刚这条记录" not in html
+    assert f'const evidenceId = "{evidence_id}";' in html
+    assert 'const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);' in html
+    assert 'fetch(`/api/evidence/${evidenceId}/status`)' in html
+    assert 'statusPollTimer = window.setInterval(pollStatus, 1800);' in html
+    assert "window.clearInterval(statusPollTimer);" in html
+    assert "window.location.reload();" in html
 
 
 def test_home_event_card_shows_due_text_when_event_has_due_at(tmp_path, monkeypatch):

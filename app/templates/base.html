@@ -27,24 +27,19 @@
 </head>
 <body class="min-h-full bg-slate-950 text-slate-100 antialiased">
     <div class="min-h-screen bg-slate-950">
-        <div class="mx-auto min-h-screen max-w-[1160px] px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
-            <header class="mb-8 rounded-[28px] border border-slate-800/80 bg-slate-900/70 px-4 py-4 shadow-[0_0_0_1px_rgba(15,23,42,0.05)] backdrop-blur-sm sm:px-5">
+        <div class="mx-auto min-h-screen max-w-[1160px] px-4 py-4 sm:px-6 sm:py-5 lg:px-8">
+            <header class="mb-6 rounded-[26px] border border-slate-800/80 bg-slate-900/70 px-4 py-3 shadow-[0_0_0_1px_rgba(15,23,42,0.05)] backdrop-blur-sm sm:px-5">
                 <div class="flex items-center justify-between gap-3">
                     <a href="/" class="min-w-0 flex-1">
-                        <div class="flex items-center gap-3">
-                            <div class="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-cyan-400/12 text-sm font-semibold tracking-wide text-cyan-200 ring-1 ring-cyan-400/20">
-                                WC
-                            </div>
-                            <div class="min-w-0">
-                                <p class="text-base font-semibold tracking-tight text-white">WorkChain</p>
-                                <p class="wc-line-clamp-2 text-sm leading-6 text-slate-400">把散落的沟通，整理成可以回看的事实。</p>
-                            </div>
+                        <div class="min-w-0">
+                            <p class="text-lg font-semibold tracking-tight text-white">WorkChain</p>
+                            <p class="hidden text-sm leading-6 text-slate-400 sm:block">把散落的沟通，整理成可以回看的事实。</p>
                         </div>
                     </a>
                     <button
                         id="mobile-nav-toggle"
                         type="button"
-                        class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
+                        class="inline-flex min-h-10 items-center justify-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
                         aria-expanded="false"
                         aria-controls="mobile-nav-panel"
                     >
@@ -52,13 +47,14 @@
                     </button>
                 </div>
 
-                <div class="mt-4 hidden items-center gap-4 lg:flex">
+                <div class="mt-3 hidden items-center gap-4 lg:flex">
                     <nav class="flex flex-1 items-center gap-2 text-sm text-slate-300">
-                        <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-11 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">我的事项</a>
-                        <a href="/help" class="inline-flex min-h-11 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">使用说明</a>
+                        <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">我的事项</a>
+                        <a href="/records" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">记录</a>
+                        <a href="/help" class="inline-flex min-h-10 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">使用说明</a>
                     </nav>
                     <div class="flex items-center gap-3">
-                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2.5">
+                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2">
                             <span class="text-slate-500">🔎</span>
                             <input
                                 type="text"
@@ -71,20 +67,21 @@
                         <button
                             type="button"
                             data-open-glossary
-                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            class="inline-flex min-h-10 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
                         >
                             我的词典
                         </button>
                     </div>
                 </div>
 
-                <div id="mobile-nav-panel" class="mt-4 hidden border-t border-slate-800/80 pt-4 lg:hidden">
+                <div id="mobile-nav-panel" class="mt-3 hidden border-t border-slate-800/80 pt-3 lg:hidden">
                     <div class="grid gap-3">
                         <nav class="grid gap-2 text-sm text-slate-200">
-                            <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-11 items-center rounded-2xl bg-slate-950/40 px-4 py-2">我的事项</a>
-                            <a href="/help" class="inline-flex min-h-11 items-center rounded-2xl bg-slate-950/40 px-4 py-2">使用说明</a>
+                            <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">我的事项</a>
+                            <a href="/records" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">记录</a>
+                            <a href="/help" class="inline-flex min-h-10 items-center rounded-2xl bg-slate-950/40 px-4 py-2">使用说明</a>
                         </nav>
-                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2.5">
+                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2">
                             <span class="text-slate-500">🔎</span>
                             <input
                                 type="text"
@@ -97,7 +94,7 @@
                         <button
                             type="button"
                             data-open-glossary
-                            class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200"
+                            class="inline-flex min-h-10 items-center justify-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200"
                         >
                             我的词典
                         </button>

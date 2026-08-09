@@ -1,89 +1,75 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="space-y-10 pb-12">
+<div class="space-y-8 pb-12">
     <div
         id="flash-banner"
-        class="hidden rounded-[28px] border px-4 py-3 text-sm transition-opacity duration-500"
+        class="hidden rounded-[24px] border px-4 py-3 text-sm transition-opacity duration-500"
         role="status"
         aria-live="polite"
     ></div>
 
-    <section class="space-y-6 rounded-[32px] border border-slate-800/80 bg-slate-900/55 px-5 py-7 sm:px-8 sm:py-8">
-        <div class="max-w-3xl space-y-4">
-            <p class="text-sm font-medium tracking-wide text-cyan-200">聊天截图、文字、文件都可以</p>
-            <h1 class="text-3xl font-semibold leading-tight text-white sm:text-4xl">把散落的沟通，整理成可以回看的事实。</h1>
-            <p class="max-w-2xl text-base leading-8 text-slate-300">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事慢慢串起来。</p>
-            <p class="text-sm leading-7 text-slate-400">原始材料独立保存，AI 整理结果可以纠正。</p>
-        </div>
-
-        <form id="evidence-form" enctype="multipart/form-data" class="space-y-5 rounded-[28px] border border-slate-800/80 bg-slate-950/55 p-4 sm:p-5">
-            <div
-                id="evidence-dropzone"
-                class="rounded-[24px] border border-dashed border-slate-700/80 bg-slate-900/40 p-4 transition sm:p-5"
-            >
-                <div id="text-input-region">
-                    <label id="evidence-text-label" for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">把记录贴进来</label>
-                    <textarea
-                        id="evidence-text"
-                        name="text"
-                        rows="8"
-                        maxlength="20000"
-                        placeholder="粘贴聊天记录，或上传截图 / 文档"
-                        class="min-h-[220px] w-full rounded-[24px] border border-slate-700/80 bg-slate-950/80 px-5 py-4 text-base leading-8 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                    ></textarea>
-                </div>
-                <input
-                    id="file-input"
-                    name="file"
-                    type="file"
-                    accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    class="hidden"
+    <section class="rounded-[30px] border border-slate-800/80 bg-slate-900/55 p-4 sm:p-5">
+        <form id="evidence-form" enctype="multipart/form-data" class="space-y-4">
+            <div class="space-y-3">
+                <label id="evidence-text-label" for="evidence-text" class="block text-sm font-medium text-slate-200">放进一条记录</label>
+                <div
+                    id="evidence-dropzone"
+                    class="rounded-[24px] border border-slate-700/80 bg-slate-950/65 p-3 transition sm:p-4"
                 >
-                <div id="file-picker-region" class="mt-4 flex flex-wrap items-center gap-3">
-                    <button
-                        id="choose-file-button"
-                        type="button"
-                        class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    <div id="text-input-region">
+                        <textarea
+                            id="evidence-text"
+                            name="text"
+                            rows="4"
+                            maxlength="20000"
+                            placeholder="粘贴聊天记录，或上传截图 / 文档"
+                            class="min-h-[120px] w-full rounded-[20px] border border-slate-700/80 bg-slate-950/90 px-4 py-3 text-base leading-7 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 sm:min-h-[136px]"
+                        ></textarea>
+                    </div>
+                    <input
+                        id="file-input"
+                        name="file"
+                        type="file"
+                        accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        class="hidden"
                     >
-                        选择文件
-                    </button>
-                    <p class="text-sm leading-6 text-slate-500">支持粘贴图片、拖拽文件，一次只放一个，单个不超过 8 MB</p>
-                </div>
-                <p id="text-mode-hint" class="mt-3 hidden text-sm text-cyan-200" aria-live="polite">清空文字后可改用文件</p>
-                <div id="file-preview" class="mt-4 hidden rounded-[24px] border border-slate-800/80 bg-slate-900/70 p-4">
-                    <div class="flex items-start justify-between gap-4">
-                        <div class="min-w-0 flex-1">
-                            <div id="file-preview-visual"></div>
-                            <div class="mt-3 min-w-0">
-                                <p id="file-preview-name" class="truncate text-sm font-medium text-slate-100"></p>
-                                <p id="file-preview-size" class="mt-1 text-xs text-slate-500"></p>
-                            </div>
-                        </div>
+                    <div id="file-picker-region" class="mt-3 flex flex-wrap items-center gap-3">
                         <button
-                            id="remove-file-button"
+                            id="choose-file-button"
                             type="button"
-                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            class="inline-flex min-h-10 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
                         >
-                            移除
+                            选择文件
                         </button>
+                        <p class="text-sm leading-6 text-slate-500">支持粘贴图片、拖拽文件，一次只放一个，单个不超过 8 MB</p>
+                    </div>
+                    <p id="text-mode-hint" class="mt-3 hidden text-sm text-cyan-200" aria-live="polite">清空文字后可改用文件</p>
+                    <div id="file-preview" class="mt-3 hidden rounded-[20px] border border-slate-800/80 bg-slate-900/70 p-4">
+                        <div class="flex items-start justify-between gap-4">
+                            <div class="min-w-0 flex-1">
+                                <div id="file-preview-visual"></div>
+                                <div class="mt-3 min-w-0">
+                                    <p id="file-preview-name" class="truncate text-sm font-medium text-slate-100"></p>
+                                    <p id="file-preview-size" class="mt-1 text-xs text-slate-500"></p>
+                                </div>
+                            </div>
+                            <button
+                                id="remove-file-button"
+                                type="button"
+                                class="inline-flex min-h-10 items-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            >
+                                移除
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <div class="space-y-3">
-                <p class="text-sm text-slate-400">不知道放什么？试试看：</p>
-                <div class="flex flex-wrap gap-2.5">
-                    <button type="button" data-fill-example="temporary-change" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">临时改需求</button>
-                    <button type="button" data-fill-example="two-things" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">一句话两件事</button>
-                    <button type="button" data-fill-example="office-jargon" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">满篇职场黑话</button>
-                </div>
-            </div>
-
-            <details class="rounded-[24px] border border-slate-800/80 bg-slate-900/45 px-4 py-3">
+            <details class="rounded-[22px] border border-slate-800/80 bg-slate-900/45 px-4 py-3">
                 <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">补充信息（可选）</summary>
-                <div class="mt-4 space-y-4">
-                    <div class="grid gap-3 md:grid-cols-4">
+                <div class="mt-4 grid gap-3 md:grid-cols-3">
+                    <div class="space-y-3">
                         <select
                             id="source-select"
                             name="source"
@@ -102,34 +88,25 @@
                             placeholder="自定义来源"
                             class="hidden min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
                         >
-                        <input
-                            id="source-detail"
-                            name="source_detail"
-                            type="text"
-                            placeholder="具体位置（可选）"
-                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                        >
-                        <input
-                            id="counterpart-input"
-                            name="counterpart"
-                            type="text"
-                            placeholder="这段对话里的另一方（可选）"
-                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
-                        >
                     </div>
-                    <div class="grid gap-3 md:grid-cols-[minmax(0,320px)_1fr]">
-                        <div>
-                            <label for="record-date" class="mb-2 block text-sm text-slate-300">这段记录发生日期（可选）</label>
-                            <input
-                                id="record-date"
-                                name="record_date"
-                                type="date"
-                                min="1900-01-01"
-                                max="2100-12-31"
-                                class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                            >
-                        </div>
-                        <p class="self-end pb-1 text-sm leading-6 text-slate-500">有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。</p>
+                    <input
+                        id="source-detail"
+                        name="source_detail"
+                        type="text"
+                        placeholder="具体位置（可选）"
+                        class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    >
+                    <div>
+                        <label for="record-date" class="mb-2 block text-sm text-slate-300">记录发生日期</label>
+                        <input
+                            id="record-date"
+                            name="record_date"
+                            type="date"
+                            min="1900-01-01"
+                            max="2100-12-31"
+                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                        >
+                        <p class="mt-2 text-xs leading-6 text-slate-500">有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。</p>
                     </div>
                 </div>
             </details>
@@ -138,7 +115,7 @@
                 <button
                     id="submit-button"
                     type="submit"
-                    class="inline-flex min-h-12 items-center rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                    class="inline-flex min-h-11 items-center rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
                 >
                     开始整理
                 </button>
@@ -148,24 +125,18 @@
         </form>
     </section>
 
-    <section class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 px-5 py-5 sm:px-6">
-        <div class="grid gap-4 text-sm md:grid-cols-4">
-            <div class="space-y-2">
-                <p class="font-medium text-white">① 放进记录</p>
-                <p class="leading-7 text-slate-400">截图 / 文字 / 文件</p>
-            </div>
-            <div class="space-y-2">
-                <p class="font-medium text-white">② AI 整理</p>
-                <p class="leading-7 text-slate-400">还原事实，解释难懂说法</p>
-            </div>
-            <div class="space-y-2">
-                <p class="font-medium text-white">③ 串成事项</p>
-                <p class="leading-7 text-slate-400">明确时自动归入，有疑问请你确认</p>
-            </div>
-            <div class="space-y-2">
-                <p class="font-medium text-white">④ 随时回看</p>
-                <p class="leading-7 text-slate-400">整理结果可以回到原始材料核对</p>
-            </div>
+    <section class="space-y-3 px-1">
+        <h1 class="text-xl font-semibold text-white sm:text-2xl">把散落的沟通，整理成可以回看的事实。</h1>
+        <p class="text-sm leading-7 text-slate-300">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。</p>
+        <p class="text-sm leading-7 text-slate-400">原始材料独立保存，AI 整理结果可以纠正。</p>
+        <div class="flex flex-wrap gap-x-3 gap-y-1 text-xs leading-6 text-slate-500">
+            <span>放进记录</span>
+            <span>·</span>
+            <span>AI 整理</span>
+            <span>·</span>
+            <span>串成事项</span>
+            <span>·</span>
+            <span>随时回看</span>
         </div>
     </section>
 
@@ -214,20 +185,12 @@
 
 <script>
     (() => {
-        const EXAMPLE_TEXTS = {
-            "temporary-change": "小李（2026.8.9）：张总说官网首页的 Banner 周五前换成新版。",
-            "two-things": "张总说官网首页的 Banner 周五前换成新版。另外财务那份供应商合同今天发给王会计。",
-            "office-jargon": "这版先别急着收口，领导希望把颗粒度再拉齐一点，别让大家心智负担太高，先看看有没有更接近 PMF 的表达。",
-        };
-
         const form = document.getElementById("evidence-form");
         const textarea = document.getElementById("evidence-text");
         const textInputRegion = document.getElementById("text-input-region");
-        const textareaLabel = document.getElementById("evidence-text-label");
         const sourceSelect = document.getElementById("source-select");
         const sourceCustom = document.getElementById("source-custom");
         const sourceDetail = document.getElementById("source-detail");
-        const counterpartInput = document.getElementById("counterpart-input");
         const recordDateInput = document.getElementById("record-date");
         const message = document.getElementById("form-message");
         const flashBanner = document.getElementById("flash-banner");
@@ -242,7 +205,6 @@
         const filePreviewName = document.getElementById("file-preview-name");
         const filePreviewSize = document.getElementById("file-preview-size");
         const removeFileButton = document.getElementById("remove-file-button");
-        const exampleButtons = [...document.querySelectorAll("[data-fill-example]")];
         let selectedFile = null;
         let previewUrl = null;
 
@@ -314,9 +276,6 @@
             textModeHint.classList.toggle("hidden", !hasTextInput || hasFile);
             textarea.disabled = hideTextInput;
             textarea.classList.remove("opacity-60", "cursor-not-allowed");
-            textarea.placeholder = "粘贴聊天记录，或上传截图 / 文档";
-            textareaLabel.textContent = "把记录贴进来";
-
             fileInput.disabled = disableFileInput;
             setControlDisabledState(chooseFileButton, disableFileInput);
         };
@@ -340,7 +299,7 @@
 
             if ((selectedFile.type || "").startsWith("image/")) {
                 previewUrl = URL.createObjectURL(selectedFile);
-                filePreviewVisual.innerHTML = `<img src="${previewUrl}" alt="${escapeHtml(fallbackFileName(selectedFile))}" class="max-h-40 rounded-2xl border border-slate-800/80 object-contain">`;
+                filePreviewVisual.innerHTML = `<img src="${previewUrl}" alt="${escapeHtml(fallbackFileName(selectedFile))}" class="max-h-36 rounded-2xl border border-slate-800/80 object-contain">`;
                 return;
             }
 
@@ -374,23 +333,14 @@
         };
 
         const showBanner = (text, tone) => {
-            if (!flashBanner) {
-                return;
-            }
             flashBanner.textContent = text;
-            flashBanner.className = "rounded-[28px] border px-4 py-3 text-sm transition-opacity duration-500";
+            flashBanner.className = "rounded-[24px] border px-4 py-3 text-sm transition-opacity duration-500";
             if (tone === "success") {
                 flashBanner.classList.add("border-emerald-400/30", "bg-emerald-400/10", "text-emerald-100");
             } else {
                 flashBanner.classList.add("border-red-400/30", "bg-red-400/10", "text-red-100");
             }
             flashBanner.classList.remove("hidden", "opacity-0");
-            if (tone === "success") {
-                window.setTimeout(() => {
-                    flashBanner.classList.add("opacity-0");
-                    window.setTimeout(() => flashBanner.classList.add("hidden"), 500);
-                }, 3000);
-            }
         };
 
         const setSubmitting = (submitting) => {
@@ -421,11 +371,9 @@
             setSubmitting(true);
             const selectedSource = sourceSelect.value === "__custom__" ? sourceCustom.value.trim() : sourceSelect.value;
             const formData = new FormData();
-            const hasFile = Boolean(selectedFile);
             formData.append("text", textarea.value);
             formData.append("source", selectedSource);
             formData.append("source_detail", sourceDetail.value.trim());
-            formData.append("counterpart", counterpartInput.value.trim());
             formData.append("record_date", recordDateInput.value);
             if (selectedFile) {
                 formData.append("file", selectedFile, fallbackFileName(selectedFile));
@@ -457,22 +405,14 @@
                     message.textContent = errorText;
                     return;
                 }
-                if (parsed.kind !== "json") {
+                if (parsed.kind !== "json" || !parsed.value?.evidence_id) {
                     const errorText = `服务器返回了意外的响应 (状态码 ${response.status})`;
                     showBanner(errorText, "error");
                     message.textContent = errorText;
                     return;
                 }
 
-                textarea.value = "";
-                counterpartInput.value = "";
-                recordDateInput.value = "";
-                clearSelectedFile();
-                sessionStorage.setItem(
-                    "workchainFlash",
-                    JSON.stringify({ tone: "success", text: hasFile ? "原件已保存，正在整理…" : "已开始整理…" }),
-                );
-                window.location.reload();
+                window.location.href = `/evidence/${encodeURIComponent(parsed.value.evidence_id)}`;
             } finally {
                 setSubmitting(false);
             }
@@ -540,21 +480,6 @@
 
         textarea.addEventListener("input", syncInputMode);
 
-        exampleButtons.forEach((button) => {
-            button.addEventListener("click", () => {
-                const key = button.dataset.fillExample;
-                const exampleText = EXAMPLE_TEXTS[key];
-                if (!exampleText) {
-                    return;
-                }
-                clearSelectedFile();
-                textarea.value = exampleText;
-                syncInputMode();
-                textarea.focus();
-                textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-            });
-        });
-
         form.addEventListener("submit", (event) => {
             event.preventDefault();
             submitForm();
@@ -566,17 +491,6 @@
                 form.requestSubmit();
             }
         });
-
-        const storedFlash = sessionStorage.getItem("workchainFlash");
-        if (storedFlash) {
-            sessionStorage.removeItem("workchainFlash");
-            try {
-                const flash = JSON.parse(storedFlash);
-                showBanner(flash.text, flash.tone);
-            } catch (error) {
-                // Ignore malformed flash payloads.
-            }
-        }
 
         window.addEventListener("beforeunload", revokePreviewUrl);
     })();

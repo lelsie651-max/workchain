@@ -2218,9 +2218,22 @@ def _prepare_recent_row(
     extracted_text = _extract_file_text(raw_text)
     display_text = extracted_text if extracted_text is not None else raw_text
     semantic_result = _build_semantic_result(conn, row["evidence_id"])
+    related_event_rows = conn.execute(
+        """
+        SELECT DISTINCT ev.event_id, ev.title
+        FROM fact_evidence fe
+        JOIN facts f ON f.fact_id = fe.fact_id
+        JOIN events ev ON ev.event_id = f.event_id
+        WHERE fe.evidence_id = ?
+        ORDER BY ev.updated_at DESC, ev.event_id DESC
+        LIMIT 3
+        """,
+        (row["evidence_id"],),
+    ).fetchall()
     return {
         "evidence_id": row["evidence_id"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
+        "captured_at_text": _format_datetime(row.get("captured_at"), "%m-%d %H:%M"),
         "platform": platform,
         "platform_class": source_badge_class(platform),
         "scene": scene,
@@ -2241,11 +2254,16 @@ def _prepare_recent_row(
         "assignment_subject": {"evidence_id": row["evidence_id"]},
         "is_verified": bool(row["is_verified"]),
         "media_type": row["media_type"],
+        "media_type_label": {"text": "文字", "image": "图片", "file": "文件"}.get(row["media_type"], row["media_type"]),
         "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
         "filename": filename,
         "is_image": row["media_type"] == "image",
         "is_file": row["media_type"] == "file",
         "has_extracted_text": extracted_text is not None,
+        "related_events": [
+            {"event_id": item["event_id"], "title": item["title"]}
+            for item in related_event_rows
+        ],
     }
 
 
@@ -2284,6 +2302,39 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
             for item in summary_rows
         ],
     }
+
+
+def _fetch_recent_records_data(
+    conn: sqlite3.Connection,
+    sandbox: SandboxContext,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    recent_rows = conn.execute(
+        """
+        SELECT evidence_id, occurred_at, captured_at, source_hint, raw_text, media_type,
+               plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats
+        FROM evidence
+        WHERE evidence_id NOT LIKE 'ev_demo_%'
+        ORDER BY seq DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    evidence_ids = [row["evidence_id"] for row in recent_rows]
+    parse_status_map = _get_parse_status_map(conn, evidence_ids)
+    parse_detail_map = _get_parse_detail_map(conn, evidence_ids)
+    extract_note_map = _get_extract_note_map(conn, evidence_ids)
+    verified_map = _get_verified_map(conn, evidence_ids)
+    decorated_recent_rows = []
+    for row in recent_rows:
+        row_dict = dict(row)
+        row_dict["parse_status"] = parse_status_map.get(row["evidence_id"], "failed")
+        row_dict["parse_detail"] = parse_detail_map.get(row["evidence_id"])
+        row_dict["extract_note"] = extract_note_map.get(row["evidence_id"])
+        row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
+        decorated_recent_rows.append(row_dict)
+    return [_prepare_recent_row(conn, row, sandbox) for row in decorated_recent_rows]
 
 
 def _settings_payload(db_path: Path) -> dict[str, Any]:
@@ -2526,35 +2577,13 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
         ORDER BY seq ASC
         """
     ).fetchall()
-    recent_rows = conn.execute(
-        """
-        SELECT evidence_id, occurred_at, source_hint, raw_text, media_type,
-               plain_summary, slot_deliverable, slot_due, slot_due_raw, caveats
-        FROM evidence
-        WHERE evidence_id NOT LIKE 'ev_demo_%'
-        ORDER BY seq DESC
-        LIMIT 20
-        """
-    ).fetchall()
-    parse_status_map = _get_parse_status_map(conn, [row["evidence_id"] for row in recent_rows])
-    parse_detail_map = _get_parse_detail_map(conn, [row["evidence_id"] for row in recent_rows])
-    extract_note_map = _get_extract_note_map(conn, [row["evidence_id"] for row in recent_rows])
-    verified_map = _get_verified_map(conn, [row["evidence_id"] for row in recent_rows])
-    decorated_recent_rows = []
-    for row in recent_rows:
-        row_dict = dict(row)
-        row_dict["parse_status"] = parse_status_map.get(row["evidence_id"], "failed")
-        row_dict["parse_detail"] = parse_detail_map.get(row["evidence_id"])
-        row_dict["extract_note"] = extract_note_map.get(row["evidence_id"])
-        row_dict["is_verified"] = verified_map.get(row["evidence_id"], False)
-        decorated_recent_rows.append(row_dict)
     prepared_events = [_prepare_event_card(conn, row) for row in event_rows]
     return {
         "my_events": [item for item in prepared_events if item["status"] == "active"][:6],
         "history_events": [item for item in prepared_events if item["status"] == "resolved"],
         "demo_threads": [_prepare_thread_card(row) for row in demo_thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],
-        "recent_records": [_prepare_recent_row(conn, row, sandbox) for row in decorated_recent_rows],
+        "recent_records": _fetch_recent_records_data(conn, sandbox, limit=20),
     }
 
 
@@ -3590,6 +3619,26 @@ def create_app() -> FastAPI:
                 "result_count": len(results),
                 "source_presets": SOURCE_PRESETS,
                 "kind_options": KIND,
+            },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.get("/records", response_class=HTMLResponse)
+    def records_page(
+        request: Request,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        records = _fetch_recent_records_data(conn, sandbox, limit=100)
+        response = TEMPLATES.TemplateResponse(
+            request,
+            "records.html",
+            {
+                "page_title": "记录",
+                "records": records,
+                "record_limit": 100,
+                "current_search_q": "",
             },
         )
         apply_sandbox_cookie(response, sandbox)

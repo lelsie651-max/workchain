@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="space-y-6 pb-12">
+    <article class="rounded-[28px] border border-slate-800/80 bg-slate-900/60 p-5 sm:p-6">
+        <div class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+            <div class="space-y-2">
+                <p class="text-sm text-cyan-200">记录</p>
+                <h1 class="text-2xl font-semibold text-white sm:text-3xl">按保存顺序回看这段时间留存下来的原始记录。</h1>
+                <p class="text-sm leading-7 text-slate-400">这里展示当前体验空间里最近保存的记录，按保存时间倒序排列。历史事项和记录分开看，避免混成同一种东西。</p>
+            </div>
+            <a
+                href="/export/pdf?scope=mine"
+                class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+            >
+                导出完整记录(PDF)
+            </a>
+        </div>
+        <p class="mt-4 text-xs leading-6 text-slate-500">当前最多展示最近 {{ record_limit }} 条，点击单条记录可以进入详情继续查看处理进度、原件和事项归属。</p>
+    </article>
+
+    {% if records %}
+    <div class="space-y-4">
+        {% for record in records %}
+        <article class="rounded-[28px] border border-slate-800/80 bg-slate-900/55 p-5">
+            <div class="flex flex-wrap items-center gap-3 text-xs text-slate-400">
+                <span>保存于 {{ record.captured_at_text or record.occurred_at_text }}</span>
+                <span class="rounded-full border px-2.5 py-1 {{ record.platform_class }}">{{ record.platform }}</span>
+                <span class="rounded-full bg-slate-800 px-2.5 py-1 text-slate-200">{{ record.media_type_label }}</span>
+                <span>状态：{{ record.parse_status_label }}</span>
+                {% if record.scene %}
+                <span>{{ record.scene }}</span>
+                {% endif %}
+            </div>
+
+            <div class="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,1fr)]">
+                <div class="space-y-4">
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">记录摘要</p>
+                        <p class="mt-2 whitespace-pre-wrap text-sm leading-7 text-slate-200">{{ record.raw_text_preview }}</p>
+                    </div>
+
+                    {% if record.semantic_fact_preview %}
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">最新事实</p>
+                        <ul class="mt-2 space-y-2">
+                            {% for fact in record.semantic_fact_preview %}
+                            <li class="rounded-2xl border border-slate-800/80 bg-slate-950/60 px-3 py-3 text-sm leading-7 text-slate-200">
+                                <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
+                                <p class="mt-1">{{ fact.content }}</p>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% elif record.plain_summary %}
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">整理结果</p>
+                        <p class="mt-2 text-sm leading-7 text-slate-200">{{ record.plain_summary }}</p>
+                    </div>
+                    {% endif %}
+                </div>
+
+                <div class="space-y-4 rounded-[24px] border border-slate-800/80 bg-slate-950/55 p-4">
+                    <div class="space-y-2 text-sm text-slate-300">
+                        <p>来源：{{ record.platform }}{% if record.scene %} / {{ record.scene }}{% endif %}</p>
+                        <p>媒体类型：{{ record.media_type_label }}</p>
+                        <p>解析状态：{{ record.parse_status_label }}</p>
+                        {% if record.parse_detail and record.parse_status != "done" %}
+                        <p class="text-slate-400">{{ record.parse_detail }}</p>
+                        {% endif %}
+                    </div>
+
+                    <div>
+                        <p class="text-xs uppercase tracking-wide text-slate-500">所属事项</p>
+                        {% if record.related_events %}
+                        <ul class="mt-2 space-y-2">
+                            {% for event in record.related_events %}
+                            <li>
+                                <a href="/event/{{ event.event_id }}" class="text-sm text-cyan-200 transition hover:text-cyan-100">{{ event.title }}</a>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                        {% else %}
+                        <p class="mt-2 text-sm text-slate-400">暂时还没有归入事项</p>
+                        {% endif %}
+                    </div>
+
+                    <div class="flex flex-wrap gap-3 pt-1">
+                        <a
+                            href="/evidence/{{ record.evidence_id }}"
+                            class="inline-flex min-h-11 items-center rounded-2xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                        >
+                            查看记录详情
+                        </a>
+                        {% if record.blob_url %}
+                        <a
+                            href="{{ record.blob_url }}"
+                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            查看原件
+                        </a>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </article>
+        {% endfor %}
+    </div>
+    {% else %}
+    <article class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 p-6 text-sm leading-7 text-slate-300">
+        还没有记录。放进第一条记录后，这里会按保存顺序把它们列出来，方便后续回看和核对。
+    </article>
+    {% endif %}
+</section>
+{% endblock %}

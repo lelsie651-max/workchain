@@ -50,13 +50,13 @@
     </div>
 
     <div class="mt-6 grid gap-4 md:grid-cols-2">
-        <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+        <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" data-current-parse-status="{{ parse_status }}">
             <h3 class="text-lg font-semibold text-white">解析结果</h3>
-            <p class="mt-3 text-sm text-slate-400">状态：{{ parse_status_label }}</p>
+            <p id="parse-status-label" class="mt-3 text-sm text-slate-400">状态：{{ parse_status_label }}</p>
             {% if parse_status == "ocr_running" %}
-            <p class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在读取图片中的文字…</p>
+            <p id="parse-status-message" class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在读取这份记录…</span></p>
             {% elif parse_status == "llm_running" or parse_status == "pending" %}
-            <p class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在理解这段对话…</p>
+            <p id="parse-status-message" class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在整理发生了什么…</span></p>
             {% elif parse_status == "done" %}
             {% if evidence.semantic_result %}
             <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs leading-6 text-slate-400">
@@ -166,9 +166,9 @@
                 </div>
             {% endif %}
             {% elif parse_status == "unsupported" %}
-            <p class="mt-3 text-sm leading-7 text-slate-300">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</p>
+            <p id="parse-status-message" class="mt-3 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</span></p>
             {% elif parse_status == "failed" %}
-            <p class="mt-3 text-sm text-slate-400">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</p>
+            <p id="parse-status-message" class="mt-3 text-sm text-slate-400"><span id="parse-status-message-text">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</span></p>
             {% if evidence.semantic_result %}
             <div class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
                 {% if evidence.semantic_result.event_match %}
@@ -487,6 +487,10 @@
         const evidenceId = "{{ evidence.evidence_id }}";
         const isDemo = evidenceId.startsWith("ev_demo_");
         const flash = document.getElementById("evidence-flash");
+        const parseStatusContainer = document.querySelector("[data-current-parse-status]");
+        const parseStatusLabel = document.getElementById("parse-status-label");
+        const parseStatusMessageTextNode = document.getElementById("parse-status-message-text");
+        const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);
 
         const showFlash = (text, tone) => {
             if (!flash) {
@@ -581,6 +585,22 @@
                 .replaceAll(">", "&gt;")
                 .replaceAll("\"", "&quot;")
                 .replaceAll("'", "&#39;");
+        };
+
+        const parseStatusMessageText = (status, detail) => {
+            if (status === "ocr_running") {
+                return "正在读取这份记录…";
+            }
+            if (status === "llm_running" || status === "pending") {
+                return "正在整理发生了什么…";
+            }
+            if (status === "failed") {
+                return detail || "解析暂不可用，记录已完整保存。";
+            }
+            if (status === "unsupported") {
+                return detail || "这份记录暂时还不能自动整理，但原件已经完整保存。";
+            }
+            return detail || "";
         };
 
         {% if diagnostics_enabled %}
@@ -919,6 +939,64 @@
             setOcrEditorOpen(false, elements);
         };
 
+        const initStatusPolling = () => {
+            if (!parseStatusContainer) {
+                return;
+            }
+            let currentStatus = parseStatusContainer.dataset.currentParseStatus || "";
+            if (STABLE_PARSE_STATUSES.has(currentStatus)) {
+                return;
+            }
+
+            let statusPollTimer = null;
+            let requestInFlight = false;
+
+            const stopStatusPolling = () => {
+                if (statusPollTimer !== null) {
+                    window.clearInterval(statusPollTimer);
+                    statusPollTimer = null;
+                }
+            };
+
+            const syncStatusText = (payload) => {
+                if (parseStatusLabel && payload.parse_status_label) {
+                    parseStatusLabel.textContent = `状态：${payload.parse_status_label}`;
+                }
+                if (parseStatusMessageTextNode) {
+                    parseStatusMessageTextNode.textContent = parseStatusMessageText(payload.parse_status, payload.detail);
+                }
+            };
+
+            const pollStatus = async () => {
+                if (requestInFlight) {
+                    return;
+                }
+                requestInFlight = true;
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/status`);
+                    if (!response.ok) {
+                        return;
+                    }
+                    const payload = await response.json();
+                    const nextStatus = payload.parse_status || currentStatus;
+                    syncStatusText(payload);
+                    if (nextStatus !== currentStatus || STABLE_PARSE_STATUSES.has(nextStatus)) {
+                        currentStatus = nextStatus;
+                        parseStatusContainer.dataset.currentParseStatus = nextStatus;
+                        stopStatusPolling();
+                        window.location.reload();
+                    }
+                } catch (error) {
+                    // Keep the current page visible and try again on the next interval.
+                } finally {
+                    requestInFlight = false;
+                }
+            };
+
+            pollStatus();
+            statusPollTimer = window.setInterval(pollStatus, 1800);
+        };
+
         {% if diagnostics_enabled %}
         const initDiagnostics = () => {
             const runArkVisionDiagnosticButton = document.getElementById("run-ark-vision-diagnostic");
@@ -984,6 +1062,7 @@
         initEventAssignmentForm();
         initSlotsForm();
         initOcrEditor();
+        initStatusPolling();
         {% if diagnostics_enabled %}
         initDiagnostics();
         {% endif %}
