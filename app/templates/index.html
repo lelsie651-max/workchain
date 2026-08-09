@@ -1,555 +1,228 @@
 {% extends "base.html" %}
 
 {% block content %}
-<div class="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)] lg:items-start">
-    <aside class="space-y-6 lg:sticky lg:top-6">
-        <div
-            id="flash-banner"
-            class="hidden rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500"
-            role="status"
-            aria-live="polite"
-        ></div>
+<div class="space-y-10 pb-12">
+    <div
+        id="flash-banner"
+        class="hidden rounded-[28px] border px-4 py-3 text-sm transition-opacity duration-500"
+        role="status"
+        aria-live="polite"
+    ></div>
 
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <div class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
-                <div class="flex items-center justify-between gap-3">
-                    <div>
-                        <h3 class="text-sm font-medium text-slate-200">可选：我的词典</h3>
-                        <p class="mt-1 text-xs text-slate-500">给常见人名、简称或说法补一点背景，方便 WorkChain 更稳地理解这段记录。</p>
-                    </div>
+    <section class="space-y-6 rounded-[32px] border border-slate-800/80 bg-slate-900/55 px-5 py-7 sm:px-8 sm:py-8">
+        <div class="max-w-3xl space-y-4">
+            <p class="text-sm font-medium tracking-wide text-cyan-200">聊天截图、文字、文件都可以</p>
+            <h1 class="text-3xl font-semibold leading-tight text-white sm:text-4xl">把散落的沟通，整理成可以回看的事实。</h1>
+            <p class="max-w-2xl text-base leading-8 text-slate-300">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事慢慢串起来。</p>
+            <p class="text-sm leading-7 text-slate-400">原始材料独立保存，AI 整理结果可以纠正。</p>
+        </div>
+
+        <form id="evidence-form" enctype="multipart/form-data" class="space-y-5 rounded-[28px] border border-slate-800/80 bg-slate-950/55 p-4 sm:p-5">
+            <div
+                id="evidence-dropzone"
+                class="rounded-[24px] border border-dashed border-slate-700/80 bg-slate-900/40 p-4 transition sm:p-5"
+            >
+                <div id="text-input-region">
+                    <label id="evidence-text-label" for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">把记录贴进来</label>
+                    <textarea
+                        id="evidence-text"
+                        name="text"
+                        rows="8"
+                        maxlength="20000"
+                        placeholder="粘贴聊天记录，或上传截图 / 文档"
+                        class="min-h-[220px] w-full rounded-[24px] border border-slate-700/80 bg-slate-950/80 px-5 py-4 text-base leading-8 text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    ></textarea>
+                </div>
+                <input
+                    id="file-input"
+                    name="file"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    class="hidden"
+                >
+                <div id="file-picker-region" class="mt-4 flex flex-wrap items-center gap-3">
                     <button
-                        id="toggle-glossary"
+                        id="choose-file-button"
                         type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
+                        class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
                     >
-                        <span id="toggle-glossary-text">展开词典</span>
-                        <span class="ml-2 text-slate-500" id="glossary-count-mobile">{{ settings.glossary|length }}</span>
+                        选择文件
                     </button>
+                    <p class="text-sm leading-6 text-slate-500">支持粘贴图片、拖拽文件，一次只放一个，单个不超过 8 MB</p>
                 </div>
-
-                <div id="glossary-section" class="mt-4 hidden space-y-4 lg:block">
-                    <div id="glossary-list" class="space-y-3">
-                        {% for item in settings.glossary %}
-                        <div class="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                            <div class="flex items-start justify-between gap-3">
-                                <div>
-                                    <p class="text-sm text-slate-100">{{ item.term }}</p>
-                                    <p class="mt-1 text-xs text-slate-500">{{ "人物" if item.kind == "person" else "说法" }} · {{ item.meaning }}</p>
-                                </div>
-                                <button type="button" data-remove-glossary="{{ item.term }}" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                <p id="text-mode-hint" class="mt-3 hidden text-sm text-cyan-200" aria-live="polite">清空文字后可改用文件</p>
+                <div id="file-preview" class="mt-4 hidden rounded-[24px] border border-slate-800/80 bg-slate-900/70 p-4">
+                    <div class="flex items-start justify-between gap-4">
+                        <div class="min-w-0 flex-1">
+                            <div id="file-preview-visual"></div>
+                            <div class="mt-3 min-w-0">
+                                <p id="file-preview-name" class="truncate text-sm font-medium text-slate-100"></p>
+                                <p id="file-preview-size" class="mt-1 text-xs text-slate-500"></p>
                             </div>
                         </div>
-                        {% endfor %}
-                    </div>
-
-                    <div class="flex flex-wrap gap-3">
                         <button
-                            id="add-glossary-row"
+                            id="remove-file-button"
                             type="button"
-                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
                         >
-                            新增词条
-                        </button>
-                        <button
-                            id="save-settings"
-                            type="button"
-                            class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
-                        >
-                            保存设置
+                            移除
                         </button>
                     </div>
-
-                    <div id="new-glossary-form" class="hidden rounded-xl border border-slate-800 bg-slate-900/70 p-3">
-                        <div class="grid gap-3">
-                            <input id="new-glossary-term" type="text" placeholder="词" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                            <select id="new-glossary-kind" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                                <option value="person">人物</option>
-                                <option value="phrase">说法</option>
-                            </select>
-                            <input id="new-glossary-meaning" type="text" placeholder="指的是什么" class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                            <div class="flex flex-wrap gap-3">
-                                <button id="confirm-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-4 py-2 text-sm text-cyan-100 transition hover:bg-cyan-400/20">加入词典</button>
-                                <button id="cancel-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">取消</button>
-                            </div>
-                        </div>
-                    </div>
                 </div>
-            </div>
-        </section>
-    </aside>
-
-    <div class="space-y-8">
-        <section>
-            <form id="evidence-form" enctype="multipart/form-data" class="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 sm:p-5">
-                <div class="mb-4 space-y-3">
-                    <p class="text-sm text-cyan-200">把聊天截图、文字或文档放进来</p>
-                    <h1 class="text-3xl font-semibold leading-tight text-white sm:text-4xl">WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。</h1>
-                    <p class="text-sm leading-7 text-slate-400">原始证据会完整保存；AI 只负责整理，最后都能回看原文、截图或文件。</p>
-                </div>
-                <div
-                    id="evidence-dropzone"
-                    class="rounded-2xl border border-dashed border-slate-700 bg-slate-950/50 p-3 transition"
-                >
-                    <div id="text-input-region">
-                        <label id="evidence-text-label" for="evidence-text" class="mb-3 block text-sm font-medium text-slate-200">把记录贴进来</label>
-                        <textarea
-                            id="evidence-text"
-                            name="text"
-                            rows="6"
-                            maxlength="20000"
-                            placeholder="粘贴聊天记录，或上传截图 / 文档"
-                            class="min-h-32 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                        ></textarea>
-                    </div>
-                    <input
-                        id="file-input"
-                        name="file"
-                        type="file"
-                        accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        class="hidden"
-                    >
-                    <div id="file-picker-region" class="mt-3 flex flex-wrap items-center gap-3">
-                        <button
-                            id="choose-file-button"
-                            type="button"
-                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            选择文件
-                        </button>
-                        <p class="text-sm text-slate-500">支持粘贴图片、拖拽文件,一次只放一个,单个不超过 8 MB</p>
-                    </div>
-                    <p id="text-mode-hint" class="mt-3 hidden text-sm text-cyan-200" aria-live="polite">清空文字后可改用文件</p>
-                    <div id="file-preview" class="mt-4 hidden rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
-                        <div class="flex items-start justify-between gap-4">
-                            <div class="min-w-0 flex-1">
-                                <div id="file-preview-visual"></div>
-                                <div class="mt-3 min-w-0">
-                                    <p id="file-preview-name" class="truncate text-sm font-medium text-slate-100"></p>
-                                    <p id="file-preview-size" class="mt-1 text-xs text-slate-500"></p>
-                                </div>
-                            </div>
-                            <button
-                                id="remove-file-button"
-                                type="button"
-                                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                            >
-                                移除
-                            </button>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="mt-4 grid gap-3 md:grid-cols-4">
-                    <select
-                        id="source-select"
-                        name="source"
-                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                    >
-                        {% for source in source_presets %}
-                        <option value="{{ source }}">{{ source }}</option>
-                        {% endfor %}
-                        <option value="__custom__">自定义…</option>
-                    </select>
-                    <input
-                        id="source-custom"
-                        name="source_custom"
-                        type="text"
-                        maxlength="20"
-                        placeholder="自定义来源"
-                        class="hidden min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                    >
-                    <input
-                        id="source-detail"
-                        name="source_detail"
-                        type="text"
-                        placeholder="具体位置(可选)"
-                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                    >
-                    <input
-                        id="counterpart-input"
-                        name="counterpart"
-                        type="text"
-                        placeholder="这段对话里的另一方(可选)"
-                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
-                    >
-                </div>
-                <div class="mt-3 grid gap-3 md:grid-cols-2">
-                    <div>
-                        <label for="record-date" class="mb-2 block text-sm text-slate-300">这段记录发生日期（可选）</label>
-                        <input
-                            id="record-date"
-                            name="record_date"
-                            type="date"
-                            min="1900-01-01"
-                            max="2100-12-31"
-                            class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                        >
-                    </div>
-                    <p class="self-end pb-1 text-sm leading-6 text-slate-500">有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。</p>
-                </div>
-
-                <div class="mt-4 flex flex-wrap items-center gap-3">
-                    <button
-                        id="submit-button"
-                        type="submit"
-                        class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-                    >
-                        保存
-                    </button>
-                    <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
-                </div>
-                <p id="form-message" class="mt-3 text-sm text-slate-400"></p>
-            </form>
-        </section>
-
-        <section>
-            <div class="mb-5">
-                <div>
-                    <h2 class="text-xl font-semibold text-white sm:text-2xl">我的事项</h2>
-                    <p class="mt-1 text-sm text-slate-400">这里展示当前体验空间里，正在进行中的真实事项。</p>
-                </div>
-            </div>
-
-            {% if my_events %}
-            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {% for event in my_events %}
-                <a
-                    href="/event/{{ event.event_id }}"
-                    class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
-                    data-testid="event-card"
-                >
-                    <h3 class="text-lg font-semibold text-white">{{ event.title }}</h3>
-                    <p class="mt-3 text-sm text-slate-400">{{ event.fact_count }} 条事实 · 最近活动 {{ event.last_activity_text }}</p>
-                    {% if event.due_text %}
-                    <p class="mt-2 text-sm text-amber-200">截止：{{ event.due_text }}</p>
-                    {% endif %}
-                    <div class="mt-4 space-y-3 text-sm text-slate-300">
-                        {% for fact in event.recent_facts %}
-                        <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3">
-                            <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
-                            <p class="mt-1">{{ fact.content }}</p>
-                        </div>
-                        {% endfor %}
-                    </div>
-                </a>
-                {% endfor %}
-            </div>
-            {% else %}
-            <div class="rounded-2xl border border-slate-800 bg-slate-900/70 p-5 text-sm leading-7 text-slate-300">
-                还没有串起来的事项。先放一条聊天截图、文字或文档进来，WorkChain 会在识别出事实后把同一件事慢慢串起来。
-            </div>
-            {% endif %}
-        </section>
-
-        <section>
-            <div class="mb-5">
-                <div>
-                    <h2 class="text-xl font-semibold text-white sm:text-2xl">历史事项</h2>
-                    <p class="mt-1 text-sm text-slate-400">已经结档的事项会留在这里，方便回看全过程，不会删除任何事实或证据。</p>
-                </div>
-            </div>
-
-            {% if history_events %}
-            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {% for event in history_events %}
-                <a
-                    href="/event/{{ event.event_id }}"
-                    class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/50 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
-                    data-testid="history-event-card"
-                >
-                    <div class="flex flex-wrap items-center gap-3">
-                        <h3 class="text-lg font-semibold text-white">{{ event.title }}</h3>
-                        <span class="rounded-full border border-slate-700 px-2.5 py-1 text-xs text-slate-300">{{ event.status_label }}</span>
-                    </div>
-                    <p class="mt-3 text-sm text-slate-400">{{ event.fact_count }} 条事实 · 最近活动 {{ event.last_activity_text }}</p>
-                    {% if event.due_text %}
-                    <p class="mt-2 text-sm text-slate-400">原截止：{{ event.due_text }}</p>
-                    {% endif %}
-                </a>
-                {% endfor %}
-            </div>
-            {% else %}
-            <div class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5 text-sm leading-7 text-slate-400">
-                还没有已结档的事项。
-            </div>
-            {% endif %}
-        </section>
-
-        {% if diagnostics_enabled and demo_threads %}
-        <section>
-            <div class="mb-5">
-                <div>
-                    <h2 class="text-xl font-semibold text-white sm:text-2xl">看看示例</h2>
-                    <p class="mt-1 text-sm text-slate-400">下面这些是演示用的旧事项线，只用来帮助你快速理解产品，不会和你的真实记录混在一起。</p>
-                </div>
-            </div>
-
-            <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {% for thread in demo_threads %}
-                <a
-                    href="/thread/{{ thread.thread_id }}"
-                    class="block min-h-11 rounded-2xl border border-slate-800 bg-slate-900/70 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900"
-                    data-testid="thread-card"
-                >
-                    <h3 class="text-lg font-semibold text-white">{{ thread.title }}</h3>
-                    <p class="mt-3 text-xl font-semibold leading-8 text-orange-300 sm:text-2xl sm:leading-9">{{ thread.headline }}</p>
-
-                    <div class="mt-4 flex flex-wrap gap-2">
-                        {% for source in thread.source_platforms %}
-                        <span class="rounded-full border px-2.5 py-1 text-xs {{ source.platform_class }}">{{ source.platform }}</span>
-                        {% endfor %}
-                    </div>
-
-                    <div class="mt-4 flex flex-wrap gap-2">
-                        {% for label in thread.risk_labels %}
-                        <span class="rounded-full bg-amber-400/15 px-3 py-1 text-xs text-amber-200">{{ label }}</span>
-                        {% endfor %}
-                    </div>
-
-                    <p class="mt-5 text-sm text-slate-400">{{ thread.evidence_count }} 条记录 · 最后活动 {{ thread.last_activity_text }}</p>
-                </a>
-                {% endfor %}
-            </div>
-        </section>
-        {% endif %}
-
-        {% if recent_records %}
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <div class="mb-4 flex flex-wrap items-start justify-between gap-3">
-                <div>
-                    <h2 class="text-xl font-semibold text-white">最近证据</h2>
-                    <p class="mt-1 text-sm text-slate-400">按保存顺序保留的原始材料，用于回看和核对。</p>
-                </div>
-                <form method="get" action="/export/pdf" data-export-form>
-                    <input type="hidden" name="scope" value="mine">
-                    <button
-                        type="submit"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        data-export-button
-                        data-loading-text="生成中…"
-                    >
-                        导出我的记录(PDF)
-                    </button>
-                </form>
             </div>
 
             <div class="space-y-3">
-                {% for item in recent_records %}
-                <article
-                    class="rounded-xl border border-slate-800 bg-slate-950/70 p-4"
-                    data-evidence-id="{{ item.evidence_id }}"
-                    data-parse-status="{{ item.parse_status }}"
-                    data-media-type="{{ item.media_type }}"
-                >
-                    <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                        <span>{{ item.occurred_at_text }}</span>
-                        <span class="rounded-full border px-2.5 py-1 {{ item.platform_class }}">{{ item.platform }}</span>
-                        {% if item.is_verified %}
-                        <span class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">已确认</span>
-                        {% endif %}
-                        {% if item.scene %}
-                        <span>{{ item.scene }}</span>
-                        {% endif %}
-                    </div>
-                    <div class="text-sm leading-6 text-slate-200">
-                        {% if item.is_image %}
-                        <button
-                            type="button"
-                            data-open-lightbox="{{ item.blob_url }}"
-                            data-lightbox-alt="{{ item.filename or '图片记录' }}"
-                            class="block"
-                        >
-                            <img
-                                src="{{ item.blob_url }}"
-                                alt="{{ item.filename or '图片记录' }}"
-                                class="max-h-40 rounded-xl border border-slate-800 object-contain"
-                            >
-                        </button>
-                        <p class="mt-2 text-xs text-slate-500">{{ item.filename or "未命名图片" }}</p>
-                        {% elif item.is_file %}
-                        <div class="space-y-3">
-                            <a
-                                href="{{ item.blob_url }}"
-                                class="flex min-h-11 items-center gap-3 rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3 transition hover:border-cyan-400/40"
-                            >
-                                <span class="inline-flex h-11 w-11 items-center justify-center rounded-xl border border-slate-700 text-xs text-slate-300">文件</span>
-                                <span class="min-w-0 flex-1 truncate text-sm text-slate-100">{{ item.filename or "未命名文件" }}</span>
-                            </a>
-                            {% if item.display_text %}
-                            <p
-                                data-raw-preview
-                                class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
-                            >{{ item.raw_text_preview }}</p>
-                            <div
-                                data-raw-full
-                                class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
-                            >{{ item.display_text }}</div>
-                            {% endif %}
-                        </div>
-                        {% else %}
-                        <p
-                            data-raw-preview
-                            class="{% if item.is_long_text %}{% else %}hidden{% endif %}"
-                        >{{ item.raw_text_preview }}</p>
-                        <div
-                            data-raw-full
-                            class="{% if item.is_long_text %}hidden{% endif %} max-h-[60vh] overflow-auto whitespace-pre-wrap"
-                        >{{ item.raw_text }}</div>
-                        {% endif %}
-                    </div>
-                    <div class="mt-3 flex flex-wrap items-center gap-3">
-                        {% if item.is_long_text and not item.is_image %}
-                        <button
-                            type="button"
-                            data-toggle-fulltext
-                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            展开全文
-                        </button>
-                        {% endif %}
-                        <a
-                            href="/evidence/{{ item.evidence_id }}"
-                            class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            详情
-                        </a>
-                    </div>
-                    <div class="mt-3 text-sm text-slate-300" data-parse-body>
-                        {% if item.parse_status == "ocr_running" %}
-                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在读取图片中的文字…</p>
-                        {% elif item.parse_status == "llm_running" or item.parse_status == "pending" %}
-                        <p class="inline-flex items-center gap-2 text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>正在理解这段对话…</p>
-                        {% elif item.parse_status == "done" %}
-                        {% if item.semantic_fact_preview %}
-                        <div class="space-y-2">
-                            {% for fact in item.semantic_fact_preview %}
-                            <div class="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-3">
-                                <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
-                                <p class="mt-1 text-slate-100">{{ fact.content }}</p>
-                            </div>
-                            {% endfor %}
-                        </div>
-                        {% if item.event_match and item.event_match.review_status == "pending" and item.event_match.routing_mode in ["confirm", "needs_context"] %}
-                        <div class="mt-3">
-                            {% set panel_event_match = item.event_match %}
-                            {% set panel_assignment_subject = item.assignment_subject %}
-                            {% include "_event_assignment_panel.html" %}
-                        </div>
-                        {% elif item.event_match %}
-                        <p class="mt-3 text-sm text-slate-400">{{ item.event_match.message }}</p>
-                        {% endif %}
-                        {% else %}
-                            {% if item.plain_summary %}
-                            <p class="text-slate-200">{{ item.plain_summary }}</p>
-                            {% endif %}
-                            <div class="mt-2 space-y-1 text-slate-400">
-                                {% if item.deliverable %}
-                                <p>交付物：{{ item.deliverable }}</p>
-                                {% endif %}
-                                {% if item.due_text %}
-                                <p>时限：{{ item.due_text }}</p>
-                                {% endif %}
-                                {% for caveat in item.caveats %}
-                                <p class="text-yellow-200">{{ caveat }}</p>
-                                {% endfor %}
-                            </div>
-                        {% endif %}
-                        {% else %}
-                        {% if item.plain_summary %}
-                        <p class="text-slate-200">{{ item.plain_summary }}</p>
-                        {% endif %}
-                        <p class="mt-2 text-slate-400">
-                            {% if item.extract_note %}
-                            {{ item.extract_note }}
-                            {% else %}
-                            {{ item.parse_detail or "解析暂不可用,记录已完整保存" }}
-                            {% endif %}
-                        </p>
-                        {% endif %}
-                    </div>
-                    {% if item.is_image and item.has_extracted_text %}
-                    <details class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-3" data-ocr-details>
-                        <summary class="cursor-pointer list-none text-sm text-slate-200">看看系统读到了什么</summary>
-                        <div class="mt-3 space-y-3">
-                            <p class="text-xs leading-6 text-slate-500">文字由图片自动识别,可能有误。原始图片已完整保存,识别结果不影响完整性校验。</p>
-                            <div class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-6 text-slate-200">{{ item.display_text }}</div>
-                        </div>
-                    </details>
-                    {% endif %}
-                </article>
-                {% endfor %}
+                <p class="text-sm text-slate-400">不知道放什么？试试看：</p>
+                <div class="flex flex-wrap gap-2.5">
+                    <button type="button" data-fill-example="temporary-change" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">临时改需求</button>
+                    <button type="button" data-fill-example="two-things" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">一句话两件事</button>
+                    <button type="button" data-fill-example="office-jargon" class="inline-flex min-h-11 items-center rounded-full border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">满篇职场黑话</button>
+                </div>
             </div>
-        </section>
-        {% endif %}
 
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <details open>
-                <summary class="cursor-pointer list-none text-lg font-semibold text-white">
-                    参考信息
-                    <span class="ml-2 text-sm font-normal text-slate-400">已识别为参考信息,未计入待办</span>
-                </summary>
-
-                <div class="mt-5 space-y-4">
-                    {% for ref in references %}
-                    <article class="rounded-xl border border-slate-800 bg-slate-950/70 p-4">
-                        <div class="mb-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                            <span>#{{ ref.seq }}</span>
-                            <span>{{ ref.occurred_at_text }}</span>
-                            <span class="rounded-full border px-2.5 py-1 {{ ref.platform_class }}">{{ ref.platform }}</span>
-                            {% if ref.scene %}
-                            <span>{{ ref.scene }}</span>
-                            {% endif %}
+            <details class="rounded-[24px] border border-slate-800/80 bg-slate-900/45 px-4 py-3">
+                <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">补充信息（可选）</summary>
+                <div class="mt-4 space-y-4">
+                    <div class="grid gap-3 md:grid-cols-4">
+                        <select
+                            id="source-select"
+                            name="source"
+                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                        >
+                            {% for source in source_presets %}
+                            <option value="{{ source }}">{{ source }}</option>
+                            {% endfor %}
+                            <option value="__custom__">自定义…</option>
+                        </select>
+                        <input
+                            id="source-custom"
+                            name="source_custom"
+                            type="text"
+                            maxlength="20"
+                            placeholder="自定义来源"
+                            class="hidden min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                        >
+                        <input
+                            id="source-detail"
+                            name="source_detail"
+                            type="text"
+                            placeholder="具体位置（可选）"
+                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                        >
+                        <input
+                            id="counterpart-input"
+                            name="counterpart"
+                            type="text"
+                            placeholder="这段对话里的另一方（可选）"
+                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
+                        >
+                    </div>
+                    <div class="grid gap-3 md:grid-cols-[minmax(0,320px)_1fr]">
+                        <div>
+                            <label for="record-date" class="mb-2 block text-sm text-slate-300">这段记录发生日期（可选）</label>
+                            <input
+                                id="record-date"
+                                name="record_date"
+                                type="date"
+                                min="1900-01-01"
+                                max="2100-12-31"
+                                class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                            >
                         </div>
-                        <p class="text-sm leading-6 text-slate-200">{{ ref.raw_text }}</p>
-                    </article>
-                    {% endfor %}
+                        <p class="self-end pb-1 text-sm leading-6 text-slate-500">有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。</p>
+                    </div>
                 </div>
             </details>
-        </section>
 
-        <section class="rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-            <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                    <h2 class="text-xl font-semibold text-white">导出完整举证包</h2>
-                    <p class="mt-1 text-sm text-slate-400">包含你的全部记录与校验工具,对方可自行验证真伪。单条事项的 PDF 仅供阅读,不含校验工具。</p>
-                </div>
-                <form method="get" action="/export/package" data-export-form>
-                    <button
-                        type="submit"
-                        class="inline-flex min-h-11 items-center rounded-xl bg-slate-200 px-4 py-2 text-sm font-medium text-slate-900 transition hover:bg-white"
-                        data-export-button
-                        data-loading-text="生成中…"
-                    >
-                        导出完整举证包
-                    </button>
-                </form>
+            <div class="flex flex-wrap items-center gap-3">
+                <button
+                    id="submit-button"
+                    type="submit"
+                    class="inline-flex min-h-12 items-center rounded-2xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                >
+                    开始整理
+                </button>
+                <p class="text-sm text-slate-500">按 Ctrl/Cmd + Enter 也可以提交</p>
             </div>
-        </section>
-    </div>
-</div>
+            <p id="form-message" class="text-sm text-slate-400"></p>
+        </form>
+    </section>
 
-<div
-    id="image-lightbox"
-    class="fixed inset-0 z-50 hidden bg-slate-950/90 p-4"
-    aria-hidden="true"
->
-    <button
-        id="lightbox-close"
-        type="button"
-        class="absolute right-4 top-4 inline-flex min-h-11 items-center rounded-xl border border-slate-700 bg-slate-900/80 px-4 py-2 text-sm text-slate-100 transition hover:border-cyan-400/40 hover:text-white"
-    >
-        关闭
-    </button>
-    <div class="flex h-full w-full items-center justify-center">
-        <img id="lightbox-image" src="" alt="" class="max-h-full max-w-full rounded-2xl border border-slate-800 object-contain">
-    </div>
+    <section class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 px-5 py-5 sm:px-6">
+        <div class="grid gap-4 text-sm md:grid-cols-4">
+            <div class="space-y-2">
+                <p class="font-medium text-white">① 放进记录</p>
+                <p class="leading-7 text-slate-400">截图 / 文字 / 文件</p>
+            </div>
+            <div class="space-y-2">
+                <p class="font-medium text-white">② AI 整理</p>
+                <p class="leading-7 text-slate-400">还原事实，解释难懂说法</p>
+            </div>
+            <div class="space-y-2">
+                <p class="font-medium text-white">③ 串成事项</p>
+                <p class="leading-7 text-slate-400">明确时自动归入，有疑问请你确认</p>
+            </div>
+            <div class="space-y-2">
+                <p class="font-medium text-white">④ 随时回看</p>
+                <p class="leading-7 text-slate-400">整理结果可以回到原始材料核对</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="my-events" class="space-y-5">
+        <div class="flex items-end justify-between gap-4">
+            <div>
+                <h2 class="text-2xl font-semibold text-white">我的事项</h2>
+                <p class="mt-2 text-sm leading-7 text-slate-400">当前体验空间里，正在进行中的事项会先放在这里。</p>
+            </div>
+        </div>
+
+        {% if my_events %}
+        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {% for event in my_events %}
+            <a
+                href="/event/{{ event.event_id }}"
+                class="block rounded-[28px] border border-slate-800/80 bg-slate-900/55 p-5 transition hover:border-cyan-400/40 hover:bg-slate-900/80"
+                data-testid="event-card"
+            >
+                <div class="space-y-3">
+                    <h3 class="text-lg font-semibold leading-8 text-white">{{ event.title }}</h3>
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-2 text-sm text-slate-400">
+                        <span>{{ event.fact_count }} 条事实</span>
+                        {% if event.due_text %}
+                        <span class="text-amber-200">截止：{{ event.due_text }}</span>
+                        {% endif %}
+                    </div>
+                    {% if event.recent_facts %}
+                    <div class="space-y-2">
+                        <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{{ event.recent_facts[0].fact_type_label or event.recent_facts[0].fact_type }}</p>
+                        <p class="wc-line-clamp-3 text-sm leading-7 text-slate-300">{{ event.recent_facts[0].content }}</p>
+                    </div>
+                    {% endif %}
+                    <p class="text-xs text-slate-500">最近活动 {{ event.last_activity_text }}</p>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="rounded-[28px] border border-slate-800/80 bg-slate-900/45 p-6 text-sm leading-7 text-slate-300">
+            还没有事项。放进第一条记录后，WorkChain 会帮你把相关事实串起来。
+        </div>
+        {% endif %}
+    </section>
 </div>
 
 <script>
     (() => {
+        const EXAMPLE_TEXTS = {
+            "temporary-change": "小李（2026.8.9）：张总说官网首页的 Banner 周五前换成新版。",
+            "two-things": "张总说官网首页的 Banner 周五前换成新版。另外财务那份供应商合同今天发给王会计。",
+            "office-jargon": "这版先别急着收口，领导希望把颗粒度再拉齐一点，别让大家心智负担太高，先看看有没有更接近 PMF 的表达。",
+        };
+
         const form = document.getElementById("evidence-form");
-        const textInputRegion = document.getElementById("text-input-region");
         const textarea = document.getElementById("evidence-text");
+        const textInputRegion = document.getElementById("text-input-region");
         const textareaLabel = document.getElementById("evidence-text-label");
         const sourceSelect = document.getElementById("source-select");
         const sourceCustom = document.getElementById("source-custom");
@@ -569,29 +242,7 @@
         const filePreviewName = document.getElementById("file-preview-name");
         const filePreviewSize = document.getElementById("file-preview-size");
         const removeFileButton = document.getElementById("remove-file-button");
-        const lightbox = document.getElementById("image-lightbox");
-        const lightboxImage = document.getElementById("lightbox-image");
-        const lightboxClose = document.getElementById("lightbox-close");
-        const glossaryList = document.getElementById("glossary-list");
-        const glossarySection = document.getElementById("glossary-section");
-        const toggleGlossaryButton = document.getElementById("toggle-glossary");
-        const toggleGlossaryText = document.getElementById("toggle-glossary-text");
-        const glossaryCountMobile = document.getElementById("glossary-count-mobile");
-        const addGlossaryRowButton = document.getElementById("add-glossary-row");
-        const saveSettingsButton = document.getElementById("save-settings");
-        const newGlossaryForm = document.getElementById("new-glossary-form");
-        const newGlossaryTerm = document.getElementById("new-glossary-term");
-        const newGlossaryKind = document.getElementById("new-glossary-kind");
-        const newGlossaryMeaning = document.getElementById("new-glossary-meaning");
-        const confirmAddGlossary = document.getElementById("confirm-add-glossary");
-        const cancelAddGlossary = document.getElementById("cancel-add-glossary");
-        const pendingCards = [...document.querySelectorAll("[data-evidence-id][data-parse-status]")].filter((card) => (
-            ["pending", "ocr_running", "llm_running"].includes(card.dataset.parseStatus)
-        ));
-        const toggleButtons = [...document.querySelectorAll("[data-toggle-fulltext]")];
-        const lightboxButtons = [...document.querySelectorAll("[data-open-lightbox]")];
-        let selfNames = {{ settings.self_names|tojson }};
-        let glossary = {{ settings.glossary|tojson }};
+        const exampleButtons = [...document.querySelectorAll("[data-fill-example]")];
         let selectedFile = null;
         let previewUrl = null;
 
@@ -689,12 +340,12 @@
 
             if ((selectedFile.type || "").startsWith("image/")) {
                 previewUrl = URL.createObjectURL(selectedFile);
-                filePreviewVisual.innerHTML = `<img src="${previewUrl}" alt="${escapeHtml(fallbackFileName(selectedFile))}" class="max-h-40 rounded-xl border border-slate-800 object-contain">`;
+                filePreviewVisual.innerHTML = `<img src="${previewUrl}" alt="${escapeHtml(fallbackFileName(selectedFile))}" class="max-h-40 rounded-2xl border border-slate-800/80 object-contain">`;
                 return;
             }
 
             filePreviewVisual.innerHTML = `
-                <div class="inline-flex h-20 w-20 items-center justify-center rounded-2xl border border-slate-700 bg-slate-950 text-sm text-slate-300">
+                <div class="inline-flex h-20 w-20 items-center justify-center rounded-3xl border border-slate-700/80 bg-slate-950 text-sm text-slate-300">
                     文档
                 </div>
             `;
@@ -727,7 +378,7 @@
                 return;
             }
             flashBanner.textContent = text;
-            flashBanner.className = "mb-4 rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500";
+            flashBanner.className = "rounded-[28px] border px-4 py-3 text-sm transition-opacity duration-500";
             if (tone === "success") {
                 flashBanner.classList.add("border-emerald-400/30", "bg-emerald-400/10", "text-emerald-100");
             } else {
@@ -744,7 +395,7 @@
 
         const setSubmitting = (submitting) => {
             submitButton.disabled = submitting;
-            submitButton.textContent = submitting ? "保存中…" : "保存";
+            submitButton.textContent = submitting ? "整理中…" : "开始整理";
             submitButton.classList.toggle("opacity-60", submitting);
             submitButton.classList.toggle("cursor-not-allowed", submitting);
         };
@@ -759,98 +410,6 @@
                 }
             }
             return { kind: "text", value: await response.text() };
-        };
-
-        const syncEventAssignmentInputs = (scope = document) => {
-            scope.querySelectorAll("[data-event-assignment-form]").forEach((formNode) => {
-                formNode.querySelectorAll("[data-assignment-group]").forEach((groupNode) => {
-                    const select = groupNode.querySelector("[data-assignment-select]");
-                    const newTitleWrap = groupNode.querySelector("[data-new-title-wrap]");
-                    if (!select || !newTitleWrap) {
-                        return;
-                    }
-                    newTitleWrap.classList.toggle("hidden", select.value !== "new");
-                });
-            });
-        };
-
-        const buildEventAssignmentPayload = (formNode) => {
-            return {
-                event_match_run_id: formNode.dataset.eventMatchRunId,
-                groups: [...formNode.querySelectorAll("[data-assignment-group]")].map((groupNode) => {
-                    const groupIndex = Number(groupNode.dataset.groupIndex);
-                    const select = groupNode.querySelector("[data-assignment-select]");
-                    const newTitleInput = groupNode.querySelector("[data-new-title-input]");
-                    const selectedValue = select?.value || "unassigned";
-                    if (selectedValue === "new") {
-                        return {
-                            group_index: groupIndex,
-                            choice: "new",
-                            new_title: newTitleInput?.value || "",
-                        };
-                    }
-                    if (selectedValue === "unassigned") {
-                        return {
-                            group_index: groupIndex,
-                            choice: "unassigned",
-                        };
-                    }
-                    return {
-                        group_index: groupIndex,
-                        choice: "existing",
-                        event_id: selectedValue.replace("existing:", ""),
-                    };
-                }),
-            };
-        };
-
-        const bindEventAssignmentForms = (scope = document) => {
-            scope.querySelectorAll("[data-event-assignment-form]").forEach((formNode) => {
-                if (formNode.dataset.boundEventAssignment === "true") {
-                    return;
-                }
-                formNode.dataset.boundEventAssignment = "true";
-                formNode.querySelectorAll("[data-assignment-select]").forEach((node) => {
-                    node.addEventListener("change", () => syncEventAssignmentInputs(formNode));
-                });
-                formNode.addEventListener("submit", async (event) => {
-                    event.preventDefault();
-                    const saveButton = formNode.querySelector("[data-event-assignment-save]");
-                    const endpoint = formNode.dataset.eventAssignmentEndpoint;
-                    if (!endpoint) {
-                        return;
-                    }
-                    if (saveButton) {
-                        saveButton.disabled = true;
-                        saveButton.classList.add("opacity-60", "cursor-not-allowed");
-                    }
-                    try {
-                        const response = await fetch(endpoint, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(buildEventAssignmentPayload(formNode)),
-                        });
-                        const data = await response.json();
-                        if (!response.ok) {
-                            showBanner(data.detail || "确认归属失败", "error");
-                            return;
-                        }
-                        sessionStorage.setItem(
-                            "workchainFlash",
-                            JSON.stringify({ tone: "success", text: "事项归属已确认" }),
-                        );
-                        window.location.reload();
-                    } catch (error) {
-                        showBanner("确认归属失败，请稍后再试", "error");
-                    } finally {
-                        if (saveButton) {
-                            saveButton.disabled = false;
-                            saveButton.classList.remove("opacity-60", "cursor-not-allowed");
-                        }
-                    }
-                });
-            });
-            syncEventAssignmentInputs(scope);
         };
 
         const submitForm = async () => {
@@ -880,8 +439,7 @@
                         body: formData,
                     });
                 } catch (error) {
-                    console.error(error);
-                    const errorText = "请求没能发出去,请检查网络";
+                    const errorText = "请求没能发出去，请检查网络";
                     showBanner(errorText, "error");
                     message.textContent = errorText;
                     return;
@@ -892,7 +450,7 @@
                     let errorText = `服务器返回了意外的响应 (状态码 ${response.status})`;
                     if (parsed.kind === "json") {
                         errorText = response.status === 429
-                            ? "今天存得有点多啦,明天再来"
+                            ? "今天存得有点多啦，明天再来"
                             : (parsed.value?.detail || errorText);
                     }
                     showBanner(errorText, "error");
@@ -912,174 +470,11 @@
                 clearSelectedFile();
                 sessionStorage.setItem(
                     "workchainFlash",
-                    JSON.stringify({ tone: "success", text: hasFile ? "已保存,原件已完整保存" : "已保存,正在解析…" }),
+                    JSON.stringify({ tone: "success", text: hasFile ? "原件已保存，正在整理…" : "已开始整理…" }),
                 );
                 window.location.reload();
             } finally {
                 setSubmitting(false);
-            }
-        };
-
-        const renderParseBody = (card, payload) => {
-            const target = card.querySelector("[data-parse-body]");
-            if (!target) {
-                return;
-            }
-            const mediaType = payload.media_type || card.dataset.mediaType || "text";
-            if (payload.parse_status === "ocr_running") {
-                target.innerHTML = `
-                    <p class="inline-flex items-center gap-2 text-cyan-200">
-                        <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>
-                        正在读取图片中的文字…
-                    </p>
-                `;
-                return;
-            }
-            if (payload.parse_status === "llm_running" || payload.parse_status === "pending") {
-                target.innerHTML = `
-                    <p class="inline-flex items-center gap-2 text-cyan-200">
-                        <span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span>
-                        ${mediaType === "image" ? "正在理解这段对话…" : "正在理解这段对话…"}
-                    </p>
-                `;
-                return;
-            }
-            if (payload.parse_status === "done") {
-                const semanticFacts = Array.isArray(payload.semantic_fact_preview) ? payload.semantic_fact_preview : [];
-                const eventMatch = payload.event_match || null;
-                if (semanticFacts.length > 0) {
-                    const factHtml = semanticFacts.map((fact) => `
-                        <div class="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-3">
-                            <p class="text-xs uppercase tracking-wide text-slate-500">${escapeHtml(fact.fact_type || "fact")}</p>
-                            <p class="mt-1 text-slate-100">${escapeHtml(fact.content || "")}</p>
-                        </div>
-                    `).join("");
-                    target.innerHTML = `
-                        <div class="space-y-2">${factHtml}</div>
-                        ${payload.event_assignment_panel_html || ""}
-                        ${!payload.event_assignment_panel_html && eventMatch?.message ? `<p class="mt-3 text-slate-400">${escapeHtml(eventMatch.message)}</p>` : ""}
-                    `;
-                    bindEventAssignmentForms(target);
-                    return;
-                }
-                const caveats = (payload.caveats || []).map((item) => `<p class="text-yellow-200">${escapeHtml(item)}</p>`).join("");
-                target.innerHTML = `
-                    ${payload.plain_summary ? `<p class="text-slate-200">${escapeHtml(payload.plain_summary)}</p>` : ""}
-                    <div class="mt-2 space-y-1 text-slate-400">
-                        ${payload.deliverable ? `<p>交付物：${escapeHtml(payload.deliverable)}</p>` : ""}
-                        ${payload.due_text ? `<p>时限：${escapeHtml(payload.due_text)}</p>` : ""}
-                        ${caveats}
-                    </div>
-                `;
-                return;
-            }
-            target.innerHTML = `
-                ${payload.plain_summary ? `<p class="text-slate-200">${escapeHtml(payload.plain_summary)}</p>` : ""}
-                <p class="${payload.plain_summary ? "mt-2 " : ""}text-slate-400">${escapeHtml(payload.detail || "解析暂不可用,记录已完整保存")}</p>
-            `;
-        };
-
-        const pollParseStatus = (card) => {
-            const evidenceId = card.dataset.evidenceId;
-            if (!evidenceId) {
-                return;
-            }
-            let attempts = 0;
-            const timer = window.setInterval(async () => {
-                attempts += 1;
-                try {
-                    const response = await fetch(`/api/evidence/${evidenceId}/status`);
-                    const payload = await response.json();
-                    card.dataset.parseStatus = payload.parse_status || card.dataset.parseStatus;
-                    if (payload.parse_status === "done" || payload.parse_status === "failed" || payload.parse_status === "unsupported" || attempts >= 40) {
-                        window.clearInterval(timer);
-                        renderParseBody(
-                            card,
-                            attempts >= 40 && ["pending", "ocr_running", "llm_running"].includes(payload.parse_status)
-                                ? { parse_status: "failed", detail: "处理时间较长,请稍后刷新查看" }
-                                : payload,
-                        );
-                    }
-                } catch (error) {
-                    window.clearInterval(timer);
-                    renderParseBody(card, { parse_status: "failed", detail: "解析暂不可用,记录已完整保存" });
-                }
-            }, 2000);
-        };
-
-        const syncGlossaryMobileState = () => {
-            glossaryCountMobile.textContent = glossary.length;
-            const expanded = !glossarySection.classList.contains("hidden");
-            toggleGlossaryText.textContent = expanded ? "收起词典" : "展开词典";
-        };
-
-        const openLightbox = (src, alt) => {
-            if (!lightbox || !lightboxImage || !src) {
-                return;
-            }
-            lightboxImage.src = src;
-            lightboxImage.alt = alt || "图片记录";
-            lightbox.classList.remove("hidden");
-            lightbox.setAttribute("aria-hidden", "false");
-            document.body.classList.add("overflow-hidden");
-        };
-
-        const closeLightbox = () => {
-            if (!lightbox || !lightboxImage) {
-                return;
-            }
-            lightbox.classList.add("hidden");
-            lightbox.setAttribute("aria-hidden", "true");
-            lightboxImage.src = "";
-            lightboxImage.alt = "";
-            document.body.classList.remove("overflow-hidden");
-        };
-
-        const renderGlossary = () => {
-            glossaryList.innerHTML = "";
-            glossary.forEach((item) => {
-                const row = document.createElement("div");
-                row.className = "rounded-xl border border-slate-800 bg-slate-900/70 p-3";
-                row.innerHTML = `
-                    <div class="flex items-start justify-between gap-3">
-                        <div>
-                            <p class="text-sm text-slate-100">${item.term}</p>
-                            <p class="mt-1 text-xs text-slate-500">${item.kind === "person" ? "人物" : "说法"} · ${item.meaning}</p>
-                        </div>
-                        <button type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
-                    </div>
-                `;
-                row.querySelector("button").addEventListener("click", () => {
-                    glossary = glossary.filter((entry) => !(entry.term === item.term && entry.kind === item.kind && entry.meaning === item.meaning));
-                    renderGlossary();
-                });
-                glossaryList.appendChild(row);
-            });
-            syncGlossaryMobileState();
-        };
-
-        const saveSettings = async () => {
-            try {
-                const response = await fetch("/api/settings", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({
-                        self_names: selfNames,
-                        glossary: glossary,
-                    }),
-                });
-                const data = await response.json();
-                if (!response.ok) {
-                    showBanner(data.detail || "保存设置失败", "error");
-                    return;
-                }
-                selfNames = data.self_names || [];
-                glossary = data.glossary || [];
-                renderGlossary();
-                newGlossaryForm.classList.add("hidden");
-                showBanner("设置已保存,马上生效", "success");
-            } catch (error) {
-                showBanner("保存设置失败,请稍后再试", "error");
             }
         };
 
@@ -1145,83 +540,18 @@
 
         textarea.addEventListener("input", syncInputMode);
 
-        toggleButtons.forEach((button) => {
+        exampleButtons.forEach((button) => {
             button.addEventListener("click", () => {
-                const card = button.closest("[data-evidence-id]");
-                if (!card) {
+                const key = button.dataset.fillExample;
+                const exampleText = EXAMPLE_TEXTS[key];
+                if (!exampleText) {
                     return;
                 }
-                const preview = card.querySelector("[data-raw-preview]");
-                const full = card.querySelector("[data-raw-full]");
-                if (!preview || !full) {
-                    return;
-                }
-                const isExpanded = !full.classList.contains("hidden");
-                preview.classList.toggle("hidden", !isExpanded);
-                full.classList.toggle("hidden", isExpanded);
-                button.textContent = isExpanded ? "展开全文" : "收起";
-            });
-        });
-
-        lightboxButtons.forEach((button) => {
-            button.addEventListener("click", () => {
-                openLightbox(button.dataset.openLightbox, button.dataset.lightboxAlt || "图片记录");
-            });
-        });
-
-        lightboxClose.addEventListener("click", closeLightbox);
-        lightbox.addEventListener("click", (event) => {
-            if (event.target === lightbox) {
-                closeLightbox();
-            }
-        });
-        window.addEventListener("keydown", (event) => {
-            if (event.key === "Escape") {
-                closeLightbox();
-            }
-        });
-
-        addGlossaryRowButton.addEventListener("click", () => {
-            newGlossaryForm.classList.toggle("hidden");
-        });
-
-        saveSettingsButton.addEventListener("click", () => {
-            saveSettings();
-        });
-
-        confirmAddGlossary.addEventListener("click", () => {
-            const term = newGlossaryTerm.value.trim();
-            const kind = newGlossaryKind.value;
-            const meaning = newGlossaryMeaning.value.trim();
-            if (!term || !meaning) {
-                return;
-            }
-            glossary.push({ term, kind, meaning });
-            newGlossaryTerm.value = "";
-            newGlossaryMeaning.value = "";
-            newGlossaryKind.value = "person";
-            newGlossaryForm.classList.add("hidden");
-            renderGlossary();
-        });
-
-        cancelAddGlossary.addEventListener("click", () => {
-            newGlossaryForm.classList.add("hidden");
-        });
-
-        toggleGlossaryButton.addEventListener("click", () => {
-            glossarySection.classList.toggle("hidden");
-            syncGlossaryMobileState();
-        });
-
-        [...document.querySelectorAll("[data-export-form]")].forEach((exportForm) => {
-            exportForm.addEventListener("submit", () => {
-                const button = exportForm.querySelector("[data-export-button]");
-                if (!button) {
-                    return;
-                }
-                button.disabled = true;
-                button.textContent = button.dataset.loadingText || "生成中…";
-                button.classList.add("opacity-60", "cursor-not-allowed");
+                clearSelectedFile();
+                textarea.value = exampleText;
+                syncInputMode();
+                textarea.focus();
+                textarea.setSelectionRange(textarea.value.length, textarea.value.length);
             });
         });
 
@@ -1248,10 +578,6 @@
             }
         }
 
-        renderGlossary();
-        syncGlossaryMobileState();
-        bindEventAssignmentForms();
-        pendingCards.forEach((card) => pollParseStatus(card));
         window.addEventListener("beforeunload", revokePreviewUrl);
     })();
 </script>

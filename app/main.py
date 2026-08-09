@@ -2263,7 +2263,7 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
                 AND e.evidence_id NOT LIKE 'ev_demo_%'
           )
         ORDER BY COALESCE(f.occurred_at, f.updated_at, f.created_at) DESC, f.fact_id DESC
-        LIMIT 2
+        LIMIT 1
         """,
         (row["event_id"],),
     ).fetchall()
@@ -2550,7 +2550,7 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
         decorated_recent_rows.append(row_dict)
     prepared_events = [_prepare_event_card(conn, row) for row in event_rows]
     return {
-        "my_events": [item for item in prepared_events if item["status"] == "active"],
+        "my_events": [item for item in prepared_events if item["status"] == "active"][:6],
         "history_events": [item for item in prepared_events if item["status"] == "resolved"],
         "demo_threads": [_prepare_thread_card(row) for row in demo_thread_rows],
         "references": [_prepare_reference_row(row) for row in reference_rows],

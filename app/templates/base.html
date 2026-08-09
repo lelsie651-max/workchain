@@ -9,86 +9,382 @@
         body {
             font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
         }
+
+        .wc-line-clamp-2 {
+            display: -webkit-box;
+            overflow: hidden;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+        }
+
+        .wc-line-clamp-3 {
+            display: -webkit-box;
+            overflow: hidden;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 3;
+        }
     </style>
 </head>
-<body class="min-h-full bg-slate-950 text-slate-100">
-    <div class="mx-auto min-h-screen max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-        <header class="mb-6 border-b border-slate-800 pb-5 sm:mb-8 sm:pb-6">
-            <div class="flex flex-wrap items-start justify-between gap-4">
-                <a href="/" class="flex min-h-11 flex-1 items-start gap-3">
-                    <div class="rounded-xl border border-cyan-400/30 bg-cyan-400/10 px-3 py-2 text-sm font-semibold tracking-wide text-cyan-200">
-                        WorkChain
-                    </div>
-                    <div class="min-w-0">
-                        <h1 class="text-2xl font-semibold tracking-tight text-white sm:text-3xl">WorkChain</h1>
-                        <p class="mt-1 text-sm leading-6 text-slate-400">「这不是我要的」? —— 自动留证 · 不可篡改 · 可第三方验证</p>
-                    </div>
-                </a>
-                <div class="flex items-center gap-3">
-                    <form action="/search" method="get" class="hidden items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 lg:flex">
-                        <span class="text-slate-500">🔎</span>
-                        <input
-                            type="text"
-                            name="q"
-                            value="{{ current_search_q|default('') }}"
-                            placeholder="搜索记录"
-                            class="w-48 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                        >
-                    </form>
-                    <button
-                        id="mobile-search-toggle"
-                        type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
-                        aria-label="打开搜索"
-                    >
-                        🔎
-                    </button>
-                    <a
-                        href="/help"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                    >
-                        使用说明
+<body class="min-h-full bg-slate-950 text-slate-100 antialiased">
+    <div class="min-h-screen bg-slate-950">
+        <div class="mx-auto min-h-screen max-w-[1160px] px-4 py-5 sm:px-6 sm:py-6 lg:px-8">
+            <header class="mb-8 rounded-[28px] border border-slate-800/80 bg-slate-900/70 px-4 py-4 shadow-[0_0_0_1px_rgba(15,23,42,0.05)] backdrop-blur-sm sm:px-5">
+                <div class="flex items-center justify-between gap-3">
+                    <a href="/" class="min-w-0 flex-1">
+                        <div class="flex items-center gap-3">
+                            <div class="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-cyan-400/12 text-sm font-semibold tracking-wide text-cyan-200 ring-1 ring-cyan-400/20">
+                                WC
+                            </div>
+                            <div class="min-w-0">
+                                <p class="text-base font-semibold tracking-tight text-white">WorkChain</p>
+                                <p class="wc-line-clamp-2 text-sm leading-6 text-slate-400">把散落的沟通，整理成可以回看的事实。</p>
+                            </div>
+                        </div>
                     </a>
+                    <button
+                        id="mobile-nav-toggle"
+                        type="button"
+                        class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white lg:hidden"
+                        aria-expanded="false"
+                        aria-controls="mobile-nav-panel"
+                    >
+                        菜单
+                    </button>
+                </div>
+
+                <div class="mt-4 hidden items-center gap-4 lg:flex">
+                    <nav class="flex flex-1 items-center gap-2 text-sm text-slate-300">
+                        <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-11 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">我的事项</a>
+                        <a href="/help" class="inline-flex min-h-11 items-center rounded-2xl px-4 py-2 transition hover:bg-slate-800/70 hover:text-white">使用说明</a>
+                    </nav>
+                    <div class="flex items-center gap-3">
+                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2.5">
+                            <span class="text-slate-500">🔎</span>
+                            <input
+                                type="text"
+                                name="q"
+                                value="{{ current_search_q|default('') }}"
+                                placeholder="搜索"
+                                class="w-40 bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                            >
+                        </form>
+                        <button
+                            type="button"
+                            data-open-glossary
+                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            我的词典
+                        </button>
+                    </div>
+                </div>
+
+                <div id="mobile-nav-panel" class="mt-4 hidden border-t border-slate-800/80 pt-4 lg:hidden">
+                    <div class="grid gap-3">
+                        <nav class="grid gap-2 text-sm text-slate-200">
+                            <a href="{{ '#my-events' if request.url.path == '/' else '/#my-events' }}" class="inline-flex min-h-11 items-center rounded-2xl bg-slate-950/40 px-4 py-2">我的事项</a>
+                            <a href="/help" class="inline-flex min-h-11 items-center rounded-2xl bg-slate-950/40 px-4 py-2">使用说明</a>
+                        </nav>
+                        <form action="/search" method="get" class="flex items-center gap-2 rounded-2xl border border-slate-800/80 bg-slate-950/50 px-4 py-2.5">
+                            <span class="text-slate-500">🔎</span>
+                            <input
+                                type="text"
+                                name="q"
+                                value="{{ current_search_q|default('') }}"
+                                placeholder="搜索"
+                                class="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
+                            >
+                        </form>
+                        <button
+                            type="button"
+                            data-open-glossary
+                            class="inline-flex min-h-11 items-center justify-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200"
+                        >
+                            我的词典
+                        </button>
+                    </div>
+                </div>
+            </header>
+
+            <main>
+                {% block content %}{% endblock %}
+            </main>
+
+            <footer class="mt-12 border-t border-slate-800/80 pt-5 text-sm text-slate-500">
+                <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span>匿名体验</span>
+                    <span>·</span>
+                    <span>24 小时自动清理</span>
+                    <span>·</span>
+                    <a href="/help" class="transition hover:text-slate-300">使用说明</a>
+                </div>
+            </footer>
+        </div>
+    </div>
+
+    <div
+        id="glossary-overlay"
+        class="fixed inset-0 z-40 hidden bg-slate-950/70"
+        aria-hidden="true"
+    ></div>
+    <aside
+        id="glossary-drawer"
+        class="fixed inset-y-0 right-0 z-50 hidden w-full max-w-[420px] border-l border-slate-800 bg-slate-950/95 p-4 shadow-2xl sm:p-5"
+        aria-hidden="true"
+    >
+        <div class="flex h-full flex-col">
+            <div class="flex items-start justify-between gap-4">
+                <div>
+                    <h2 class="text-xl font-semibold text-white">我的词典</h2>
+                    <p class="mt-1 text-sm leading-6 text-slate-400">给常见人名、简称或说法补一点背景，方便 WorkChain 更稳地理解这段记录。</p>
+                </div>
+                <button
+                    id="close-glossary"
+                    type="button"
+                    class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                >
+                    关闭
+                </button>
+            </div>
+
+            <div id="glossary-flash" class="mt-4 hidden rounded-2xl border px-4 py-3 text-sm" role="status" aria-live="polite"></div>
+
+            <div class="mt-5 flex-1 overflow-y-auto pr-1">
+                <div id="glossary-loading" class="text-sm text-slate-400">正在加载词典…</div>
+                <div id="glossary-shell" class="hidden space-y-5">
+                    <div id="glossary-list" class="space-y-3"></div>
+
+                    <div class="flex flex-wrap gap-3">
+                        <button
+                            id="add-glossary-row"
+                            type="button"
+                            class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                        >
+                            新增词条
+                        </button>
+                        <button
+                            id="save-settings"
+                            type="button"
+                            class="inline-flex min-h-11 items-center rounded-2xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                        >
+                            保存
+                        </button>
+                    </div>
+
+                    <div id="new-glossary-form" class="hidden rounded-3xl border border-slate-800/80 bg-slate-900/80 p-4">
+                        <div class="grid gap-3">
+                            <input id="new-glossary-term" type="text" placeholder="词" class="min-h-11 rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                            <select id="new-glossary-kind" class="min-h-11 rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                                <option value="person">人物</option>
+                                <option value="phrase">说法</option>
+                            </select>
+                            <input id="new-glossary-meaning" type="text" placeholder="指的是什么" class="min-h-11 rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40">
+                            <div class="flex flex-wrap gap-3">
+                                <button id="confirm-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-2xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300">加入词典</button>
+                                <button id="cancel-add-glossary" type="button" class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">取消</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
-            <form id="mobile-search-form" action="/search" method="get" class="mt-4 hidden items-center gap-2 rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 lg:hidden">
-                <span class="text-slate-500">🔎</span>
-                <input
-                    type="text"
-                    name="q"
-                    value="{{ current_search_q|default('') }}"
-                    placeholder="搜索记录"
-                    class="w-full bg-transparent text-sm text-slate-100 outline-none placeholder:text-slate-500"
-                >
-            </form>
-        </header>
+        </div>
+    </aside>
 
-        <main>
-            {% block content %}{% endblock %}
-        </main>
-
-        <footer class="mt-10 border-t border-slate-800 pt-5 text-sm text-slate-500">
-            <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <span>匿名体验空间</span>
-                <span>·</span>
-                <span>24 小时后自动清理</span>
-                <span>·</span>
-                <a href="/help" class="transition hover:text-slate-300">使用说明</a>
-            </div>
-        </footer>
-    </div>
     <script>
         (() => {
-            const mobileToggle = document.getElementById("mobile-search-toggle");
-            const mobileForm = document.getElementById("mobile-search-form");
-            if (!mobileToggle || !mobileForm) {
-                return;
+            const mobileNavToggle = document.getElementById("mobile-nav-toggle");
+            const mobileNavPanel = document.getElementById("mobile-nav-panel");
+            const glossaryOverlay = document.getElementById("glossary-overlay");
+            const glossaryDrawer = document.getElementById("glossary-drawer");
+            const glossaryLoading = document.getElementById("glossary-loading");
+            const glossaryShell = document.getElementById("glossary-shell");
+            const glossaryList = document.getElementById("glossary-list");
+            const glossaryFlash = document.getElementById("glossary-flash");
+            const addGlossaryRowButton = document.getElementById("add-glossary-row");
+            const saveSettingsButton = document.getElementById("save-settings");
+            const newGlossaryForm = document.getElementById("new-glossary-form");
+            const newGlossaryTerm = document.getElementById("new-glossary-term");
+            const newGlossaryKind = document.getElementById("new-glossary-kind");
+            const newGlossaryMeaning = document.getElementById("new-glossary-meaning");
+            const confirmAddGlossary = document.getElementById("confirm-add-glossary");
+            const cancelAddGlossary = document.getElementById("cancel-add-glossary");
+            const closeGlossaryButton = document.getElementById("close-glossary");
+            const openGlossaryButtons = [...document.querySelectorAll("[data-open-glossary]")];
+            let glossary = [];
+            let selfNames = [];
+            let glossaryLoaded = false;
+
+            const escapeHtml = (value) => String(value ?? "")
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#39;");
+
+            const showGlossaryFlash = (text, tone) => {
+                if (!glossaryFlash) {
+                    return;
+                }
+                glossaryFlash.textContent = text;
+                glossaryFlash.className = "mt-4 rounded-2xl border px-4 py-3 text-sm";
+                if (tone === "success") {
+                    glossaryFlash.classList.add("border-emerald-400/30", "bg-emerald-400/10", "text-emerald-100");
+                } else {
+                    glossaryFlash.classList.add("border-red-400/30", "bg-red-400/10", "text-red-100");
+                }
+                glossaryFlash.classList.remove("hidden");
+            };
+
+            const renderGlossary = () => {
+                if (!glossaryList) {
+                    return;
+                }
+                glossaryList.innerHTML = "";
+                if (glossary.length === 0) {
+                    const empty = document.createElement("div");
+                    empty.className = "rounded-3xl border border-slate-800/80 bg-slate-900/60 px-4 py-4 text-sm leading-7 text-slate-400";
+                    empty.textContent = "还没有词条。你可以先加常见人名、简称或黑话解释。";
+                    glossaryList.appendChild(empty);
+                    return;
+                }
+                glossary.forEach((item) => {
+                    const row = document.createElement("div");
+                    row.className = "rounded-3xl border border-slate-800/80 bg-slate-900/60 p-4";
+                    row.innerHTML = `
+                        <div class="flex items-start justify-between gap-3">
+                            <div class="min-w-0">
+                                <p class="text-sm font-medium text-slate-100">${escapeHtml(item.term)}</p>
+                                <p class="mt-1 text-sm leading-6 text-slate-400">${item.kind === "person" ? "人物" : "说法"} · ${escapeHtml(item.meaning)}</p>
+                            </div>
+                            <button type="button" class="inline-flex min-h-11 items-center rounded-2xl border border-slate-700/80 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                        </div>
+                    `;
+                    row.querySelector("button").addEventListener("click", () => {
+                        glossary = glossary.filter((entry) => !(entry.term === item.term && entry.kind === item.kind && entry.meaning === item.meaning));
+                        renderGlossary();
+                    });
+                    glossaryList.appendChild(row);
+                });
+            };
+
+            const loadGlossary = async () => {
+                if (glossaryLoaded) {
+                    return;
+                }
+                glossaryLoading.classList.remove("hidden");
+                glossaryShell.classList.add("hidden");
+                try {
+                    const response = await fetch("/api/settings");
+                    const payload = await response.json();
+                    if (!response.ok) {
+                        throw new Error(payload.detail || "词典加载失败");
+                    }
+                    selfNames = payload.self_names || [];
+                    glossary = payload.glossary || [];
+                    renderGlossary();
+                    glossaryLoaded = true;
+                    glossaryLoading.classList.add("hidden");
+                    glossaryShell.classList.remove("hidden");
+                } catch (error) {
+                    glossaryLoading.textContent = "词典加载失败，请稍后再试。";
+                }
+            };
+
+            const openGlossary = async () => {
+                glossaryOverlay.classList.remove("hidden");
+                glossaryDrawer.classList.remove("hidden");
+                glossaryOverlay.setAttribute("aria-hidden", "false");
+                glossaryDrawer.setAttribute("aria-hidden", "false");
+                document.body.classList.add("overflow-hidden");
+                await loadGlossary();
+            };
+
+            const closeGlossary = () => {
+                glossaryOverlay.classList.add("hidden");
+                glossaryDrawer.classList.add("hidden");
+                glossaryOverlay.setAttribute("aria-hidden", "true");
+                glossaryDrawer.setAttribute("aria-hidden", "true");
+                document.body.classList.remove("overflow-hidden");
+            };
+
+            const saveSettings = async () => {
+                try {
+                    const response = await fetch("/api/settings", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            self_names: selfNames,
+                            glossary: glossary,
+                        }),
+                    });
+                    const payload = await response.json();
+                    if (!response.ok) {
+                        showGlossaryFlash(payload.detail || "保存失败", "error");
+                        return;
+                    }
+                    glossary = payload.glossary || [];
+                    selfNames = payload.self_names || [];
+                    renderGlossary();
+                    newGlossaryForm.classList.add("hidden");
+                    showGlossaryFlash("设置已保存，马上生效。", "success");
+                } catch (error) {
+                    showGlossaryFlash("保存失败，请稍后再试。", "error");
+                }
+            };
+
+            if (mobileNavToggle && mobileNavPanel) {
+                mobileNavToggle.addEventListener("click", () => {
+                    const nextExpanded = mobileNavPanel.classList.contains("hidden");
+                    mobileNavPanel.classList.toggle("hidden");
+                    mobileNavToggle.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
+                });
             }
-            mobileToggle.addEventListener("click", () => {
-                mobileForm.classList.toggle("hidden");
-                const input = mobileForm.querySelector("input[name='q']");
-                if (input && !mobileForm.classList.contains("hidden")) {
-                    input.focus();
+
+            openGlossaryButtons.forEach((button) => {
+                button.addEventListener("click", () => {
+                    openGlossary();
+                });
+            });
+
+            if (glossaryOverlay) {
+                glossaryOverlay.addEventListener("click", closeGlossary);
+            }
+            if (closeGlossaryButton) {
+                closeGlossaryButton.addEventListener("click", closeGlossary);
+            }
+
+            if (addGlossaryRowButton) {
+                addGlossaryRowButton.addEventListener("click", () => {
+                    newGlossaryForm.classList.toggle("hidden");
+                });
+            }
+            if (cancelAddGlossary) {
+                cancelAddGlossary.addEventListener("click", () => {
+                    newGlossaryForm.classList.add("hidden");
+                });
+            }
+            if (confirmAddGlossary) {
+                confirmAddGlossary.addEventListener("click", () => {
+                    const term = newGlossaryTerm.value.trim();
+                    const kind = newGlossaryKind.value;
+                    const meaning = newGlossaryMeaning.value.trim();
+                    if (!term || !meaning) {
+                        return;
+                    }
+                    glossary.push({ term, kind, meaning });
+                    newGlossaryTerm.value = "";
+                    newGlossaryKind.value = "person";
+                    newGlossaryMeaning.value = "";
+                    newGlossaryForm.classList.add("hidden");
+                    renderGlossary();
+                });
+            }
+            if (saveSettingsButton) {
+                saveSettingsButton.addEventListener("click", saveSettings);
+            }
+
+            window.addEventListener("keydown", (event) => {
+                if (event.key === "Escape" && !glossaryDrawer.classList.contains("hidden")) {
+                    closeGlossary();
                 }
             });
         })();

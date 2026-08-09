@@ -595,10 +595,13 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 ### 阶段四:界面与导出
 **已完成首版**
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
-- 首页主体验已切到 Event / Fact 体系:`我的事项` 只展示当前访客沙箱中的真实 `events + facts`
+- 首页主体验已切到单列聚焦布局:Hero + 主输入区 + 轻量 onboarding + `我的事项`,默认只突出"把一条记录放进 WorkChain"这一主动作
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
+- 首页补充信息(`source / source_detail / counterpart / record_date`)收纳进"补充信息(可选)"折叠区,不与主输入区争主层级
+- 首页新增 3 个纯前端示例 chips(`临时改需求 / 一句话两件事 / 满篇职场黑话`),只负责填充 textarea,不自动提交
+- `我的词典` 已退出首页侧栏,改为 Header 入口打开的右侧抽屉;继续复用现有 `GET/POST /api/settings` 保存 glossary,关闭后保持当前首页状态
 - 旧 demo threads 兼容路由仍保留,但普通用户首页不再公开展示;仅在 diagnostics/debug 场景下保留只读入口,避免与真实 Event 体系混淆
-- `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要;若 latest Event Match 为 `pending` 且 routing_mode 为 `confirm / needs_context`,首页直接复用与详情页相同的事项归属确认面板,无需先进入详情页
+- 首页本轮不再直接展示 `历史事项 / 最近证据 / 参考信息 / 导出入口 / diagnostics`;相关路由和兼容能力保留,后续轮次再安排入口
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
 - Event 详情页现已升级为 Competition Event Control Center V1:可修改事项名称、纠正 Fact 的 `content / fact_type / due_at`、直接补/改相关 Evidence 的记录日期,并通过受控接口切换 `active <-> resolved`
 - Event 页 Fact 纠正必须走 `correct_fact_by_user(...)`;只允许修改语义字段,不得改 `fact_id / semantic_run_id / Evidence` 关联,写入后统一标记 `origin=user / review_status=corrected` 并更新 `events.updated_at`
@@ -606,9 +609,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - Evidence 详情页若已存在 succeeded Semantic Run,不再展示旧兼容层 slots 编辑区(`交付物 / 时限原文 / 方向 / kind / caveat`);只有无 Semantic Run 的旧记录继续保留兼容编辑入口
 - Evidence 详情页在存在相对日期 Fact 时,会展示"记录日期"操作区:缺少 anchor 时允许补充日期,已有 anchor 时展示来源(`你填写的` / `从记录时间中识别`)并允许修改
 - `/api/evidence/{id}/record-date` 只做确定性补算:保存 `meta` 中的 anchor/source=`user`,对 latest succeeded semantic run 内 `due_raw` 为相对日期的 Facts 重新计算 `due_at / due_anchor_at`,并以原子事务更新 `origin=user / review_status=corrected`;不重跑 DeepSeek,不改 Evidence 原件,不改 Semantic Run 历史
-- 首页 `我的事项` 卡片会读取 Event 关联 Facts 中最早的有效 `due_at`;有明确日期时显示 `截止：MM-DD`(跨年则显示完整日期),没有 `due_at` 时不显示占位文案
-- 首页 `我的事项` 现只展示 `status=active` 的事项;`status=resolved` 的事项进入单独的 `历史事项` 区,支持回看与重新打开,结档不会删除任何 Fact / Evidence
-- 首页原 `我刚存的` 文案已改为 `最近证据`,说明固定为 `按保存顺序保留的原始材料，用于回看和核对。`
+- 首页 `我的事项` 现只展示 `status=active` 的事项,并安全截取最近 6 个;卡片只保留标题、截止日期(若有)、fact count 与最近 1 条 Fact 摘要,避免继续堆叠大块事实卡片
 - 用户可见文案不得直接暴露 `anchor_date / due_date / fact_index / event_assignment` 等内部字段名;相对日期缺少可靠锚点时,统一改写为用户能理解的提示,并明确只有补充"记录发生日期"后才能换算
 - 当 Evidence 已有可靠 anchor 后,当前视图要过滤掉"缺少记录发生日期 / 无法换算今天或周五"这类 stale date uncertainty;历史 Interpretation 保留,但可补充一条轻量提示: `已按 YYYY-MM-DD 换算相对日期。`
 - Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、AI 结果可继续纠正、原件独立保存与完整性校验;用户可见文案统一改成人话,不直接暴露 `AUTO / CONFIRM / NEEDS_CONTEXT` 等实现术语
@@ -635,6 +636,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 |---|---|---|
 | 2026-08-09 | Competition Event Control Center V1:Event 页支持改名 / Fact 纠正 / 记录日期补改 / 结档与重开,首页新增历史事项并将 `我刚存的` 改为 `最近证据` | 让 `我的事项` 成为用户纠正 AI 结果、补日期、结档和回看历史的主入口,同时保持旧记录兼容与哈希链不受影响 |
 | 2026-08-09 | Competition Release Hardening:普通页清理 provider/model/parser/run id 等 dev 痕迹,diagnostics 关闭即整组 404,Help 与 demo surface 做正式版收口 | 发布版默认只保留用户能理解的界面与安全错误面,同时继续保留同一套代码下的 diagnostics 能力 |
+| 2026-08-09 | Competition UI Round 1:重做全局导航与首页信息架构,词典改为 Header 抽屉,首页只保留 Hero / 主输入 / onboarding / active 事项 | 让第一次打开的普通用户先看懂如何放入记录,其它能力退到次级层级,同时不改变现有业务规则 |
 | 2026-08-07 | v1.0 初始版本 | — |
 | 2026-08-07 | 简化 slot_direction CHECK 写法;新增 §9 | 原写法正确,等价简化为 IN 单条件;NULL 由 SQLite 三值逻辑天然放行 |
 | 2026-08-07 | verify_chain 增加 checkpoint 校验;append_evidence 每 100 条自动打点 | 链尾截断此前无法检测 |

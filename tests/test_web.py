@@ -294,7 +294,7 @@ def test_diag_ocr_returns_404_when_diagnostics_disabled(tmp_path, monkeypatch):
     assert response.status_code == 404
 
 
-def test_index_hides_demo_threads_from_regular_users(tmp_path, monkeypatch):
+def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -302,40 +302,47 @@ def test_index_hides_demo_threads_from_regular_users(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     html = response.text
-    assert "把聊天截图、文字或文档放进来" in html
-    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事串起来。" in html
-    assert "可选：我的词典" in html
+    assert "把散落的沟通，整理成可以回看的事实。" in html
+    assert "聊天截图、文字、文件都可以" in html
+    assert "原始材料独立保存，AI 整理结果可以纠正。" in html
+    assert "WorkChain 帮你还原发生了什么、解释难懂表达，并把同一件事慢慢串起来。" in html
     assert "我的事项" in html
-    assert "历史事项" in html
+    assert "我的词典" in html
+    assert 'id="glossary-drawer"' in html
+    assert 'data-open-glossary' in html
+    assert 'id="mobile-nav-toggle"' in html
+    assert 'id="mobile-nav-panel"' in html
+    assert "补充信息（可选）" in html
+    assert "开始整理" in html
+    assert "① 放进记录" in html
     assert "看看示例" not in html
     assert 'data-testid="thread-card"' not in html
-    assert "导出完整举证包" in html
-    assert "包含你的全部记录与校验工具" in html
-    assert "填了之后系统才知道哪句话是你说的" not in html
-    assert "你在对话里叫什么" not in html
-    assert 'id="self-name-input"' not in html
-    assert "你手上的事" not in html
-    assert "保存" in html
-    assert "存证" not in html
-    assert "新增词条" in html
+    assert "历史事项" not in html
+    assert "最近证据" not in html
+    assert "导出完整举证包" not in html
+    assert "参考信息" not in html
+    assert 'lg:grid-cols-[300px_minmax(0,1fr)]' not in html
 
 
-def test_index_contains_reference_section_and_reference_texts(tmp_path, monkeypatch):
+def test_index_contains_glossary_drawer_shell_and_settings_controls(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
         response = client.get("/")
 
     html = response.text
-    assert "参考信息" in html
-    assert "已识别为参考信息,未计入待办" in html
-    assert "昨天楼下咖啡店又涨价了" in html
-    assert "公司统一放假半天" in html
-    assert "中午点什么外卖" in html
-    assert "下周一开始工位调整" in html
+    assert 'id="glossary-drawer"' in html
+    assert 'id="glossary-overlay"' in html
+    assert 'id="glossary-list"' in html
+    assert 'id="add-glossary-row"' in html
+    assert 'id="save-settings"' in html
+    assert 'id="new-glossary-form"' in html
+    assert 'fetch("/api/settings")' in html
+    assert 'fetch("/api/settings", {' in html
+    assert "openGlossary" in html
 
 
-def test_index_shows_real_event_in_my_events_without_exposing_demo_threads(tmp_path, monkeypatch):
+def test_index_shows_real_event_in_my_events_without_secondary_home_sections(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     parsed = _semantic_result(
@@ -382,6 +389,9 @@ def test_index_shows_real_event_in_my_events_without_exposing_demo_threads(tmp_p
     assert "补签供应商合同" in html
     assert "看看示例" not in html
     assert 'data-testid="thread-card"' not in html
+    assert "历史事项" not in html
+    assert "最近证据" not in html
+    assert "导出完整举证包" not in html
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:
@@ -901,7 +911,7 @@ def test_correct_event_fact_rejects_provenance_tampering_fields(tmp_path, monkey
     assert [item["evidence_id"] for item in evidence_rows] == [row["evidence_id"]]
 
 
-def test_recent_record_prefers_semantic_facts_and_event_status(tmp_path, monkeypatch):
+def test_home_event_card_prefers_semantic_fact_summary(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, _ = _make_client(tmp_path, monkeypatch)
     parsed = _semantic_result(
@@ -943,11 +953,11 @@ def test_recent_record_prefers_semantic_facts_and_event_status(tmp_path, monkeyp
 
     assert create_response.status_code == 200
     assert "系统整理：补签供应商合同。" in index_response.text
-    assert "已自动归入事项：补签供应商合同" in index_response.text
+    assert "补签供应商合同" in index_response.text
     assert "截止：" not in index_response.text
 
 
-def test_home_page_contains_mutually_exclusive_input_copy_and_record_date_field(tmp_path, monkeypatch):
+def test_home_page_contains_optional_meta_fields_example_chips_and_mutually_exclusive_input(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -958,6 +968,14 @@ def test_home_page_contains_mutually_exclusive_input_copy_and_record_date_field(
     assert 'id="file-picker-region"' in response.text
     assert 'id="text-mode-hint"' in response.text
     assert "清空文字后可改用文件" in response.text
+    assert 'data-fill-example="temporary-change"' in response.text
+    assert 'data-fill-example="two-things"' in response.text
+    assert 'data-fill-example="office-jargon"' in response.text
+    assert "不知道放什么？试试看：" in response.text
+    assert "EXAMPLE_TEXTS" in response.text
+    assert "clearSelectedFile();" in response.text
+    assert "textarea.value = exampleText;" in response.text
+    assert "syncInputMode();" in response.text
     assert 'min="1900-01-01"' in response.text
     assert 'max="2100-12-31"' in response.text
     assert 'textInputRegion.classList.toggle("hidden", hideTextInput);' in response.text
@@ -968,94 +986,6 @@ def test_home_page_contains_mutually_exclusive_input_copy_and_record_date_field(
     assert "这段记录发生日期（可选）" in response.text
     assert "有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。" in response.text
     assert "recordDateInput.reportValidity();" in response.text
-
-
-def test_home_recent_record_shows_pending_assignment_panel_and_reuses_detail_endpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
-    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
-    parsed = _semantic_result(
-        facts=[
-            {
-                "fact_type": "request",
-                "content": "请补一版渠道复盘。",
-                "actors": [],
-                "due_raw": None,
-                "due_date": None,
-                "due_anchor_date": None,
-                "occurred_date": None,
-                "confidence": 0.85,
-            }
-        ]
-    )
-    normalized_match = {
-        "groups": [
-            {
-                "fact_indexes": [0],
-                "target": "existing",
-                "event_id": "evt-1",
-                "proposed_title": None,
-                "confidence": 0.72,
-                "reason": "像是在延续旧事项",
-            }
-        ],
-        "ambiguities": [],
-    }
-
-    with client:
-        client.get("/")
-        db_path = _sandbox_db_path(client, sandbox_root)
-        conn = init_db(db_path)
-        try:
-            conn.execute(
-                """
-                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                ("evt-1", "渠道复盘", "active", None, 1, 1),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
-            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
-                create_response = client.post(
-                    "/api/evidence",
-                    json={"text": "请补一版渠道复盘。", "source": "飞书", "source_detail": "项目复盘群"},
-                )
-                evidence_id = create_response.json()["evidence_id"]
-                home_response = client.get("/")
-                detail_response = client.get(f"/evidence/{evidence_id}")
-
-        conn = init_db(db_path)
-        try:
-            match_run_id = conn.execute(
-                """
-                SELECT event_match_run_id
-                FROM event_match_runs
-                ORDER BY created_at DESC, event_match_run_id DESC
-                LIMIT 1
-                """
-            ).fetchone()["event_match_run_id"]
-        finally:
-            conn.close()
-
-        confirm_response = client.post(
-            f"/api/evidence/{evidence_id}/event-assignment",
-            json={
-                "event_match_run_id": match_run_id,
-                "groups": [{"group_index": 0, "choice": "existing", "event_id": "evt-1"}],
-            },
-        )
-        refreshed_home = client.get("/")
-
-    endpoint = f'data-event-assignment-endpoint="/api/evidence/{evidence_id}/event-assignment"'
-    assert create_response.status_code == 200
-    assert confirm_response.status_code == 200
-    assert "AI认为这属于以下事项，请你确认。" in home_response.text
-    assert "data-event-assignment-form" in home_response.text
-    assert endpoint in home_response.text
-    assert endpoint in detail_response.text
-    assert "渠道复盘" in refreshed_home.text
 
 
 def test_home_event_card_shows_due_text_when_event_has_due_at(tmp_path, monkeypatch):
@@ -1101,6 +1031,135 @@ def test_home_event_card_shows_due_text_when_event_has_due_at(tmp_path, monkeypa
     assert response.status_code == 200
     assert "渠道复盘" in home_response.text
     assert "截止：08-08" in home_response.text
+
+
+def test_home_page_limits_active_event_cards_to_six(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        for index in range(7):
+            event_id = f"evt_limit_{index}"
+            fact_id = f"fact_limit_{index}"
+            evidence_id = f"ev_limit_{index}"
+            timestamp = 1_000 + index
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, f"事项 {index}", "active", None, timestamp, timestamp),
+            )
+            conn.execute(
+                """
+                INSERT INTO evidence (
+                    evidence_id, seq, thread_id, kind, media_type, blob_path, raw_text, source_hint,
+                    slot_requester, slot_owner, slot_deliverable, slot_due, slot_due_raw, slot_direction,
+                    slots_filled, plain_summary, caveats, occurred_at, captured_at,
+                    content_hash, prev_hash, chain_hash
+                ) VALUES (?, ?, NULL, 'reference', 'text', NULL, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, '[]', ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    100 + index,
+                    f"原文 {index}",
+                    "飞书-项目复盘群",
+                    timestamp,
+                    timestamp,
+                    f"hash_{index}",
+                    f"prev_{index}",
+                    f"chain_{index}",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO facts (
+                    fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw, due_anchor_at,
+                    confidence, event_assignment, event_assignment_confidence, origin, review_status,
+                    semantic_run_id, created_at, updated_at
+                ) VALUES (?, ?, 'request', ?, ?, NULL, NULL, NULL, NULL, 'confirmed', NULL, 'ai', 'unreviewed', NULL, ?, ?)
+                """,
+                (fact_id, event_id, f"事项 {index} 的摘要", timestamp, timestamp, timestamp),
+            )
+            conn.execute(
+                "INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)",
+                (fact_id, evidence_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert response.text.count('data-testid="event-card"') == 6
+    assert "事项 6" in response.text
+    assert "事项 0" not in response.text
+
+
+def test_home_event_card_shows_only_latest_single_fact_summary(tmp_path, monkeypatch):
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        conn.execute(
+            """
+            INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+            VALUES ('evt_summary', '事项摘要测试', 'active', NULL, 1, 1)
+            """
+        )
+        for fact_index, content in enumerate(["更早的一条摘要", "最新的一条摘要"], start=1):
+            evidence_id = f"ev_summary_{fact_index}"
+            fact_id = f"fact_summary_{fact_index}"
+            conn.execute(
+                """
+                INSERT INTO evidence (
+                    evidence_id, seq, thread_id, kind, media_type, blob_path, raw_text, source_hint,
+                    slot_requester, slot_owner, slot_deliverable, slot_due, slot_due_raw, slot_direction,
+                    slots_filled, plain_summary, caveats, occurred_at, captured_at,
+                    content_hash, prev_hash, chain_hash
+                ) VALUES (?, ?, NULL, 'reference', 'text', NULL, ?, '飞书-项目复盘群', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, '[]', ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    200 + fact_index,
+                    content,
+                    fact_index,
+                    fact_index,
+                    f"hash_s_{fact_index}",
+                    f"prev_s_{fact_index}",
+                    f"chain_s_{fact_index}",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO facts (
+                    fact_id, event_id, fact_type, content, occurred_at, due_at, due_raw, due_anchor_at,
+                    confidence, event_assignment, event_assignment_confidence, origin, review_status,
+                    semantic_run_id, created_at, updated_at
+                ) VALUES (?, 'evt_summary', 'statement', ?, ?, NULL, NULL, NULL, NULL, 'confirmed', NULL, 'ai', 'unreviewed', NULL, ?, ?)
+                """,
+                (fact_id, content, fact_index, fact_index, fact_index),
+            )
+            conn.execute("INSERT INTO fact_evidence (fact_id, evidence_id) VALUES (?, ?)", (fact_id, evidence_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "事项摘要测试" in response.text
+    assert "最新的一条摘要" in response.text
+    assert "更早的一条摘要" not in response.text
 
 
 def test_user_facing_pages_hide_internal_semantic_field_names(tmp_path, monkeypatch):
@@ -1177,7 +1236,7 @@ def test_user_facing_pages_hide_internal_semantic_field_names(tmp_path, monkeypa
         assert token not in detail_visible
 
 
-def test_recent_record_falls_back_for_legacy_row_without_semantic_run(tmp_path, monkeypatch):
+def test_home_page_does_not_render_legacy_reference_content_without_event(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
@@ -1252,10 +1311,11 @@ def test_recent_record_falls_back_for_legacy_row_without_semantic_run(tmp_path, 
         response = client.get("/")
 
     assert response.status_code == 200
-    assert "旧摘要仍可展示" in response.text
-    assert "旧交付物" in response.text
-    assert "周五前" in response.text
-    assert "旧兼容提示" in response.text
+    home_visible = response.text.split("<script>", 1)[0]
+    assert "旧摘要仍可展示" not in home_visible
+    assert "旧交付物" not in home_visible
+    assert "周五前" not in home_visible
+    assert "旧兼容提示" not in home_visible
 
 
 def test_thread_channel_page_contains_10_evidence_cards(tmp_path, monkeypatch):
@@ -1591,7 +1651,7 @@ def test_post_evidence_appends_reference_record(tmp_path, monkeypatch):
     assert _sandbox_db_path(client, sandbox_root).exists()
 
 
-def test_index_shows_recent_user_records_after_post(tmp_path, monkeypatch):
+def test_index_keeps_home_focused_after_post_without_recent_records_list(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
@@ -1602,13 +1662,13 @@ def test_index_shows_recent_user_records_after_post(tmp_path, monkeypatch):
         response = client.get("/")
 
     assert response.status_code == 200
-    assert "最近证据" in response.text
-    assert "按保存顺序保留的原始材料，用于回看和核对。" in response.text
-    assert "李娜刚补了一句" in response.text
-    assert "导出我的记录(PDF)" in response.text
+    assert "最近证据" not in response.text
+    assert "李娜刚补了一句" not in response.text
+    assert "导出我的记录(PDF)" not in response.text
+    assert "还没有事项。放进第一条记录后，WorkChain 会帮你把相关事实串起来。" in response.text
 
 
-def test_index_contains_full_long_text_in_html(tmp_path, monkeypatch):
+def test_index_does_not_dump_full_long_raw_text_on_home(tmp_path, monkeypatch):
     client, _, _ = _make_client(tmp_path, monkeypatch)
     long_text = "这是一条很长的原文。\\n" + ("后续细节" * 30)
 
@@ -1620,7 +1680,7 @@ def test_index_contains_full_long_text_in_html(tmp_path, monkeypatch):
         response = client.get("/")
 
     assert response.status_code == 200
-    assert long_text in response.text
+    assert long_text not in response.text
 
 
 def test_evidence_detail_returns_full_text_for_current_sandbox(tmp_path, monkeypatch):
@@ -2993,7 +3053,7 @@ def test_patch_sets_verified_flag_and_pages_show_badge(tmp_path, monkeypatch):
         conn.close()
 
     assert "已确认" in detail_response.text
-    assert "已确认" in index_response.text
+    assert "已确认" not in index_response.text
 
 
 def test_patch_ocr_text_updates_raw_text_without_changing_hashes_and_keeps_verify_chain_valid(tmp_path, monkeypatch):
@@ -4216,9 +4276,9 @@ def test_two_clients_do_not_see_each_other_records(tmp_path, monkeypatch):
         home_a = client_a.get("/")
         home_b = client_b.get("/")
 
-    assert "只属于 A 的内容" in home_a.text
+    assert "只属于 A 的内容" not in home_a.text
     assert "只属于 B 的内容" not in home_a.text
-    assert "只属于 B 的内容" in home_b.text
+    assert "只属于 B 的内容" not in home_b.text
     assert "只属于 A 的内容" not in home_b.text
 
 
@@ -5680,13 +5740,11 @@ def test_event_status_moves_between_active_and_history_without_touching_facts_or
     assert resolve_response.status_code == 200
     assert resolve_response.json()["status"] == "resolved"
     assert 'data-testid="event-card"' not in resolved_home.text
-    assert 'data-testid="history-event-card"' in resolved_home.text
-    assert "补签供应商合同" in resolved_home.text
+    assert "补签供应商合同" not in resolved_home.text
     assert "重新打开" in resolved_detail.text
     assert reopen_response.status_code == 200
     assert reopen_response.json()["status"] == "active"
     assert 'data-testid="event-card"' in reopened_home.text
-    assert 'data-testid="history-event-card"' not in reopened_home.text
     assert after_counts["status"] == "active"
     assert after_counts["fact_count"] == before_counts["fact_count"] == 1
     assert after_counts["link_count"] == before_counts["link_count"] == 1
