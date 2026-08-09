@@ -492,6 +492,231 @@ def test_recent_record_prefers_semantic_facts_and_event_status(tmp_path, monkeyp
     assert create_response.status_code == 200
     assert "系统整理：补签供应商合同。" in index_response.text
     assert "已自动归入事项：补签供应商合同" in index_response.text
+    assert "截止：" not in index_response.text
+
+
+def test_home_page_contains_mutually_exclusive_input_copy_and_record_date_field(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert 'id="input-mode-hint"' in response.text
+    assert "本次已选择文字记录" in response.text
+    assert "本次已选择文件" in response.text
+    assert "textarea.disabled = disableTextarea" in response.text
+    assert "fileInput.disabled = disableFileInput" in response.text
+    assert 'name="record_date"' in response.text
+    assert "这段记录发生日期（可选）" in response.text
+    assert "不会自动拿上传时间代替" in response.text
+
+
+def test_home_recent_record_shows_pending_assignment_panel_and_reuses_detail_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请补一版渠道复盘。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.85,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "像是在延续旧事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "渠道复盘", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请补一版渠道复盘。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+                home_response = client.get("/")
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+        conn = init_db(db_path)
+        try:
+            match_run_id = conn.execute(
+                """
+                SELECT event_match_run_id
+                FROM event_match_runs
+                ORDER BY created_at DESC, event_match_run_id DESC
+                LIMIT 1
+                """
+            ).fetchone()["event_match_run_id"]
+        finally:
+            conn.close()
+
+        confirm_response = client.post(
+            f"/api/evidence/{evidence_id}/event-assignment",
+            json={
+                "event_match_run_id": match_run_id,
+                "groups": [{"group_index": 0, "choice": "existing", "event_id": "evt-1"}],
+            },
+        )
+        refreshed_home = client.get("/")
+
+    endpoint = f'data-event-assignment-endpoint="/api/evidence/{evidence_id}/event-assignment"'
+    assert create_response.status_code == 200
+    assert confirm_response.status_code == 200
+    assert "AI认为这属于以下事项，请你确认。" in home_response.text
+    assert "data-event-assignment-form" in home_response.text
+    assert endpoint in home_response.text
+    assert endpoint in detail_response.text
+    assert "渠道复盘" in refreshed_home.text
+
+
+def test_home_event_card_shows_due_text_when_event_has_due_at(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "张伟要求下周五前提交渠道复盘数据。",
+                "actors": [],
+                "due_raw": "下周五",
+                "due_date": "2026-08-08",
+                "due_anchor_date": "2026-08-08",
+                "occurred_date": None,
+                "confidence": 0.95,
+            }
+        ]
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "渠道复盘",
+                "confidence": 0.95,
+                "reason": "这是一件新的渠道复盘事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                response = client.post(
+                    "/api/evidence",
+                    json={"text": "张伟说下周五前提交渠道复盘数据。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                home_response = client.get("/")
+
+    assert response.status_code == 200
+    assert "渠道复盘" in home_response.text
+    assert "截止：08-08" in home_response.text
+
+
+def test_user_facing_pages_hide_internal_semantic_field_names(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请周五前补材料。",
+                "actors": [],
+                "due_raw": "周五",
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.8,
+            }
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "uncertainty",
+                "content": "由于缺少 anchor_date，无法将“周五”换算为具体日期。",
+                "confidence": 0.6,
+            }
+        ],
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0],
+                "target": "existing",
+                "event_id": "evt-1",
+                "proposed_title": None,
+                "confidence": 0.72,
+                "reason": "建议复查 event_assignment、fact_index 和 due_date。",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO events (event_id, title, status, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                ("evt-1", "补材料", "active", None, 1, 1),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+            with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+                response = client.post(
+                    "/api/evidence",
+                    json={"text": "请周五前补材料。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = response.json()["evidence_id"]
+                home_response = client.get("/")
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert response.status_code == 200
+    friendly_copy = "还无法确定“周五”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
+    assert friendly_copy in detail_response.text
+    home_visible = home_response.text.split("<script>", 1)[0]
+    detail_visible = detail_response.text.split("<script>", 1)[0]
+    for token in ("anchor_date", "due_date", "fact_index", "event_assignment"):
+        assert token not in home_visible
+        assert token not in detail_visible
 
 
 def test_recent_record_falls_back_for_legacy_row_without_semantic_run(tmp_path, monkeypatch):
@@ -1372,12 +1597,12 @@ def test_image_upload_without_ocr_does_not_consume_daily_parse_quota(tmp_path, m
         conn.close()
 
 
-def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypatch):
+def test_image_upload_without_text_preserves_attachment_raw_text(tmp_path, monkeypatch):
     _disable_external_ai(monkeypatch)
     client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
 
     with client:
-        response = _upload_png(client, filename="annotated.png", text="这是我补充的说明")
+        response = _upload_png(client, filename="annotated.png", text="")
 
     assert response.status_code == 200
     evidence_id = response.json()["evidence_id"]
@@ -1390,7 +1615,7 @@ def test_text_and_file_together_store_text_into_plain_summary(tmp_path, monkeypa
         ).fetchone()
         assert row["media_type"] == "image"
         assert row["raw_text"] == "[图片] annotated.png"
-        assert row["plain_summary"] == "这是我补充的说明"
+        assert row["plain_summary"] is None
     finally:
         conn.close()
 
@@ -1563,9 +1788,9 @@ def test_multipart_file_only_submission_returns_200(tmp_path, monkeypatch):
     assert response.json()["media_type"] == "image"
 
 
-def test_multipart_text_and_file_submission_returns_200(tmp_path, monkeypatch):
+def test_multipart_text_and_file_submission_returns_400(tmp_path, monkeypatch):
     _disable_external_ai(monkeypatch)
-    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    client, _, _ = _make_client(tmp_path, monkeypatch)
 
     with client:
         response = _multipart_request(
@@ -1574,18 +1799,8 @@ def test_multipart_text_and_file_submission_returns_200(tmp_path, monkeypatch):
             file_part=("x.png", PNG_BYTES, "image/png"),
         )
 
-    assert response.status_code == 200
-    evidence_id = response.json()["evidence_id"]
-    db_path = _sandbox_db_path(client, sandbox_root)
-    conn = init_db(db_path)
-    try:
-        row = conn.execute(
-            "SELECT plain_summary FROM evidence WHERE evidence_id = ?",
-            (evidence_id,),
-        ).fetchone()
-        assert row["plain_summary"] == "说明"
-    finally:
-        conn.close()
+    assert response.status_code == 400
+    assert response.json()["detail"] == "文字记录和文件不能同时提交，请二选一。"
 
 
 def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchable(tmp_path, monkeypatch):
@@ -3473,6 +3688,20 @@ def test_post_evidence_rejects_empty_text_and_too_long_text(tmp_path, monkeypatc
     assert long_response.status_code == 400
 
 
+def test_post_evidence_rejects_text_and_file_together(tmp_path, monkeypatch):
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        response = _multipart_request(
+            client,
+            data={"text": "这次既有文字也有文件", "source": "飞书", "source_detail": "项目复盘群"},
+            file_part=("note.txt", "文件内容".encode("utf-8"), "text/plain"),
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "文字记录和文件不能同时提交，请二选一。"
+
+
 def test_two_clients_do_not_see_each_other_records(tmp_path, monkeypatch):
     demo_dir = tmp_path / "web_demo_data"
     sandbox_root = tmp_path / "sandboxes"
@@ -4551,6 +4780,31 @@ def test_parse_pipeline_passes_glossary_source_hint_and_anchor_none(tmp_path, mo
     assert captured["anchor_date"] is None
     assert captured["glossary"] == [{"term": "活爹", "kind": "person", "meaning": "张伟"}]
     assert captured["source_hint"] == "飞书-项目复盘群"
+
+
+def test_parse_pipeline_uses_explicit_record_date_as_anchor_date(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        captured["anchor_date"] = anchor_date
+        return _semantic_result()
+
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+        with client:
+            response = client.post(
+                "/api/evidence",
+                json={
+                    "text": "周五前补一版。",
+                    "source": "飞书",
+                    "source_detail": "项目复盘群",
+                    "record_date": "2026-08-08",
+                },
+            )
+
+    assert response.status_code == 200
+    assert captured["anchor_date"] == "2026-08-08"
 
 
 def test_parse_pipeline_does_not_pass_self_names_or_counterpart(tmp_path, monkeypatch):

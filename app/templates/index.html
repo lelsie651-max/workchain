@@ -116,6 +116,7 @@
                         </button>
                         <p class="text-sm text-slate-500">支持粘贴图片、拖拽文件,一次只放一个,单个不超过 8 MB</p>
                     </div>
+                    <p id="input-mode-hint" class="mt-3 text-sm text-cyan-200" aria-live="polite"></p>
                     <div id="file-preview" class="mt-4 hidden rounded-2xl border border-slate-800 bg-slate-900/70 p-4">
                         <div class="flex items-start justify-between gap-4">
                             <div class="min-w-0 flex-1">
@@ -170,6 +171,18 @@
                         class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40 md:col-span-2"
                     >
                 </div>
+                <div class="mt-3 grid gap-3 md:grid-cols-2">
+                    <div>
+                        <label for="record-date" class="mb-2 block text-sm text-slate-300">这段记录发生日期（可选）</label>
+                        <input
+                            id="record-date"
+                            name="record_date"
+                            type="date"
+                            class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                        >
+                    </div>
+                    <p class="self-end pb-1 text-sm leading-6 text-slate-500">只有你明确填写时，系统才会把相对日期换算成具体日期；不会自动拿上传时间代替。</p>
+                </div>
 
                 <div class="mt-4 flex flex-wrap items-center gap-3">
                     <button
@@ -203,6 +216,9 @@
                 >
                     <h3 class="text-lg font-semibold text-white">{{ event.title }}</h3>
                     <p class="mt-3 text-sm text-slate-400">{{ event.fact_count }} 条事实 · 最近活动 {{ event.last_activity_text }}</p>
+                    {% if event.due_text %}
+                    <p class="mt-2 text-sm text-amber-200">截止：{{ event.due_text }}</p>
+                    {% endif %}
                     <div class="mt-4 space-y-3 text-sm text-slate-300">
                         {% for fact in event.recent_facts %}
                         <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3">
@@ -373,7 +389,13 @@
                             </div>
                             {% endfor %}
                         </div>
-                        {% if item.event_match %}
+                        {% if item.event_match and item.event_match.review_status == "pending" and item.event_match.routing_mode in ["confirm", "needs_context"] %}
+                        <div class="mt-3">
+                            {% set panel_event_match = item.event_match %}
+                            {% set panel_assignment_subject = item.assignment_subject %}
+                            {% include "_event_assignment_panel.html" %}
+                        </div>
+                        {% elif item.event_match %}
                         <p class="mt-3 text-sm text-slate-400">{{ item.event_match.message }}</p>
                         {% endif %}
                         {% else %}
@@ -492,12 +514,14 @@
         const sourceCustom = document.getElementById("source-custom");
         const sourceDetail = document.getElementById("source-detail");
         const counterpartInput = document.getElementById("counterpart-input");
+        const recordDateInput = document.getElementById("record-date");
         const message = document.getElementById("form-message");
         const flashBanner = document.getElementById("flash-banner");
         const submitButton = document.getElementById("submit-button");
         const dropzone = document.getElementById("evidence-dropzone");
         const fileInput = document.getElementById("file-input");
         const chooseFileButton = document.getElementById("choose-file-button");
+        const inputModeHint = document.getElementById("input-mode-hint");
         const filePreview = document.getElementById("file-preview");
         const filePreviewVisual = document.getElementById("file-preview-visual");
         const filePreviewName = document.getElementById("file-preview-name");
@@ -577,14 +601,44 @@
             }
         };
 
-        const syncTextareaMode = () => {
+        const setControlDisabledState = (node, disabled) => {
+            if (!node) {
+                return;
+            }
+            node.disabled = disabled;
+            node.classList.toggle("opacity-60", disabled);
+            node.classList.toggle("cursor-not-allowed", disabled);
+        };
+
+        const syncInputMode = () => {
             const hasFile = Boolean(selectedFile);
-            textarea.placeholder = hasFile ? "补充说明(可选)" : "粘贴聊天记录，或上传截图 / 文档";
-            textareaLabel.textContent = hasFile ? "补充说明(可选)" : "把记录贴进来";
+            const hasTextInput = textarea.value.trim().length > 0;
+            const disableFileInput = hasTextInput;
+            const disableTextarea = hasFile;
+
+            textarea.disabled = disableTextarea;
+            textarea.classList.toggle("opacity-60", disableTextarea);
+            textarea.classList.toggle("cursor-not-allowed", disableTextarea);
+            textarea.placeholder = hasFile ? "本次已选择文件，移除后可改回文字记录" : "粘贴聊天记录，或上传截图 / 文档";
+            textareaLabel.textContent = "把记录贴进来";
+
+            fileInput.disabled = disableFileInput;
+            setControlDisabledState(chooseFileButton, disableFileInput);
+
+            if (!inputModeHint) {
+                return;
+            }
+            if (hasFile) {
+                inputModeHint.textContent = "本次已选择文件";
+            } else if (hasTextInput) {
+                inputModeHint.textContent = "本次已选择文字记录";
+            } else {
+                inputModeHint.textContent = "";
+            }
         };
 
         const renderSelectedFile = () => {
-            syncTextareaMode();
+            syncInputMode();
             if (!selectedFile) {
                 revokePreviewUrl();
                 fileInput.value = "";
@@ -614,6 +668,10 @@
         };
 
         const setSelectedFile = (file) => {
+            if (textarea.value.trim()) {
+                syncInputMode();
+                return;
+            }
             selectedFile = namedFile(file);
             renderSelectedFile();
         };
@@ -670,6 +728,98 @@
             return { kind: "text", value: await response.text() };
         };
 
+        const syncEventAssignmentInputs = (scope = document) => {
+            scope.querySelectorAll("[data-event-assignment-form]").forEach((formNode) => {
+                formNode.querySelectorAll("[data-assignment-group]").forEach((groupNode) => {
+                    const select = groupNode.querySelector("[data-assignment-select]");
+                    const newTitleWrap = groupNode.querySelector("[data-new-title-wrap]");
+                    if (!select || !newTitleWrap) {
+                        return;
+                    }
+                    newTitleWrap.classList.toggle("hidden", select.value !== "new");
+                });
+            });
+        };
+
+        const buildEventAssignmentPayload = (formNode) => {
+            return {
+                event_match_run_id: formNode.dataset.eventMatchRunId,
+                groups: [...formNode.querySelectorAll("[data-assignment-group]")].map((groupNode) => {
+                    const groupIndex = Number(groupNode.dataset.groupIndex);
+                    const select = groupNode.querySelector("[data-assignment-select]");
+                    const newTitleInput = groupNode.querySelector("[data-new-title-input]");
+                    const selectedValue = select?.value || "unassigned";
+                    if (selectedValue === "new") {
+                        return {
+                            group_index: groupIndex,
+                            choice: "new",
+                            new_title: newTitleInput?.value || "",
+                        };
+                    }
+                    if (selectedValue === "unassigned") {
+                        return {
+                            group_index: groupIndex,
+                            choice: "unassigned",
+                        };
+                    }
+                    return {
+                        group_index: groupIndex,
+                        choice: "existing",
+                        event_id: selectedValue.replace("existing:", ""),
+                    };
+                }),
+            };
+        };
+
+        const bindEventAssignmentForms = (scope = document) => {
+            scope.querySelectorAll("[data-event-assignment-form]").forEach((formNode) => {
+                if (formNode.dataset.boundEventAssignment === "true") {
+                    return;
+                }
+                formNode.dataset.boundEventAssignment = "true";
+                formNode.querySelectorAll("[data-assignment-select]").forEach((node) => {
+                    node.addEventListener("change", () => syncEventAssignmentInputs(formNode));
+                });
+                formNode.addEventListener("submit", async (event) => {
+                    event.preventDefault();
+                    const saveButton = formNode.querySelector("[data-event-assignment-save]");
+                    const endpoint = formNode.dataset.eventAssignmentEndpoint;
+                    if (!endpoint) {
+                        return;
+                    }
+                    if (saveButton) {
+                        saveButton.disabled = true;
+                        saveButton.classList.add("opacity-60", "cursor-not-allowed");
+                    }
+                    try {
+                        const response = await fetch(endpoint, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(buildEventAssignmentPayload(formNode)),
+                        });
+                        const data = await response.json();
+                        if (!response.ok) {
+                            showBanner(data.detail || "确认归属失败", "error");
+                            return;
+                        }
+                        sessionStorage.setItem(
+                            "workchainFlash",
+                            JSON.stringify({ tone: "success", text: "事项归属已确认" }),
+                        );
+                        window.location.reload();
+                    } catch (error) {
+                        showBanner("确认归属失败，请稍后再试", "error");
+                    } finally {
+                        if (saveButton) {
+                            saveButton.disabled = false;
+                            saveButton.classList.remove("opacity-60", "cursor-not-allowed");
+                        }
+                    }
+                });
+            });
+            syncEventAssignmentInputs(scope);
+        };
+
         const submitForm = async () => {
             message.textContent = "";
             setSubmitting(true);
@@ -680,6 +830,7 @@
             formData.append("source", selectedSource);
             formData.append("source_detail", sourceDetail.value.trim());
             formData.append("counterpart", counterpartInput.value.trim());
+            formData.append("record_date", recordDateInput.value);
             if (selectedFile) {
                 formData.append("file", selectedFile, fallbackFileName(selectedFile));
             }
@@ -720,6 +871,7 @@
 
                 textarea.value = "";
                 counterpartInput.value = "";
+                recordDateInput.value = "";
                 clearSelectedFile();
                 sessionStorage.setItem(
                     "workchainFlash",
@@ -767,8 +919,10 @@
                     `).join("");
                     target.innerHTML = `
                         <div class="space-y-2">${factHtml}</div>
-                        ${eventMatch?.message ? `<p class="mt-3 text-slate-400">${escapeHtml(eventMatch.message)}</p>` : ""}
+                        ${payload.event_assignment_panel_html || ""}
+                        ${!payload.event_assignment_panel_html && eventMatch?.message ? `<p class="mt-3 text-slate-400">${escapeHtml(eventMatch.message)}</p>` : ""}
                     `;
+                    bindEventAssignmentForms(target);
                     return;
                 }
                 const caveats = (payload.caveats || []).map((item) => `<p class="text-yellow-200">${escapeHtml(item)}</p>`).join("");
@@ -894,10 +1048,13 @@
 
         sourceSelect.addEventListener("change", syncCustomSource);
         syncCustomSource();
-        syncTextareaMode();
+        syncInputMode();
         renderSelectedFile();
 
         chooseFileButton.addEventListener("click", () => {
+            if (chooseFileButton.disabled) {
+                return;
+            }
             fileInput.click();
         });
 
@@ -925,6 +1082,10 @@
         dropzone.addEventListener("drop", (event) => {
             event.preventDefault();
             dropzone.classList.remove("border-cyan-400/50", "bg-cyan-400/5");
+            if (textarea.value.trim()) {
+                syncInputMode();
+                return;
+            }
             const [file] = event.dataTransfer?.files || [];
             if (file) {
                 setSelectedFile(file);
@@ -944,6 +1105,8 @@
             event.preventDefault();
             setSelectedFile(file);
         });
+
+        textarea.addEventListener("input", syncInputMode);
 
         toggleButtons.forEach((button) => {
             button.addEventListener("click", () => {
@@ -1050,6 +1213,7 @@
 
         renderGlossary();
         syncGlossaryMobileState();
+        bindEventAssignmentForms();
         pendingCards.forEach((card) => pollParseStatus(card));
         window.addEventListener("beforeunload", revokePreviewUrl);
     })();

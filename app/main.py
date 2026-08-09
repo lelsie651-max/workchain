@@ -108,6 +108,85 @@ def _format_datetime(value: int | None, fmt: str) -> str | None:
     return datetime.fromtimestamp(value / 1000).strftime(fmt)
 
 
+def _parse_status_label(status: str | None) -> str:
+    mapping = {
+        PARSE_STATUS_OCR_RUNNING: "正在读取图片中的文字",
+        PARSE_STATUS_LLM_RUNNING: "正在理解这段记录",
+        PARSE_STATUS_DONE: "已完成",
+        PARSE_STATUS_FAILED: "暂不可用",
+        PARSE_STATUS_UNSUPPORTED: "当前不支持自动解析",
+    }
+    return mapping.get(status, status or "未知")
+
+
+def _format_due_display(value: int | None) -> str | None:
+    if value is None:
+        return None
+    due_dt = datetime.fromtimestamp(value / 1000)
+    current_year = datetime.now().year
+    if due_dt.year == current_year:
+        return due_dt.strftime("%m-%d")
+    return due_dt.strftime("%Y-%m-%d")
+
+
+def _friendly_interpretation_label(kind: str | None) -> str:
+    mapping = {
+        "explanation": "解释",
+        "term": "术语说明",
+        "action_hint": "补充建议",
+        "uncertainty": "还需要补充",
+    }
+    return mapping.get(kind or "", "说明")
+
+
+def _first_quoted_phrase(text: str) -> str | None:
+    patterns = [
+        r"[“\"]([^”\"]+)[”\"]",
+        r"[‘']([^’']+)[’']",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).strip() or None
+    return None
+
+
+def _humanize_user_facing_text(text: str | None) -> str | None:
+    if text is None:
+        return None
+    normalized = text.strip()
+    if not normalized:
+        return normalized
+    if "anchor_date" in normalized and "换算" in normalized:
+        quoted = _first_quoted_phrase(normalized)
+        if quoted:
+            return f"还无法确定“{quoted}”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
+        return "还无法把这类相对日期换算成具体日期。补充这段记录发生的日期后，可以换算成具体日期。"
+
+    replacements = {
+        "anchor_date": "记录发生日期",
+        "due_date": "具体日期",
+        "due_anchor_at": "日期换算依据",
+        "fact_index": "事实序号",
+        "event_assignment": "事项归属",
+    }
+    for old, new in replacements.items():
+        normalized = normalized.replace(old, new)
+    return normalized
+
+
+def _normalize_record_date_input(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    try:
+        return datetime.strptime(normalized, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="记录发生日期请按 YYYY-MM-DD 填写") from exc
+
+
 def _decode_json_array(value: str | None) -> list[str]:
     if not value:
         return []
@@ -382,6 +461,20 @@ def _extract_note_key(evidence_id: str) -> str:
 
 def _ocr_corrected_key(evidence_id: str) -> str:
     return f"ocr_corrected:{evidence_id}"
+
+
+def _set_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str, anchor_date: str | None) -> None:
+    key = _semantic_anchor_date_key(evidence_id)
+    if anchor_date is None:
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        conn.commit()
+        return
+    _set_meta_value(conn, key, anchor_date)
+    conn.commit()
+
+
+def _get_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    return _get_meta_value(conn, _semantic_anchor_date_key(evidence_id))
 
 
 def _set_extract_note(conn: sqlite3.Connection, evidence_id: str, note: str) -> None:
@@ -706,7 +799,8 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         help_items.append(
             {
                 "kind": item["kind"],
-                "content": item["content"],
+                "label": _friendly_interpretation_label(item["kind"]),
+                "content": _humanize_user_facing_text(item["content"]) or "",
                 "confidence": item["confidence"],
                 "is_uncertainty": item["kind"] == "uncertainty",
                 "fact_content": None if item["fact_id"] is None else fact_map.get(item["fact_id"], {}).get("content"),
@@ -805,7 +899,7 @@ def _build_event_match_groups(
             {
                 "group_index": group_index,
                 "ai_title": _event_title(conn, event_id) or proposed_title or "AI 未给出标题",
-                "reason": group.get("reason") if isinstance(group.get("reason"), str) else "",
+                "reason": _humanize_user_facing_text(group.get("reason")) if isinstance(group.get("reason"), str) else "",
                 "fact_items": _event_match_fact_items(conn, normalized_fact_ids),
                 "default_choice": default_choice,
                 "default_event_id": event_id,
@@ -930,6 +1024,29 @@ def _build_event_match_result(conn: sqlite3.Connection, semantic_run_id: str) ->
     return None
 
 
+def _should_show_event_assignment_panel(event_match: dict[str, Any] | None) -> bool:
+    if not isinstance(event_match, dict):
+        return False
+    return (
+        event_match.get("review_status") == "pending"
+        and event_match.get("routing_mode") in {"confirm", "needs_context"}
+        and bool(event_match.get("groups"))
+    )
+
+
+def _render_event_assignment_panel_html(
+    *,
+    event_match: dict[str, Any] | None,
+    evidence_id: str,
+) -> str | None:
+    if not _should_show_event_assignment_panel(event_match):
+        return None
+    return TEMPLATES.get_template("_event_assignment_panel.html").render(
+        panel_event_match=event_match,
+        panel_assignment_subject={"evidence_id": evidence_id},
+    )
+
+
 def _event_matcher_fact_payload(conn: sqlite3.Connection, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     payloads: list[dict[str, Any]] = []
     for fact in facts:
@@ -1016,6 +1133,7 @@ async def _parse_evidence_input(request: Request) -> dict[str, Any]:
             "source": str(form.get("source", "")).strip(),
             "source_detail": str(form.get("source_detail", "")).strip() or None,
             "counterpart": str(form.get("counterpart", "")).strip() or None,
+            "record_date": _normalize_record_date_input(form.get("record_date")),
             "upload": upload,
             "file_bytes": file_bytes,
             "media_type": detected_media_type,
@@ -1028,6 +1146,7 @@ async def _parse_evidence_input(request: Request) -> dict[str, Any]:
         "source": str(payload.get("source", "")).strip(),
         "source_detail": None if payload.get("source_detail") is None else str(payload.get("source_detail")).strip() or None,
         "counterpart": None if payload.get("counterpart") is None else str(payload.get("counterpart")).strip() or None,
+        "record_date": _normalize_record_date_input(payload.get("record_date")),
         "upload": None,
         "file_bytes": None,
         "media_type": None,
@@ -1083,6 +1202,10 @@ def _parse_detail_key(evidence_id: str) -> str:
 
 def _semantic_diagnostic_key(semantic_run_id: str) -> str:
     return f"semantic_diagnostic:{semantic_run_id}"
+
+
+def _semantic_anchor_date_key(evidence_id: str) -> str:
+    return f"semantic_anchor_date:{evidence_id}"
 
 
 def _verified_key(evidence_id: str) -> str:
@@ -1387,6 +1510,7 @@ def _run_parse_pipeline(
     transcript = None
     observations: list[dict[str, Any]] = []
     glossary: list[dict[str, Any]] = []
+    anchor_date: str | None = None
     try:
         evidence_row = conn.execute(
             "SELECT evidence_id, source_hint FROM evidence WHERE evidence_id = ?",
@@ -1395,6 +1519,7 @@ def _run_parse_pipeline(
         extraction = get_latest_extraction(conn, evidence_id)
         if evidence_row is not None:
             glossary = get_settings(sandbox_db_path).get("glossary", [])
+            anchor_date = _get_semantic_anchor_date(conn, evidence_id)
         if extraction is not None:
             transcript = extraction.get("transcript")
             observations = extraction.get("observations") if isinstance(extraction.get("observations"), list) else []
@@ -1426,7 +1551,7 @@ def _run_parse_pipeline(
             provider="deepseek",
             model=get_text_model(),
             parser_version=semantic_llm.SEMANTIC_PARSER_VERSION,
-            anchor_date=None,
+            anchor_date=anchor_date,
             supersedes_run_id=None if previous_run is None else previous_run["semantic_run_id"],
             inputs=[
                 {
@@ -1597,7 +1722,7 @@ def _run_parse_pipeline(
         parsed = semantic_llm.extract_semantics(
             _llm_input_text(transcript) if transcript is not None else None,
             observations=observations,
-            anchor_date=None,
+            anchor_date=anchor_date,
             glossary=glossary,
             source_hint=evidence_row["source_hint"],
         )
@@ -1902,14 +2027,16 @@ def _prepare_recent_row(
         "raw_text_preview": _truncate_text(display_text),
         "is_long_text": len(display_text) > 100,
         "parse_status": row["parse_status"],
-        "parse_detail": row["parse_detail"],
-        "extract_note": row.get("extract_note"),
+        "parse_status_label": _parse_status_label(row["parse_status"]),
+        "parse_detail": _humanize_user_facing_text(row["parse_detail"]) or row["parse_detail"],
+        "extract_note": _humanize_user_facing_text(row.get("extract_note")) if row.get("extract_note") else None,
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
         "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
-        "caveats": _decode_json_array(row["caveats"]),
+        "caveats": [_humanize_user_facing_text(item) or item for item in _decode_json_array(row["caveats"])],
         "semantic_fact_preview": [] if semantic_result is None else semantic_result["facts"][:2],
         "event_match": None if semantic_result is None else semantic_result.get("event_match"),
+        "assignment_subject": {"evidence_id": row["evidence_id"]},
         "is_verified": bool(row["is_verified"]),
         "media_type": row["media_type"],
         "blob_url": f"/blob/{row['evidence_id']}" if row["media_type"] in {"image", "file"} else None,
@@ -1943,6 +2070,7 @@ def _prepare_event_card(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str,
         "title": row["title"],
         "fact_count": row["fact_count"],
         "last_activity_text": _format_datetime(row["last_activity_at"], "%m-%d %H:%M"),
+        "due_text": _format_due_display(row["due_at"]),
         "recent_facts": [
             {"fact_type": item["fact_type"], "content": item["content"]}
             for item in summary_rows
@@ -2139,6 +2267,7 @@ def _fetch_index_data(conn: sqlite3.Connection, sandbox: SandboxContext) -> dict
             ev.event_id,
             ev.title,
             COUNT(DISTINCT f.fact_id) AS fact_count,
+            MIN(f.due_at) AS due_at,
             MAX(COALESCE(f.occurred_at, f.updated_at, f.created_at, ev.updated_at)) AS last_activity_at
         FROM events AS ev
         JOIN facts AS f ON f.event_id = ev.event_id
@@ -2380,8 +2509,8 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "plain_summary": row["plain_summary"],
         "deliverable": row["slot_deliverable"],
         "due_date_value": _format_datetime(row["slot_due"], "%Y-%m-%d"),
-        "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
-        "caveats": _decode_json_array(row["caveats"]),
+        "due_text": row["slot_due_raw"] or _format_due_display(row["slot_due"]),
+        "caveats": [_humanize_user_facing_text(item) or item for item in _decode_json_array(row["caveats"])],
         "content_hash_prefix": (row["content_hash"] or "")[:12],
         "slots_filled": row["slots_filled"],
         "kind": row["kind"],
@@ -2396,6 +2525,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         "current_extraction": current_extraction,
         "extraction_history": extraction_history,
         "semantic_result": semantic_result,
+        "assignment_subject": {"evidence_id": row["evidence_id"]},
     }
 
 
@@ -2853,16 +2983,22 @@ def create_app() -> FastAPI:
             extract_note = _get_extract_note(conn, evidence_id)
             parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
             semantic_result = _build_semantic_result(conn, evidence_id)
+            event_match = None if semantic_result is None else semantic_result.get("event_match")
             return {
                 "parse_status": parse_status,
+                "parse_status_label": _parse_status_label(parse_status),
                 "slots_filled": row["slots_filled"],
                 "plain_summary": row["plain_summary"],
                 "deliverable": row["slot_deliverable"],
                 "due_text": row["slot_due_raw"] or _format_datetime(row["slot_due"], "%m-%d"),
-                "caveats": _decode_json_array(row["caveats"]),
+                "caveats": [_humanize_user_facing_text(item) or item for item in _decode_json_array(row["caveats"])],
                 "semantic_fact_preview": [] if semantic_result is None else semantic_result["facts"][:2],
-                "event_match": None if semantic_result is None else semantic_result.get("event_match"),
-                "detail": parse_detail,
+                "event_match": event_match,
+                "event_assignment_panel_html": _render_event_assignment_panel_html(
+                    event_match=event_match,
+                    evidence_id=evidence_id,
+                ),
+                "detail": _humanize_user_facing_text(parse_detail) or parse_detail,
                 "is_verified": _is_verified(conn, evidence_id),
                 "media_type": row["media_type"],
                 "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
@@ -3196,7 +3332,9 @@ def create_app() -> FastAPI:
         try:
             parse_status = _get_parse_status(status_conn, evidence_id)
             extract_note = _get_extract_note(status_conn, evidence_id)
-            parse_detail = extract_note or _get_parse_detail(status_conn, evidence_id)
+            parse_detail = _humanize_user_facing_text(extract_note or _get_parse_detail(status_conn, evidence_id)) or (
+                extract_note or _get_parse_detail(status_conn, evidence_id)
+            )
             is_verified = _is_verified(status_conn, evidence_id)
             is_ocr_corrected = _is_ocr_corrected(status_conn, evidence_id)
             diagnostics = None
@@ -3219,6 +3357,7 @@ def create_app() -> FastAPI:
                 "page_title": "记录详情",
                 "evidence": context,
                 "parse_status": parse_status,
+                "parse_status_label": _parse_status_label(parse_status),
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
                 "is_ocr_corrected": is_ocr_corrected,
@@ -3344,11 +3483,14 @@ def create_app() -> FastAPI:
     ) -> JSONResponse:
         payload = await _parse_evidence_input(request)
         text = payload["text"]
+        record_date = payload["record_date"]
         upload = payload["upload"]
         file_bytes = payload["file_bytes"]
         upload_media_type = payload["media_type"]
         if not text and file_bytes is None:
             raise HTTPException(status_code=400, detail="请输入内容或选择一个文件")
+        if text and file_bytes is not None:
+            raise HTTPException(status_code=400, detail="文字记录和文件不能同时提交，请二选一。")
         if len(text) > MAX_TEXT_LENGTH:
             raise HTTPException(status_code=400, detail="内容过长,请控制在 20000 字以内")
 
@@ -3466,6 +3608,8 @@ def create_app() -> FastAPI:
             _set_parse_detail(conn, row["evidence_id"], parse_detail)
             if extract_note is not None:
                 _set_extract_note(conn, row["evidence_id"], extract_note)
+            if record_date is not None:
+                _set_semantic_anchor_date(conn, row["evidence_id"], record_date)
         finally:
             conn.close()
 

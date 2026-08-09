@@ -113,7 +113,8 @@
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
-- production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date=None`;不传 `self_names`,也不使用 `counterpart` 参与事实判断
+- production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;不传 `self_names`,也不使用 `counterpart` 参与事实判断
+- `anchor_date` 默认保持 `None`;只有用户在首页明确填写"这段记录发生日期（可选）"时,才允许把该日期传给 Semantic Parser,绝不能自动拿 `captured_at` / 上传时间冒充发生日期
 - Transcript 与 Visual Observation 都属于 Evidence 的提取层,仍与后续 Fact / Event 解读层分离
 - Observation 可以支持 Fact / Interpretation 生成,但不得越过“画面直接可观察事实”边界;若与 transcript 冲突,应显式保留 uncertainty / ambiguity,不得静默脑补
 - Semantic Run 记录一次具体语义解析所使用的 provider / model / parser_version 以及精确 Evidence / Extraction 输入,供 Fact / Interpretation provenance 追溯;run 生命周期为 `running -> succeeded/failed`,新的 run 通过 `supersedes_run_id` 保留历史
@@ -592,10 +593,13 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 **已完成首版**
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
 - 首页主体验已切到 Event / Fact 体系:`我的事项` 只展示当前访客沙箱中的真实 `events + facts`
+- 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
 - 旧 demo threads 已降级为 `看看示例`,与真实 Event 分区展示,不再混为同一数据体系
-- `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要与事件归档状态;没有 Semantic Run 的旧记录继续回退兼容层
+- `我刚存的` 在存在成功 Semantic Run 时优先展示最新 Fact 摘要;若 latest Event Match 为 `pending` 且 routing_mode 为 `confirm / needs_context`,首页直接复用与详情页相同的事项归属确认面板,无需先进入详情页
 - 新增只读 Event 详情页(`/event/{event_id}`):按时间展示 Facts,并可回跳到支撑它的 Evidence 详情核对原始证据
-- Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,完成后展示最终事项归属结果
+- Evidence 详情页已支持 `confirm / needs_context` 的用户确认归属表单,并与首页共用同一服务端确认写入逻辑;完成后展示最终事项归属结果
+- 首页 `我的事项` 卡片会读取 Event 关联 Facts 中最早的有效 `due_at`;有明确日期时显示 `截止：MM-DD`(跨年则显示完整日期),没有 `due_at` 时不显示占位文案
+- 用户可见文案不得直接暴露 `anchor_date / due_date / fact_index / event_assignment` 等内部字段名;相对日期缺少可靠锚点时,统一改写为用户能理解的提示,并明确只有补充"记录发生日期"后才能换算
 - Help 文案已同步当前真实能力:匿名沙箱、24 小时清理、原件完整保存与校验、以及 `auto / confirm / needs_context` 的真实行为
 - 访客沙箱(`wc_sid`)与 24 小时过期清理
 - 图片/文档上传、预览、Lightbox
@@ -639,6 +643,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-09 | V7 新增 Event Match Run 履历,Production 改为 Semantic succeeded 后运行 Event Matcher | 让 Event 建议/自动归档同样具备 provenance,并明确只有 auto 会实际改写 Fact 归属 |
 | 2026-08-09 | V8 新增 Event Assignment Confirmation:pending/completed review 状态、Evidence 详情确认归属 UI、整批原子提交 | 让 confirm / needs_context 不再停留在只读建议,而是能由用户一次性确认归入已有事项、新建事项或暂不归入 |
 | 2026-08-09 | Competition UX V1:首页主体验切到真实 Event / Fact,新增只读 Event 详情页,Help 同步真实能力 | 让用户首先看到 `我的事项` 与可回看原始证据的事实链路,同时把 demo threads 降级为示例区并清理过时文案 |
+| 2026-08-09 | Competition Core UX Polish:首页输入互斥、首页直确认事项、人话日期提示、事项截止展示 | 抹平首页与详情之间的确认断点,并明确"记录发生日期"只能来自用户显式填写,不能自动借用上传时间 |
 
 ---
 
