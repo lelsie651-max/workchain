@@ -137,10 +137,10 @@ def _format_due_display(value: int | None) -> str | None:
 
 def _friendly_interpretation_label(kind: str | None) -> str:
     mapping = {
-        "explanation": "解释",
+        "explanation": "补充说明",
         "term": "术语说明",
-        "action_hint": "补充建议",
-        "uncertainty": "还需要补充",
+        "action_hint": "可以这样处理",
+        "uncertainty": "建议确认",
     }
     return mapping.get(kind or "", "说明")
 
@@ -953,7 +953,9 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         semantic_llm.is_relative_due_raw(fact.get("due_raw"))
         for fact in facts
     )
+    grouped_help_items: dict[str, list[dict[str, Any]]] = {fact["fact_id"]: [] for fact in facts}
     help_items = []
+    evidence_help_items = []
     filtered_stale_date_help_items = 0
     for item in interpretations:
         help_item = {
@@ -974,16 +976,21 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
         ):
             filtered_stale_date_help_items += 1
             continue
-        help_items.append(
-            {
-                "kind": help_item["kind"],
-                "label": help_item["label"],
-                "content": help_item["content"],
-                "confidence": help_item["confidence"],
-                "is_uncertainty": help_item["is_uncertainty"],
-                "fact_content": help_item["fact_content"],
-            }
-        )
+        public_help_item = {
+            "kind": help_item["kind"],
+            "label": help_item["label"],
+            "content": help_item["content"],
+            "confidence": help_item["confidence"],
+            "is_uncertainty": help_item["is_uncertainty"],
+            "fact_id": help_item["fact_id"],
+            "fact_content": help_item["fact_content"],
+        }
+        help_items.append(public_help_item)
+        fact_id = help_item["fact_id"]
+        if isinstance(fact_id, str) and fact_id in grouped_help_items:
+            grouped_help_items[fact_id].append(public_help_item)
+        else:
+            evidence_help_items.append(public_help_item)
     event_match = _build_event_match_result(conn, run["semantic_run_id"])
 
     return {
@@ -1002,10 +1009,12 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
                 "content": fact["content"],
                 "due_raw": fact["due_raw"],
                 "due_date_value": _format_datetime(fact["due_at"], "%Y-%m-%d"),
+                "help_items": grouped_help_items.get(fact["fact_id"], []),
             }
             for fact in facts
         ],
         "help_items": help_items,
+        "evidence_help_items": evidence_help_items,
         "event_match": event_match,
         "has_relative_due_raw": has_relative_due_raw,
         "record_date": anchor_date,

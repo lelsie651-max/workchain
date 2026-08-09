@@ -1206,6 +1206,9 @@ def test_image_evidence_detail_shows_processing_state_and_status_polling_script(
     html = detail_response.text
     assert "正在读取这份记录…" in html
     assert "刚刚这条记录" not in html
+    assert 'mt-6 grid gap-4 md:grid-cols-2' not in html
+    assert "保存与校验" not in html
+    assert "记录信息" in html
     assert f'const evidenceId = "{evidence_id}";' in html
     assert 'const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);' in html
     assert 'fetch(`/api/evidence/${evidenceId}/status`)' in html
@@ -1910,7 +1913,7 @@ def test_index_does_not_dump_full_long_raw_text_on_home(tmp_path, monkeypatch):
 
 
 def test_evidence_detail_returns_full_text_for_current_sandbox(tmp_path, monkeypatch):
-    client, _, _ = _make_client(tmp_path, monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
     full_text = "第一行\\n第二行\\n第三行，完整查看。"
 
     with client:
@@ -1921,10 +1924,133 @@ def test_evidence_detail_returns_full_text_for_current_sandbox(tmp_path, monkeyp
         evidence_id = create_response.json()["evidence_id"]
         response = client.get(f"/evidence/{evidence_id}")
 
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        row = conn.execute(
+            "SELECT substr(content_hash, 1, 12) AS content_hash_prefix FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
     assert response.status_code == 200
     assert full_text in response.text
     assert evidence_id in response.text
-    assert "不会影响完整性校验" in response.text
+    assert "记录信息" in response.text
+    assert f"内容摘要：{row['content_hash_prefix']}" in response.text
+    assert "完整性校验保护的是原始材料；修改 AI 整理结果不会改变原件。" in response.text
+
+
+def test_build_semantic_result_groups_help_items_by_fact_id_and_keeps_evidence_level_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "request",
+                "content": "请先补齐合同附件。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.9,
+            },
+            {
+                "fact_type": "statement",
+                "content": "付款口径还没统一。",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.82,
+            },
+        ],
+        interpretations=[
+            {
+                "fact_index": 0,
+                "kind": "term",
+                "content": "这里的附件指合同扫描件和盖章页。",
+                "confidence": 0.8,
+            },
+            {
+                "fact_index": 1,
+                "kind": "explanation",
+                "content": "说明付款口径还需要内部再对齐。",
+                "confidence": 0.75,
+            },
+        ],
+        ambiguities=["金额口径还需要人工核对。"],
+    )
+    normalized_match = {
+        "groups": [
+            {
+                "fact_indexes": [0, 1],
+                "target": "new",
+                "event_id": None,
+                "proposed_title": "合同与付款口径",
+                "confidence": 0.8,
+                "reason": "同一条记录里的相关事项",
+            }
+        ],
+        "ambiguities": [],
+    }
+
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                create_response = client.post(
+                    "/api/evidence",
+                    json={"text": "请先补齐合同附件，付款口径还没统一。", "source": "飞书", "source_detail": "项目复盘群"},
+                )
+                evidence_id = create_response.json()["evidence_id"]
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        semantic_result = main_module._build_semantic_result(conn, evidence_id)
+    finally:
+        conn.close()
+
+    assert create_response.status_code == 200
+    assert semantic_result is not None
+    assert all("fact_id" in item for item in semantic_result["help_items"])
+    facts_by_content = {item["content"]: item for item in semantic_result["facts"]}
+    first_fact = facts_by_content["请先补齐合同附件。"]
+    second_fact = facts_by_content["付款口径还没统一。"]
+    assert first_fact["help_items"] == [
+        {
+            "kind": "term",
+            "label": "术语说明",
+            "content": "这里的附件指合同扫描件和盖章页。",
+            "confidence": 0.8,
+            "is_uncertainty": False,
+            "fact_id": first_fact["fact_id"],
+            "fact_content": "请先补齐合同附件。",
+        }
+    ]
+    assert second_fact["help_items"] == [
+        {
+            "kind": "explanation",
+            "label": "补充说明",
+            "content": "说明付款口径还需要内部再对齐。",
+            "confidence": 0.75,
+            "is_uncertainty": False,
+            "fact_id": second_fact["fact_id"],
+            "fact_content": "付款口径还没统一。",
+        }
+    ]
+    assert semantic_result["evidence_help_items"] == [
+        {
+            "kind": "uncertainty",
+            "label": "建议确认",
+            "content": "金额口径还需要人工核对。",
+            "confidence": None,
+            "is_uncertainty": True,
+            "fact_id": None,
+            "fact_content": None,
+        }
+    ]
 
 
 def test_evidence_detail_returns_404_for_other_sandbox(tmp_path, monkeypatch):
@@ -2249,6 +2375,8 @@ def test_evidence_detail_prefers_extract_note_over_generic_unsupported_copy(tmp_
     assert detail_response.status_code == 200
     assert "图片识别未配置(DASHSCOPE_API_KEY 未设置)" in detail_response.text
     assert "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" not in detail_response.text
+    assert "记录信息" in detail_response.text
+    assert "保存与校验" not in detail_response.text
 
 
 def test_evidence_detail_uses_generic_copy_when_no_extract_note_exists(tmp_path, monkeypatch):
@@ -2332,9 +2460,14 @@ def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monk
     detail_details = re.search(r"<details[^>]*data-ocr-details[^>]*>", detail_response.text)
     assert detail_details is not None
     assert "open" not in detail_details.group(0)
-    assert detail_response.text.index("事实整理") < detail_response.text.index("看看系统读到了什么")
+    assert 'mt-6 grid gap-4 md:grid-cols-2' not in detail_response.text
+    assert "保存与校验" not in detail_response.text
+    assert detail_response.text.index("AI 整理") < detail_response.text.index("看看系统读到了什么")
     assert detail_response.text.index("有人要求在周五前交付渠道复盘数据。") < detail_response.text.index("看看系统读到了什么")
-    assert "AI帮你理解" in detail_response.text
+    assert "这句话怎么理解" in detail_response.text
+    assert "整体提醒" in detail_response.text
+    assert "建议确认" in detail_response.text
+    assert "还需要补充" not in detail_response.text
     assert "金额口径还需要人工核对。" in detail_response.text
 
 
@@ -3700,8 +3833,11 @@ def test_failed_reparse_keeps_previous_succeeded_semantic_run_and_detail_fallbac
 
     assert patch_response.status_code == 200
     assert status_response.json()["parse_status"] == "failed"
+    assert 'mt-6 grid gap-4 md:grid-cols-2' not in detail_response.text
+    assert "保存与校验" not in detail_response.text
     assert "有人要求在周五前交付渠道复盘数据。" in detail_response.text
     assert "金额口径仍需确认。" in detail_response.text
+    assert "记录信息" in detail_response.text
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
@@ -3753,6 +3889,8 @@ def test_detail_page_keeps_legacy_summary_when_no_semantic_run_exists(tmp_path, 
     assert "渠道复盘数据" in detail_response.text
     assert "先按旧口径展示" in detail_response.text
     assert "事实整理" not in detail_response.text
+    assert "兼容编辑" in detail_response.text
+    assert "记录信息" in detail_response.text
 
 
 def test_evidence_detail_shows_real_extraction_provider_and_model(tmp_path, monkeypatch):
@@ -4966,9 +5104,12 @@ def test_event_matcher_single_group_confirm_copy_and_options(tmp_path, monkeypat
     assert create_response.status_code == 200
     assert "AI认为这属于以下事项，请你确认。" in detail_response.text
     assert "这段记录可能涉及多个事项，请分别确认。" not in detail_response.text
+    assert detail_response.text.index("事项归属") < detail_response.text.index("AI 整理")
     assert "渠道复盘" in detail_response.text
     assert "＋新建事项…" in detail_response.text
     assert "暂不归入" in detail_response.text
+    assert "记录信息" in detail_response.text
+    assert "解析诊断" not in detail_response.text
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:
@@ -5750,6 +5891,9 @@ def test_evidence_detail_record_date_update_recomputes_due_without_calling_deeps
     friendly_copy = "还无法确定“周五”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
     assert create_response.status_code == 200
     assert friendly_copy in detail_before.text
+    assert "这份记录含有“今天 / 周五”等相对时间。" in detail_before.text
+    assert detail_before.text.index("AI 整理") < detail_before.text.index("这份记录含有“今天 / 周五”等相对时间。")
+    assert detail_before.text.index("这份记录含有“今天 / 周五”等相对时间。") < detail_before.text.index("事实 01")
     assert update_response.status_code == 200
     assert update_response.json()["updated_fact_count"] == 1
     assert fact_row["due_at"] == main_module.llm.due_date_to_millis("2026-08-14")
@@ -5760,8 +5904,10 @@ def test_evidence_detail_record_date_update_recomputes_due_without_calling_deeps
     assert anchor_meta[f"semantic_anchor_source:{evidence_id}"] == "user"
     assert friendly_copy not in detail_after.text
     assert "负责人还不够明确。" in detail_after.text
-    assert "记录日期：2026-08-09" in detail_after.text
-    assert "来源：你填写的" in detail_after.text
+    assert "记录日期 2026-08-09" in detail_after.text
+    assert detail_after.text.index("AI 整理") < detail_after.text.index("记录日期 2026-08-09")
+    assert detail_after.text.index("记录日期 2026-08-09") < detail_after.text.index("事实 01")
+    assert "你填写的" in detail_after.text
     assert "已按 2026-08-09 换算相对日期。" in detail_after.text
     assert "截止：08-14" in home_after.text
 

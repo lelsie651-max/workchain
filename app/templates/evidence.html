@@ -1,7 +1,61 @@
 {% extends "base.html" %}
 
 {% block content %}
-<section class="rounded-2xl border border-slate-800 bg-slate-900/60 p-6">
+{% macro render_help_item(item) %}
+<li class="rounded-2xl border px-3 py-3 text-sm leading-7 {% if item.is_uncertainty %}border-amber-400/20 bg-amber-400/5 text-amber-100{% else %}border-slate-800/80 bg-slate-950/60 text-slate-200{% endif %}">
+    <p class="text-xs font-medium uppercase tracking-wide {% if item.is_uncertainty %}text-amber-200{% else %}text-slate-500{% endif %}">{{ item.label }}</p>
+    <p class="mt-1">{{ item.content }}</p>
+</li>
+{% endmacro %}
+
+{% macro render_record_date_section(result) %}
+<div id="record-date-section" class="rounded-2xl border border-slate-800/80 bg-slate-950/55 p-4">
+    <div id="record-date-display" class="{% if not result.record_date %}space-y-1{% endif %}">
+        {% if result.record_date %}
+        <div class="flex flex-wrap items-center gap-2 text-sm text-slate-100">
+            <span class="font-medium">记录日期 {{ result.record_date }}</span>
+            {% if result.record_date_source_label %}
+            <span class="text-slate-400">· {{ result.record_date_source_label }}</span>
+            {% endif %}
+        </div>
+        {% if result.date_resolution_notice %}
+        <p class="mt-2 text-xs leading-6 text-emerald-200">{{ result.date_resolution_notice }}</p>
+        {% endif %}
+        {% else %}
+        <p class="text-sm text-slate-100">这份记录含有“今天 / 周五”等相对时间。</p>
+        <p class="text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
+        {% endif %}
+    </div>
+    <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if result.record_date %}hidden{% endif %}">
+        <input
+            id="record-date-input"
+            type="date"
+            min="1900-01-01"
+            max="2100-12-31"
+            value="{{ result.record_date or '' }}"
+            class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+        >
+        <button
+            id="record-date-submit"
+            type="submit"
+            class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+        >
+            {% if result.record_date %}确认日期{% else %}确认{% endif %}
+        </button>
+    </form>
+    {% if result.record_date %}
+    <button
+        id="record-date-toggle"
+        type="button"
+        class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+    >
+        修改
+    </button>
+    {% endif %}
+</div>
+{% endmacro %}
+
+<section class="rounded-[28px] border border-slate-800/80 bg-slate-900/60 p-5 sm:p-6">
     <div
         id="evidence-flash"
         class="mb-4 hidden rounded-2xl border px-4 py-3 text-sm transition-opacity duration-500"
@@ -9,17 +63,22 @@
         aria-live="polite"
     ></div>
     <div class="flex flex-wrap items-start justify-between gap-4">
-        <div>
-            <p class="text-sm text-cyan-200">记录详情</p>
-            <h2 class="mt-2 text-3xl font-semibold text-white">完整原始记录</h2>
-            <div class="mt-4 flex flex-wrap gap-3 text-sm text-slate-400">
-                <span>{{ evidence.occurred_at_text }}</span>
+        <div class="space-y-3">
+            <div>
+                <p class="text-sm text-cyan-200">记录详情</p>
+                <h2 class="mt-2 text-3xl font-semibold text-white">完整原始记录</h2>
+            </div>
+            <div class="flex flex-wrap items-center gap-2 text-sm text-slate-400">
                 <span class="rounded-full border px-2.5 py-1 {{ evidence.platform_class }}">{{ evidence.platform }}</span>
-                {% if is_verified %}
-                <span class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">已确认</span>
-                {% endif %}
+                <span>{{ evidence.occurred_at_text }}</span>
                 {% if evidence.scene %}
-                <span>{{ evidence.scene }}</span>
+                <span>· {{ evidence.scene }}</span>
+                {% endif %}
+            </div>
+            <div class="flex flex-wrap gap-2 text-xs">
+                <span class="rounded-full border border-slate-700/80 bg-slate-950/60 px-2.5 py-1 text-slate-300">原件已保存</span>
+                {% if is_verified %}
+                <span class="rounded-full border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">完整性已校验</span>
                 {% endif %}
             </div>
         </div>
@@ -31,7 +90,7 @@
         </a>
     </div>
 
-    <div class="mt-6 rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
+    <section class="mt-6 rounded-2xl border border-slate-800/80 bg-slate-950/70 p-4">
         {% if evidence.is_image %}
         <a href="{{ evidence.blob_url }}" target="_blank" rel="noreferrer" class="mb-4 block">
             <img src="{{ evidence.blob_url }}" alt="{{ evidence.filename or '图片记录' }}" class="max-h-[60vh] rounded-xl border border-slate-800 object-contain">
@@ -47,269 +106,255 @@
         {% if not evidence.is_image %}
         <pre class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.display_text }}</pre>
         {% endif %}
-    </div>
+    </section>
 
-    <div class="mt-6 grid gap-4 md:grid-cols-2">
-        <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4" data-current-parse-status="{{ parse_status }}">
-            <h3 class="text-lg font-semibold text-white">解析结果</h3>
-            <p id="parse-status-label" class="mt-3 text-sm text-slate-400">状态：{{ parse_status_label }}</p>
-            {% if parse_status == "ocr_running" %}
-            <p id="parse-status-message" class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在读取这份记录…</span></p>
-            {% elif parse_status == "llm_running" or parse_status == "pending" %}
-            <p id="parse-status-message" class="mt-3 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在整理发生了什么…</span></p>
-            {% elif parse_status == "done" %}
-            {% if evidence.semantic_result %}
-            <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4 text-xs leading-6 text-slate-400">
-                <p class="text-slate-200">当前展示最新成功整理结果</p>
-                {% if evidence.semantic_result.created_at_text %}
-                <p>完成时间：{{ evidence.semantic_result.created_at_text }}</p>
-                {% endif %}
+    {% if evidence.semantic_result and evidence.semantic_result.event_match %}
+    <div class="mt-6">
+        {% set panel_event_match = evidence.semantic_result.event_match %}
+        {% set panel_assignment_subject = evidence.assignment_subject %}
+        {% include "_event_assignment_panel.html" %}
+    </div>
+    {% endif %}
+
+    <section class="mt-6 rounded-2xl border border-slate-800/80 bg-slate-950/70 p-4" data-current-parse-status="{{ parse_status }}">
+        <div class="flex flex-wrap items-start justify-between gap-4">
+            <div>
+                <h3 class="text-lg font-semibold text-white">AI 整理</h3>
+                <p id="parse-status-label" class="mt-2 text-sm text-slate-400">状态：{{ parse_status_label }}</p>
             </div>
-            <div class="mt-4 space-y-4">
-                {% if evidence.semantic_result.event_match %}
-                {% set panel_event_match = evidence.semantic_result.event_match %}
-                {% set panel_assignment_subject = evidence.assignment_subject %}
-                {% include "_event_assignment_panel.html" %}
-                {% endif %}
-                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                    <h4 class="text-sm font-medium text-white">事实整理</h4>
-                    {% if evidence.semantic_result.facts %}
-                    <ul class="mt-3 space-y-3">
-                        {% for fact in evidence.semantic_result.facts %}
-                        <li class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm leading-7 text-slate-100">
-                            <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
-                            <p class="mt-1">{{ fact.content }}</p>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                    {% else %}
-                    <p class="mt-3 text-sm leading-7 text-slate-300">没有识别出明确事实。</p>
-                    {% endif %}
-                </div>
-                <div class="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                    <h4 class="text-sm font-medium text-white">AI帮你理解</h4>
-                    {% if evidence.semantic_result.record_date or evidence.semantic_result.has_relative_due_raw %}
-                    <div id="record-date-section" class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-                        <div id="record-date-display" class="{% if not evidence.semantic_result.record_date %}space-y-1{% endif %}">
-                            {% if evidence.semantic_result.record_date %}
-                            <p class="text-sm text-slate-100">记录日期：{{ evidence.semantic_result.record_date }}</p>
-                            {% if evidence.semantic_result.record_date_source_label %}
-                            <p class="mt-1 text-xs text-slate-400">来源：{{ evidence.semantic_result.record_date_source_label }}</p>
-                            {% endif %}
-                            {% if evidence.semantic_result.date_resolution_notice %}
-                            <p class="mt-2 text-xs text-emerald-200">{{ evidence.semantic_result.date_resolution_notice }}</p>
-                            {% endif %}
+            {% if evidence.semantic_result and evidence.semantic_result.created_at_text and parse_status == "done" %}
+            <p class="text-xs leading-6 text-slate-500">完成时间：{{ evidence.semantic_result.created_at_text }}</p>
+            {% endif %}
+        </div>
+
+        {% if parse_status == "ocr_running" %}
+        <p id="parse-status-message" class="mt-4 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在读取这份记录…</span></p>
+        {% elif parse_status == "llm_running" or parse_status == "pending" %}
+        <p id="parse-status-message" class="mt-4 inline-flex items-center gap-2 text-sm text-cyan-200"><span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-cyan-200/30 border-t-cyan-200"></span><span id="parse-status-message-text">正在整理发生了什么…</span></p>
+        {% elif parse_status == "unsupported" %}
+        <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</span></p>
+        {% elif parse_status == "failed" %}
+        <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</span></p>
+        {% endif %}
+
+        {% if evidence.semantic_result and parse_status in ["done", "failed"] %}
+        <div class="mt-4 space-y-4">
+            {% if evidence.semantic_result.record_date or evidence.semantic_result.has_relative_due_raw %}
+            {{ render_record_date_section(evidence.semantic_result) }}
+            {% endif %}
+
+            {% if evidence.semantic_result.facts %}
+            <div class="space-y-4">
+                {% for fact in evidence.semantic_result.facts %}
+                <article class="rounded-2xl border border-slate-800/80 bg-slate-900/55 p-4" data-testid="fact-row">
+                    <div class="grid gap-4 lg:grid-cols-[minmax(0,1.45fr)_minmax(280px,1fr)] lg:items-start">
+                        <div class="space-y-3">
+                            <div class="flex flex-wrap items-center gap-3">
+                                <p class="text-xs font-semibold uppercase tracking-[0.18em] text-cyan-200">事实 {{ "%02d"|format(loop.index) }}</p>
+                                <span class="rounded-full border border-slate-700/80 bg-slate-950/60 px-2.5 py-1 text-xs text-slate-300">{{ fact.fact_type_label or fact.fact_type }}</span>
+                                {% if fact.due_date_value %}
+                                <span class="text-xs text-amber-200">日期：{{ fact.due_date_value }}</span>
+                                {% elif fact.due_raw %}
+                                <span class="text-xs text-amber-200">时限：{{ fact.due_raw }}</span>
+                                {% endif %}
+                            </div>
+                            <p class="text-base leading-8 text-slate-100">{{ fact.content }}</p>
+                        </div>
+                        <div class="rounded-2xl border border-slate-800/80 bg-slate-950/60 p-4">
+                            <p class="text-sm font-medium text-white">这句话怎么理解</p>
+                            {% if fact.help_items %}
+                            <ul class="mt-3 space-y-3">
+                                {% for item in fact.help_items %}
+                                {{ render_help_item(item) }}
+                                {% endfor %}
+                            </ul>
                             {% else %}
-                            <p class="text-sm text-slate-100">这些内容用了“今天 / 周五”等相对时间。</p>
-                            <p class="mt-1 text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
+                            <p class="mt-3 text-sm leading-7 text-slate-400">目前没有额外解释。</p>
                             {% endif %}
                         </div>
-                        <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if evidence.semantic_result.record_date %}hidden{% endif %}">
-                            <input
-                                id="record-date-input"
-                                type="date"
-                                min="1900-01-01"
-                                max="2100-12-31"
-                                value="{{ evidence.semantic_result.record_date or '' }}"
-                                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                            >
-                            <button
-                                id="record-date-submit"
-                                type="submit"
-                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-                            >
-                                确认日期
-                            </button>
-                        </form>
-                        {% if evidence.semantic_result.record_date %}
-                        <button
-                            id="record-date-toggle"
-                            type="button"
-                            class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            修改
-                        </button>
-                        {% endif %}
                     </div>
-                    {% endif %}
-                    {% if evidence.semantic_result.help_items %}
-                    <ul class="mt-3 space-y-3">
-                        {% for item in evidence.semantic_result.help_items %}
-                        <li class="rounded-xl border px-3 py-3 text-sm leading-7 {% if item.is_uncertainty %}border-amber-400/20 bg-amber-400/5 text-amber-100{% else %}border-slate-800 bg-slate-950/60 text-slate-200{% endif %}">
-                            <p class="text-xs uppercase tracking-wide {% if item.is_uncertainty %}text-amber-200{% else %}text-slate-500{% endif %}">{{ item.label }}</p>
-                            <p class="mt-1">{{ item.content }}</p>
-                            {% if item.fact_content %}
-                            <p class="mt-2 text-xs {% if item.is_uncertainty %}text-amber-200/80{% else %}text-slate-500{% endif %}">关联事实：{{ item.fact_content }}</p>
-                            {% endif %}
-                        </li>
-                        {% endfor %}
-                    </ul>
-                    {% else %}
-                    <p class="mt-3 text-sm leading-7 text-slate-300">目前没有额外解释。</p>
-                    {% endif %}
-                </div>
+                </article>
+                {% endfor %}
             </div>
             {% else %}
-                {% if evidence.plain_summary %}
-                <p class="mt-3 text-sm leading-7 text-slate-200">{{ evidence.plain_summary }}</p>
-                {% endif %}
-                <div class="mt-3 space-y-2 text-sm text-slate-400">
-                    {% if evidence.deliverable %}
-                    <p>交付物：{{ evidence.deliverable }}</p>
-                    {% endif %}
-                    {% if evidence.due_text %}
-                    <p>时限：{{ evidence.due_text }}</p>
-                    {% endif %}
-                    {% for caveat in evidence.caveats %}
-                    <p class="text-yellow-200">{{ caveat }}</p>
-                    {% endfor %}
-                </div>
+            <p class="text-sm leading-7 text-slate-300">没有识别出明确事实。</p>
             {% endif %}
-            {% elif parse_status == "unsupported" %}
-            <p id="parse-status-message" class="mt-3 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</span></p>
-            {% elif parse_status == "failed" %}
-            <p id="parse-status-message" class="mt-3 text-sm text-slate-400"><span id="parse-status-message-text">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</span></p>
-            {% if evidence.semantic_result %}
-            <div class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-                {% if evidence.semantic_result.event_match %}
-                <div class="mb-4">
-                    {% set panel_event_match = evidence.semantic_result.event_match %}
-                    {% set panel_assignment_subject = evidence.assignment_subject %}
-                    {% include "_event_assignment_panel.html" %}
-                </div>
-                {% endif %}
-                <p class="text-sm font-medium text-white">事实整理</p>
-                {% if evidence.semantic_result.facts %}
+
+            {% if evidence.semantic_result.evidence_help_items %}
+            <section class="rounded-2xl border border-slate-800/80 bg-slate-900/55 p-4" data-testid="evidence-help-section">
+                <h4 class="text-sm font-medium text-white">整体提醒</h4>
                 <ul class="mt-3 space-y-3">
-                    {% for fact in evidence.semantic_result.facts %}
-                    <li class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm leading-7 text-slate-100">
-                        <p class="text-xs uppercase tracking-wide text-slate-500">{{ fact.fact_type_label or fact.fact_type }}</p>
-                        <p class="mt-1">{{ fact.content }}</p>
-                    </li>
+                    {% for item in evidence.semantic_result.evidence_help_items %}
+                    {{ render_help_item(item) }}
                     {% endfor %}
                 </ul>
-                {% else %}
-                <p class="mt-3 text-sm leading-7 text-slate-300">没有识别出明确事实。</p>
+            </section>
+            {% endif %}
+        </div>
+        {% elif parse_status == "done" %}
+        <div class="mt-4 space-y-2 text-sm text-slate-400">
+            {% if evidence.plain_summary %}
+            <p class="text-slate-200">{{ evidence.plain_summary }}</p>
+            {% endif %}
+            {% if evidence.deliverable %}
+            <p>交付物：{{ evidence.deliverable }}</p>
+            {% endif %}
+            {% if evidence.due_text %}
+            <p>时限：{{ evidence.due_text }}</p>
+            {% endif %}
+            {% for caveat in evidence.caveats %}
+            <p class="text-amber-200">{{ caveat }}</p>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </section>
+
+    {% if evidence.is_image and evidence.has_extracted_text %}
+    <details class="mt-6 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-ocr-details>
+        <summary class="cursor-pointer list-none text-sm text-slate-200">
+            看看系统读到了什么
+            {% if is_ocr_corrected %}
+            <span class="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-xs text-amber-200">已人工校正</span>
+            {% endif %}
+        </summary>
+        <div class="mt-3 space-y-3">
+            <p class="text-xs leading-6 text-slate-500">文字由图片自动识别，可能有误。原始图片已完整保存，识别结果不影响完整性校验。</p>
+            {% if evidence.current_extraction %}
+            <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-400">
+                <p class="text-slate-300">{{ evidence.current_extraction.origin_label }}</p>
+                {% if evidence.current_extraction.created_at_text %}
+                <p>提取时间：{{ evidence.current_extraction.created_at_text }}</p>
                 {% endif %}
-                <div class="mt-4">
-                    <p class="text-sm font-medium text-white">AI帮你理解</p>
-                    {% if evidence.semantic_result.record_date or evidence.semantic_result.has_relative_due_raw %}
-                    <div id="record-date-section" class="mt-3 rounded-xl border border-slate-800 bg-slate-950/60 p-3">
-                        <div id="record-date-display" class="{% if not evidence.semantic_result.record_date %}space-y-1{% endif %}">
-                            {% if evidence.semantic_result.record_date %}
-                            <p class="text-sm text-slate-100">记录日期：{{ evidence.semantic_result.record_date }}</p>
-                            {% if evidence.semantic_result.record_date_source_label %}
-                            <p class="mt-1 text-xs text-slate-400">来源：{{ evidence.semantic_result.record_date_source_label }}</p>
-                            {% endif %}
-                            {% if evidence.semantic_result.date_resolution_notice %}
-                            <p class="mt-2 text-xs text-emerald-200">{{ evidence.semantic_result.date_resolution_notice }}</p>
-                            {% endif %}
-                            {% else %}
-                            <p class="text-sm text-slate-100">这些内容用了“今天 / 周五”等相对时间。</p>
-                            <p class="mt-1 text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
-                            {% endif %}
-                        </div>
-                        <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if evidence.semantic_result.record_date %}hidden{% endif %}">
-                            <input
-                                id="record-date-input"
-                                type="date"
-                                min="1900-01-01"
-                                max="2100-12-31"
-                                value="{{ evidence.semantic_result.record_date or '' }}"
-                                class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                            >
-                            <button
-                                id="record-date-submit"
-                                type="submit"
-                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-                            >
-                                确认日期
-                            </button>
-                        </form>
-                        {% if evidence.semantic_result.record_date %}
-                        <button
-                            id="record-date-toggle"
-                            type="button"
-                            class="mt-3 inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                        >
-                            修改
-                        </button>
-                        {% endif %}
-                    </div>
-                    {% endif %}
-                    {% if evidence.semantic_result.help_items %}
-                    <ul class="mt-3 space-y-3">
-                        {% for item in evidence.semantic_result.help_items %}
-                        <li class="rounded-xl border px-3 py-3 text-sm leading-7 {% if item.is_uncertainty %}border-amber-400/20 bg-amber-400/5 text-amber-100{% else %}border-slate-800 bg-slate-950/60 text-slate-200{% endif %}">
-                            <p class="text-xs uppercase tracking-wide {% if item.is_uncertainty %}text-amber-200{% else %}text-slate-500{% endif %}">{{ item.label }}</p>
-                            <p class="mt-1">{{ item.content }}</p>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                    {% else %}
-                    <p class="mt-3 text-sm leading-7 text-slate-300">目前没有额外解释。</p>
-                    {% endif %}
+            </div>
+            {% endif %}
+            <div id="ocr-text-readonly" class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.extracted_text }}</div>
+            {% if not evidence.evidence_id.startswith("ev_demo_") %}
+            <button
+                id="edit-ocr-text"
+                type="button"
+                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+            >
+                修正文字
+            </button>
+            <div id="ocr-text-editor" class="hidden space-y-3">
+                <textarea id="ocr-text-input" rows="8" class="w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-400/40">{{ evidence.extracted_text }}</textarea>
+                <div class="flex flex-wrap gap-3">
+                    <button
+                        id="save-ocr-text"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                    >
+                        保存
+                    </button>
+                    <button
+                        id="cancel-ocr-text"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        取消
+                    </button>
                 </div>
             </div>
             {% endif %}
-            {% endif %}
-            {% if evidence.is_image and evidence.has_extracted_text %}
-            <details class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-ocr-details>
-                <summary class="cursor-pointer list-none text-sm text-slate-200">
-                    看看系统读到了什么
-                    {% if is_ocr_corrected %}
-                    <span class="ml-2 rounded-full border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-xs text-amber-200">已人工校正</span>
-                    {% endif %}
-                </summary>
-                <div class="mt-3 space-y-3">
-                    <p class="text-xs leading-6 text-slate-500">文字由图片自动识别,可能有误。原始图片已完整保存,识别结果不影响完整性校验。</p>
-                    {% if evidence.current_extraction %}
-                    <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-400">
-                        <p class="text-slate-300">{{ evidence.current_extraction.origin_label }}</p>
-                        {% if evidence.current_extraction.created_at_text %}
-                        <p>提取时间：{{ evidence.current_extraction.created_at_text }}</p>
-                        {% endif %}
-                    </div>
-                    {% endif %}
-                    <div id="ocr-text-readonly" class="max-h-[60vh] overflow-auto whitespace-pre-wrap text-sm leading-7 text-slate-100">{{ evidence.extracted_text }}</div>
-                    {% if not evidence.evidence_id.startswith("ev_demo_") %}
-                    <button
-                        id="edit-ocr-text"
-                        type="button"
-                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                    >
-                        修正文字
-                    </button>
-                    <div id="ocr-text-editor" class="hidden space-y-3">
-                        <textarea id="ocr-text-input" rows="8" class="w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-400/40">{{ evidence.extracted_text }}</textarea>
-                        <div class="flex flex-wrap gap-3">
-                            <button
-                                id="save-ocr-text"
-                                type="button"
-                                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
-                            >
-                                保存
-                            </button>
-                            <button
-                                id="cancel-ocr-text"
-                                type="button"
-                                class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
-                            >
-                                取消
-                            </button>
-                        </div>
-                    </div>
-                    {% endif %}
+        </div>
+    </details>
+    {% endif %}
+
+    {% if evidence.evidence_id.startswith("ev_demo_") %}
+    <p class="mt-6 text-sm leading-7 text-slate-300">演示记录不可修改。</p>
+    {% endif %}
+
+    {% if not evidence.semantic_result %}
+    <section class="mt-6 rounded-2xl border border-slate-800/80 bg-slate-950/70 p-4">
+        <h3 class="text-lg font-semibold text-white">兼容编辑</h3>
+        <form id="slots-form" class="mt-4 space-y-4" data-evidence-id="{{ evidence.evidence_id }}">
+            <div>
+                <label class="mb-2 block text-sm text-slate-300">交付物</label>
+                <input id="slot-deliverable" type="text" value="{{ evidence.deliverable or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+            </div>
+            <div class="grid gap-4 md:grid-cols-2">
+                <div>
+                    <label class="mb-2 block text-sm text-slate-300">时限原文</label>
+                    <input id="slot-due-raw" type="text" value="{{ evidence.due_text or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
                 </div>
-            </details>
-            {% endif %}
-            {% if evidence.evidence_id.startswith("ev_demo_") %}
-            <p class="mt-3 text-sm leading-7 text-slate-300">演示记录不可修改。</p>
-            {% endif %}
-            {% if diagnostics_enabled and diagnostics %}
-            <details class="mt-4 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-diagnostics-details>
-                <summary class="cursor-pointer list-none text-sm text-slate-200">解析诊断</summary>
-                <div class="mt-3 space-y-3">
+                <div>
+                    <label class="mb-2 block text-sm text-slate-300">时限日期</label>
+                    <input id="slot-due-date" type="date" value="{{ evidence.due_date_value or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                </div>
+            </div>
+            <div>
+                <label class="mb-2 block text-sm text-slate-300">方向</label>
+                <div class="grid gap-3 sm:grid-cols-3">
+                    <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
+                        <input type="radio" name="slot-direction" value="i_owe" {% if evidence.slot_direction == "i_owe" %}checked{% endif %}>
+                        <span>我欠对方</span>
+                    </label>
+                    <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
+                        <input type="radio" name="slot-direction" value="owed_to_me" {% if evidence.slot_direction == "owed_to_me" %}checked{% endif %}>
+                        <span>对方欠我</span>
+                    </label>
+                    <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
+                        <input type="radio" name="slot-direction" value="none" {% if evidence.slot_direction == "none" %}checked{% endif %}>
+                        <span>都不欠</span>
+                    </label>
+                </div>
+            </div>
+            <div>
+                <label class="mb-2 block text-sm text-slate-300">类型</label>
+                <select id="kind-input" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                    <option value="request" {% if evidence.kind == "request" %}selected{% endif %}>提出需求</option>
+                    <option value="confirm" {% if evidence.kind == "confirm" %}selected{% endif %}>确认</option>
+                    <option value="change" {% if evidence.kind == "change" %}selected{% endif %}>变更</option>
+                    <option value="deliver" {% if evidence.kind == "deliver" %}selected{% endif %}>交付</option>
+                    <option value="dispute" {% if evidence.kind == "dispute" %}selected{% endif %}>争议</option>
+                    <option value="reference" {% if evidence.kind == "reference" %}selected{% endif %}>参考信息</option>
+                </select>
+            </div>
+            <div>
+                <label class="mb-2 block text-sm text-slate-300">一句话说明</label>
+                <textarea id="plain-summary" rows="4" class="w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-400/40">{{ evidence.plain_summary or '' }}</textarea>
+            </div>
+            <div>
+                <div class="mb-2 flex items-center justify-between gap-3">
+                    <label class="block text-sm text-slate-300">提醒事项</label>
+                    <button id="add-caveat" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">新增一条</button>
+                </div>
+                <div id="caveat-list" class="space-y-3">
+                    {% for caveat in evidence.caveats %}
+                    <div class="flex gap-3">
+                        <input type="text" value="{{ caveat }}" data-caveat-input class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
+                        <button type="button" data-remove-caveat class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            <button
+                id="save-slots"
+                type="submit"
+                class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
+                {% if evidence.evidence_id.startswith("ev_demo_") %}disabled{% else %}disabled{% endif %}
+            >
+                保存修改
+            </button>
+        </form>
+    </section>
+    {% endif %}
+
+    <details class="mt-6 rounded-2xl border border-slate-800/80 bg-slate-950/70 p-4">
+        <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">记录信息</summary>
+        <div class="mt-3 space-y-2 text-sm text-slate-400">
+            <p>保存时间：{{ evidence.captured_at_text }}</p>
+            <p>记录时间：{{ evidence.occurred_at_text }}</p>
+            <p>内容摘要：{{ evidence.content_hash_prefix }}</p>
+            <p>完整性状态：{% if is_verified %}已通过{% else %}原件已保存{% endif %}</p>
+            <p class="pt-1 text-xs leading-6 text-slate-500">完整性校验保护的是原始材料；修改 AI 整理结果不会改变原件。</p>
+        </div>
+    </details>
+
+    {% if diagnostics_enabled and diagnostics %}
+    <details class="mt-6 rounded-xl border border-slate-800 bg-slate-900/60 p-4" data-diagnostics-details>
+        <summary class="cursor-pointer list-none text-sm text-slate-200">解析诊断</summary>
+        <div class="mt-3 space-y-3">
                     <p class="text-xs leading-6 text-slate-500">仅显示安全元数据,用于定位当前解析链路,不包含密钥和完整敏感原文。</p>
                     <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs leading-6 text-slate-400">
                         <p>当前状态：{{ diagnostics.parse_status }}</p>
@@ -392,94 +437,8 @@
                     {% endif %}
                     <pre class="max-h-[40vh] overflow-auto whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-xs leading-6 text-slate-300">{{ diagnostics_json }}</pre>
                 </div>
-            </details>
-            {% endif %}
-            {% if not evidence.semantic_result %}
-            <form id="slots-form" class="mt-4 space-y-4" data-evidence-id="{{ evidence.evidence_id }}">
-                <div>
-                    <label class="mb-2 block text-sm text-slate-300">交付物</label>
-                    <input id="slot-deliverable" type="text" value="{{ evidence.deliverable or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                </div>
-                <div class="grid gap-4 md:grid-cols-2">
-                    <div>
-                        <label class="mb-2 block text-sm text-slate-300">时限原文</label>
-                        <input id="slot-due-raw" type="text" value="{{ evidence.due_text or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                    </div>
-                    <div>
-                        <label class="mb-2 block text-sm text-slate-300">时限日期</label>
-                        <input id="slot-due-date" type="date" value="{{ evidence.due_date_value or '' }}" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                    </div>
-                </div>
-                <div>
-                    <label class="mb-2 block text-sm text-slate-300">方向</label>
-                    <div class="grid gap-3 sm:grid-cols-3">
-                        <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
-                            <input type="radio" name="slot-direction" value="i_owe" {% if evidence.slot_direction == "i_owe" %}checked{% endif %}>
-                            <span>我欠对方</span>
-                        </label>
-                        <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
-                            <input type="radio" name="slot-direction" value="owed_to_me" {% if evidence.slot_direction == "owed_to_me" %}checked{% endif %}>
-                            <span>对方欠我</span>
-                        </label>
-                        <label class="flex min-h-11 items-center gap-2 rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200">
-                            <input type="radio" name="slot-direction" value="none" {% if evidence.slot_direction == "none" %}checked{% endif %}>
-                            <span>都不欠</span>
-                        </label>
-                    </div>
-                </div>
-                <div>
-                    <label class="mb-2 block text-sm text-slate-300">类型</label>
-                    <select id="kind-input" class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                        <option value="request" {% if evidence.kind == "request" %}selected{% endif %}>提出需求</option>
-                        <option value="confirm" {% if evidence.kind == "confirm" %}selected{% endif %}>确认</option>
-                        <option value="change" {% if evidence.kind == "change" %}selected{% endif %}>变更</option>
-                        <option value="deliver" {% if evidence.kind == "deliver" %}selected{% endif %}>交付</option>
-                        <option value="dispute" {% if evidence.kind == "dispute" %}selected{% endif %}>争议</option>
-                        <option value="reference" {% if evidence.kind == "reference" %}selected{% endif %}>参考信息</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="mb-2 block text-sm text-slate-300">一句话说明</label>
-                    <textarea id="plain-summary" rows="4" class="w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm leading-6 text-slate-100 outline-none transition focus:border-cyan-400/40">{{ evidence.plain_summary or '' }}</textarea>
-                </div>
-                <div>
-                    <div class="mb-2 flex items-center justify-between gap-3">
-                        <label class="block text-sm text-slate-300">提醒事项</label>
-                        <button id="add-caveat" type="button" class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">新增一条</button>
-                    </div>
-                    <div id="caveat-list" class="space-y-3">
-                        {% for caveat in evidence.caveats %}
-                        <div class="flex gap-3">
-                            <input type="text" value="{{ caveat }}" data-caveat-input class="min-h-11 flex-1 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40">
-                            <button type="button" data-remove-caveat class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white">删除</button>
-                        </div>
-                        {% endfor %}
-                    </div>
-                </div>
-                <button
-                    id="save-slots"
-                    type="submit"
-                    class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-5 py-3 text-sm font-medium text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
-                    {% if evidence.evidence_id.startswith("ev_demo_") %}disabled{% else %}disabled{% endif %}
-                >
-                    保存修改
-                </button>
-            </form>
-            {% endif %}
-        </div>
-
-        <div class="rounded-2xl border border-slate-800 bg-slate-950/70 p-4">
-            <h3 class="text-lg font-semibold text-white">保存与校验</h3>
-            <div class="mt-3 space-y-2 text-sm text-slate-400">
-                <p>记录时间：{{ evidence.occurred_at_text }}</p>
-                <p>保存时间：{{ evidence.captured_at_text }}</p>
-                {% if is_verified %}
-                <p>完整性校验：已通过</p>
-                {% endif %}
-            </div>
-            <p class="mt-4 text-xs leading-6 text-slate-500">修改解析结果或校正识别文字,都不会影响完整性校验 —— 校验保护的是原始图片本身,不包括对它的解读。</p>
-        </div>
-    </div>
+    </details>
+    {% endif %}
 </section>
 
 <script>
