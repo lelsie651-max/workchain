@@ -48,12 +48,23 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
         lambda image_bytes, mime_type: {
-            "transcript": "请周五前补齐渠道复盘数据",
+            "transcript": (
+                "[chat_title] 微信单聊\n"
+                "[message 1][right_account] 计划6月16日上午搬走\n"
+                "[message 2][left_contact] 好的\n"
+                "[message 3][right_account] 8月16日,打错了\n"
+                "[message 4][left_contact] 这个月16号哈"
+            ),
             "observations": [
                 {
-                    "kind": "reaction",
-                    "content": "有人对该消息显示👍反应",
+                    "kind": "chat_context",
+                    "content": "画面为微信单聊截图,顶部可见聊天标题。",
                     "confidence": 0.74,
+                },
+                {
+                    "kind": "participant_layout",
+                    "content": "右侧第1/3条消息属于同一视觉发送方,左侧第2/4条消息属于另一视觉发送方。",
+                    "confidence": 0.8,
                 }
             ],
             "provider": "doubao-ark",
@@ -69,18 +80,43 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
     )
 
     assert result == {
-        "transcript": "请周五前补齐渠道复盘数据",
+        "transcript": (
+            "[chat_title] 微信单聊\n"
+            "[message 1][right_account] 计划6月16日上午搬走\n"
+            "[message 2][left_contact] 好的\n"
+            "[message 3][right_account] 8月16日,打错了\n"
+            "[message 4][left_contact] 这个月16号哈"
+        ),
         "observations": [
             {
-                "kind": "reaction",
-                "content": "有人对该消息显示👍反应",
+                "kind": "chat_context",
+                "content": "画面为微信单聊截图,顶部可见聊天标题。",
                 "confidence": 0.74,
+            },
+            {
+                "kind": "participant_layout",
+                "content": "右侧第1/3条消息属于同一视觉发送方,左侧第2/4条消息属于另一视觉发送方。",
+                "confidence": 0.8,
             }
         ],
         "provider": "doubao-ark",
         "model": "doubao-seed-2-0-lite-260215",
         "warnings": [],
     }
+
+
+def test_extract_image_evidence_ocr_text_only_path_does_not_fabricate_speaker_refs(monkeypatch):
+    monkeypatch.setattr(
+        "app.evidence_extractor.ocr.image_to_text",
+        lambda image_bytes, mime_type: ("计划6月16日上午搬走\n好的\n8月16日,打错了", ""),
+    )
+
+    result = evidence_extractor.extract_image_evidence(b"fake-image", "image/png")
+
+    assert result["provider"] == "dashscope"
+    assert result["transcript"] == "计划6月16日上午搬走\n好的\n8月16日,打错了"
+    assert "[message 1]" not in result["transcript"]
+    assert "[right_account]" not in result["transcript"]
 
 
 def test_extract_image_evidence_can_switch_to_experimental_provider_via_env(monkeypatch):

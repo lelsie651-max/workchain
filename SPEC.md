@@ -109,6 +109,7 @@
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
 - 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
 - Ark Vision 可同时产出 `transcript + observations`;其中 transcript 进入 production semantic route,observations 只进入 Extraction 层与 Semantic Parser 输入,不得混入 `raw_text`
+- 当 Ark Vision 处理聊天/IM 截图时,`transcript` 必须是 layout-aware transcription:保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
