@@ -15,6 +15,7 @@
                 <label id="evidence-text-label" for="evidence-text" class="block text-sm font-medium text-slate-200">放进一条记录</label>
                 <div
                     id="evidence-dropzone"
+                    tabindex="0"
                     class="rounded-[24px] border border-slate-700/80 bg-slate-950/65 p-3 transition sm:p-4"
                 >
                     <div id="text-input-region">
@@ -402,6 +403,24 @@
             selectedFiles = nextFiles;
             message.textContent = "";
             renderSelectedFiles();
+            dropzone.focus();
+        };
+
+        const clipboardImageFiles = (event) => {
+            const items = [...(event.clipboardData?.items || [])];
+            return items
+                .filter((item) => item.kind === "file" && (item.type || "").startsWith("image/"))
+                .map((item) => item.getAsFile())
+                .filter(Boolean);
+        };
+
+        const handleUploadAreaPaste = (event) => {
+            const imageFiles = clipboardImageFiles(event);
+            if (!imageFiles.length) {
+                return;
+            }
+            event.preventDefault();
+            appendFiles(imageFiles);
         };
 
         const syncCustomSource = () => {
@@ -550,18 +569,7 @@
             appendFiles(Array.from(event.dataTransfer?.files || []));
         });
 
-        textarea.addEventListener("paste", (event) => {
-            const items = [...(event.clipboardData?.items || [])];
-            const imageFiles = items
-                .filter((item) => item.kind === "file" && (item.type || "").startsWith("image/"))
-                .map((item) => item.getAsFile())
-                .filter(Boolean);
-            if (!imageFiles.length) {
-                return;
-            }
-            event.preventDefault();
-            appendFiles(imageFiles);
-        });
+        dropzone.addEventListener("paste", handleUploadAreaPaste);
 
         textarea.addEventListener("input", syncInputMode);
 

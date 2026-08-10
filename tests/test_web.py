@@ -12,7 +12,7 @@ import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 from docx import Document
 from fastapi.testclient import TestClient
@@ -1230,6 +1230,12 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert 'window.location.href = "/records";' in response.text
     assert 'data-remove-selected-file="${index}"' in response.text
     assert "Array.from(event.dataTransfer?.files || [])" in response.text
+    assert 'id="evidence-dropzone"' in response.text
+    assert 'tabindex="0"' in response.text
+    assert "const handleUploadAreaPaste = (event) => {" in response.text
+    assert "dropzone.addEventListener(\"paste\", handleUploadAreaPaste);" in response.text
+    assert "const clipboardImageFiles = (event) => {" in response.text
+    assert "dropzone.focus();" in response.text
     assert "recordDateInput.disabled = disableRecordDate;" in response.text
     assert "recordDateInput.value = \"\";" in response.text
     assert 'name="record_date"' in response.text
@@ -1240,6 +1246,7 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert 'formData.append("counterpart"' not in response.text
     assert 'window.location.reload()' not in response.text
     assert 'window.location.href = `/evidence/${encodeURIComponent(parsed.value.evidence_id)}`;' in response.text
+    assert "textarea.addEventListener(\"paste\"" not in response.text
 
 
 def test_records_page_lists_current_sandbox_evidence_and_links_to_detail(tmp_path, monkeypatch):
@@ -2920,6 +2927,7 @@ def test_multi_image_pipeline_runs_sequentially_and_scopes_semantics_per_evidenc
         mime_type,
         *,
         provider,
+        source_hint,
         allow_ocr_fallback,
         consume_ocr_fallback_budget,
     ):
@@ -3054,6 +3062,7 @@ def test_multi_image_pipeline_failure_on_middle_item_does_not_block_later_items(
         mime_type,
         *,
         provider,
+        source_hint,
         allow_ocr_fallback,
         consume_ocr_fallback_budget,
     ):
@@ -3391,7 +3400,12 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
         with patch("app.extract.ocr.image_to_text") as mock_ocr:
             with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
                 with client:
-                    response = _upload_png(client, filename="ark-success.png")
+                    response = _upload_png(
+                        client,
+                        filename="ark-success.png",
+                        source="微信",
+                        source_detail="单聊",
+                    )
                     evidence_id = response.json()["evidence_id"]
                     status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
@@ -3399,6 +3413,9 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
     assert response.json()["parse_status"] == "ocr_running"
     assert status_response.json()["parse_status"] == "done"
     mock_vision.assert_called_once()
+    vision_args, vision_kwargs = mock_vision.call_args
+    assert vision_args == (ANY, "image/png")
+    assert vision_kwargs == {"source_hint": "微信-单聊"}
     mock_ocr.assert_not_called()
     mock_llm.assert_called_once()
     assert mock_llm.call_args.args[0] == main_module._llm_input_text("Ark transcript")
@@ -4929,7 +4946,7 @@ def test_ark_vision_diagnostic_uses_current_blob_and_does_not_mutate_state(tmp_p
     mock_vision.assert_called_once()
     args, kwargs = mock_vision.call_args
     assert args == (expected_blob_bytes, "image/png")
-    assert kwargs == {}
+    assert kwargs == {"source_hint": "飞书-项目复盘群"}
     mock_log.assert_called_once()
     assert mock_log.call_args.args[0] == "ark_vision_diagnostic"
     assert mock_log.call_args.args[1]["evidence_id"] == evidence_id

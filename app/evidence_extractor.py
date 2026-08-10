@@ -109,12 +109,18 @@ def run_production_image_extraction(
     mime_type: str,
     *,
     provider: str | None = None,
+    source_hint: str | None = None,
     allow_ocr_fallback: bool = False,
     consume_ocr_fallback_budget: Callable[[], tuple[bool, str | None]] | None = None,
     ocr_fallback_unavailable_reason: str | None = None,
 ) -> dict[str, Any]:
     selected_provider = (provider or get_image_extraction_provider()).strip() or DEFAULT_IMAGE_EXTRACTION_PROVIDER
-    extraction = extract_image_evidence(image_bytes, mime_type, provider=selected_provider)
+    extraction = extract_image_evidence(
+        image_bytes,
+        mime_type,
+        provider=selected_provider,
+        source_hint=source_hint,
+    )
     if _has_extraction_content(extraction):
         return {
             "configured_provider": selected_provider,
@@ -151,6 +157,7 @@ def run_production_image_extraction(
             image_bytes,
             mime_type,
             provider=DEFAULT_IMAGE_EXTRACTION_PROVIDER,
+            source_hint=source_hint,
         )
         if _has_extraction_content(fallback_extraction):
             return {
@@ -191,13 +198,20 @@ def extract_image_evidence(
     mime_type: str,
     *,
     provider: str | None = None,
+    source_hint: str | None = None,
 ) -> dict[str, Any] | None:
     selected_provider = (provider or get_image_extraction_provider()).strip() or DEFAULT_IMAGE_EXTRACTION_PROVIDER
 
     if selected_provider == DEFAULT_IMAGE_EXTRACTION_PROVIDER:
         return _extract_with_ocr(image_bytes, mime_type)
     if selected_provider == ARK_VISION_EXTRACTION_PROVIDER:
-        return vision_provider.extract_visual_evidence(image_bytes, mime_type)
+        if source_hint is None:
+            return vision_provider.extract_visual_evidence(image_bytes, mime_type)
+        return vision_provider.extract_visual_evidence(
+            image_bytes,
+            mime_type,
+            source_hint=source_hint,
+        )
     raise ValueError(f"unsupported image extraction provider: {selected_provider}")
 
 

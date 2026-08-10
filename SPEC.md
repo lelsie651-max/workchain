@@ -109,7 +109,11 @@
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
 - 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
 - Ark Vision 可同时产出 `transcript + observations`;其中 transcript 进入 production semantic route,observations 只进入 Extraction 层与 Semantic Parser 输入,不得混入 `raw_text`
-- 当 Ark Vision 处理聊天/IM 截图时,`transcript` 必须是 layout-aware transcription:保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
+- `source_hint` 中的平台上下文属于 Extraction 输入上下文,只用于帮助 Vision 正确阅读 UI,不是 Evidence 原文的一部分,也不得被用来改写原图文字
+- 当 Ark Vision 处理聊天/IM 截图时,优先返回 platform-aware structured conversation extraction,再由代码确定性 normalize 成现有 `transcript + observations`;`chat_header` 只表示顶部直接可见 UI 文本,不等于 participant identity,但在已知平台/UI 结构下可用于建立 participant mapping
+- 聊天 transcript 中的 `speaker_ref` 永远必须是 stable neutral identity:direct chat 只允许 `left_account / right_account`;group chat 使用 `right_account / participant_n`;昵称只放 `display_name`,不得让 `left_戴雯 / left_饭之 / right_用户` 这类 ref 直接进入最终 transcript
+- quote / reply / reaction 属于直接可观察 conversation structure,必须绑定在对应 message 上保留;actor 不可见时只能显式记为 `unknown`,不得推断含义
+- 当 Ark Vision 处理聊天/IM 截图时,最终 `transcript` 必须保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
@@ -604,6 +608,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 首页主体验已切到单列聚焦布局:Header 后直接进入主输入区,输入区下方保留独立的 `STEP 1 / STEP 2 / STEP 3` 轻量流程区,再往下才是 `我的事项`
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
 - 首页图片上传现支持一次多选多张图片:前端保留选择顺序、展示编号/缩略图/文件名/大小,允许逐项移除与继续添加,拖拽同样支持多图;文档仍保持一次一个
+- 首页图片粘贴入口现属于整个 evidence upload area:第一次 Ctrl/Cmd+V 贴图后,上传区会保持焦点以便继续粘贴第 2 / 3 张图片;粘贴、本地选择、拖拽三种入口最终都走同一个 `appendFiles / validation` 流程,且不会干扰 `source / source_detail / record_date` 等其它表单输入
 - `/api/evidence` 现统一以 Submission 为入口:单文字/单图片/单文档会创建 `1 Submission + 1 Evidence`,多图会创建 `1 Submission + N Evidence`;后台对多图只启动一个顺序 wrapper,按 `submission_evidence.position` 逐张执行现有 `Extraction -> Semantic Parse -> Event Matcher`
 - 多图批次禁止共用一个 `record_date`:前端会禁用并清空日期输入,服务端也会拒绝 `multi-image + non-empty record_date`,避免把同一日期广播到全部图片
 - 首页补充信息现仅保留 `source / source_detail / record_date`,继续收纳进"补充信息(可选)"折叠区;前端已移除 `counterpart`,但服务端兼容字段仍保留

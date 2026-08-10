@@ -2270,10 +2270,20 @@ def _run_image_pipeline(
 ) -> None:
     mime_type = _detect_blob_content_type(image_bytes, filename)
     selected_provider = get_image_extraction_provider()
+    conn = init_db(sandbox_db_path)
+    try:
+        evidence_row = conn.execute(
+            "SELECT source_hint FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        source_hint = None if evidence_row is None else evidence_row["source_hint"]
+    finally:
+        conn.close()
     extraction_result = run_production_image_extraction(
         image_bytes,
         mime_type,
         provider=selected_provider,
+        source_hint=source_hint,
         allow_ocr_fallback=selected_provider != "ocr",
         consume_ocr_fallback_budget=(
             None
@@ -3486,6 +3496,13 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="blob not found")
 
             latest_extraction = get_latest_extraction(conn, evidence_id)
+            evidence_source_hint_row = conn.execute(
+                "SELECT source_hint FROM evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            evidence_source_hint = (
+                None if evidence_source_hint_row is None else evidence_source_hint_row["source_hint"]
+            )
             baseline = _build_extraction_baseline_summary(latest_extraction)
         finally:
             conn.close()
@@ -3514,7 +3531,11 @@ def create_app() -> FastAPI:
                 ),
             )
 
-        diagnostic = vision_provider.diagnose_visual_evidence(image_bytes, mime_type)
+        diagnostic = vision_provider.diagnose_visual_evidence(
+            image_bytes,
+            mime_type,
+            source_hint=evidence_source_hint,
+        )
         detail = _ark_diagnostic_detail(text_preflight, diagnostic)
         if not diagnostic["success"]:
             _log_ark_diagnostic_attempt(

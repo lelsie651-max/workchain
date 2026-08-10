@@ -13,7 +13,7 @@ def test_extract_image_evidence_defaults_to_current_ocr(monkeypatch):
     )
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: pytest.fail("默认不应调用实验视觉 provider"),
+        lambda image_bytes, mime_type, source_hint=None: pytest.fail("默认不应调用实验视觉 provider"),
     )
 
     result = evidence_extractor.extract_image_evidence(b"fake-image", "image/png")
@@ -44,28 +44,60 @@ def test_extract_image_evidence_keeps_text_only_ocr_behavior(monkeypatch):
     }
 
 
+def test_extract_image_evidence_passes_source_hint_to_ark_provider(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_extract_visual_evidence(image_bytes, mime_type, source_hint=None):
+        captured["source_hint"] = source_hint
+        return {
+            "transcript": "Ark transcript",
+            "observations": [],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(
+        "app.evidence_extractor.vision_provider.extract_visual_evidence",
+        fake_extract_visual_evidence,
+    )
+
+    result = evidence_extractor.extract_image_evidence(
+        b"fake-image",
+        "image/png",
+        provider=evidence_extractor.ARK_VISION_EXTRACTION_PROVIDER,
+        source_hint="微信-单聊",
+    )
+
+    assert captured["source_hint"] == "微信-单聊"
+    assert result["transcript"] == "Ark transcript"
+
+
 def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeypatch):
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: {
+        lambda image_bytes, mime_type, source_hint=None: {
             "transcript": (
-                "[chat_title] 微信单聊\n"
-                "[message 1][right_account] 计划6月16日上午搬走\n"
-                "[message 2][left_contact] 好的\n"
-                "[message 3][right_account] 8月16日,打错了\n"
-                "[message 4][left_contact] 这个月16号哈"
+                "[scene] platform=微信; conversation_type=direct_chat\n"
+                "[chat_header] 戴雯\n"
+                "[participant][left_account] display_name=戴雯\n"
+                "[participant][right_account] display_name=unknown\n"
+                "[message 1][left_account] 饭之\n"
+                "[message 2][left_account] 刚开始给我13呢\n"
+                "[message 3][right_account] 怎么了\n"
+                '[message 6][left_account][quote speaker="戴雯" text="刚开始给我13呢"] 感觉被侮辱了'
             ),
             "observations": [
                 {
                     "kind": "chat_context",
-                    "content": "画面为微信单聊截图,顶部可见聊天标题。",
-                    "confidence": 0.74,
+                    "content": "platform=微信; conversation_type=direct_chat",
+                    "confidence": None,
                 },
                 {
                     "kind": "participant_layout",
-                    "content": "右侧第1/3条消息属于同一视觉发送方,左侧第2/4条消息属于另一视觉发送方。",
+                    "content": "左侧消息与右侧消息为两个稳定发送方。",
                     "confidence": 0.8,
-                }
+                },
             ],
             "provider": "doubao-ark",
             "model": "doubao-seed-2-0-lite-260215",
@@ -77,32 +109,15 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
         b"fake-image",
         "image/png",
         provider=evidence_extractor.ARK_VISION_EXTRACTION_PROVIDER,
+        source_hint="微信-单聊",
     )
 
-    assert result == {
-        "transcript": (
-            "[chat_title] 微信单聊\n"
-            "[message 1][right_account] 计划6月16日上午搬走\n"
-            "[message 2][left_contact] 好的\n"
-            "[message 3][right_account] 8月16日,打错了\n"
-            "[message 4][left_contact] 这个月16号哈"
-        ),
-        "observations": [
-            {
-                "kind": "chat_context",
-                "content": "画面为微信单聊截图,顶部可见聊天标题。",
-                "confidence": 0.74,
-            },
-            {
-                "kind": "participant_layout",
-                "content": "右侧第1/3条消息属于同一视觉发送方,左侧第2/4条消息属于另一视觉发送方。",
-                "confidence": 0.8,
-            }
-        ],
-        "provider": "doubao-ark",
-        "model": "doubao-seed-2-0-lite-260215",
-        "warnings": [],
-    }
+    assert result["transcript"].startswith("[scene] platform=微信; conversation_type=direct_chat")
+    assert "[participant][left_account] display_name=戴雯" in result["transcript"]
+    assert "[participant][right_account] display_name=unknown" in result["transcript"]
+    assert "[message 1][left_account] 饭之" in result["transcript"]
+    assert '[message 6][left_account][quote speaker="戴雯" text="刚开始给我13呢"] 感觉被侮辱了' in result["transcript"]
+    assert "[left_饭之]" not in result["transcript"]
 
 
 def test_extract_image_evidence_ocr_text_only_path_does_not_fabricate_speaker_refs(monkeypatch):
@@ -117,6 +132,7 @@ def test_extract_image_evidence_ocr_text_only_path_does_not_fabricate_speaker_re
     assert result["transcript"] == "计划6月16日上午搬走\n好的\n8月16日,打错了"
     assert "[message 1]" not in result["transcript"]
     assert "[right_account]" not in result["transcript"]
+    assert "[participant]" not in result["transcript"]
 
 
 def test_extract_image_evidence_can_switch_to_experimental_provider_via_env(monkeypatch):
@@ -126,7 +142,7 @@ def test_extract_image_evidence_can_switch_to_experimental_provider_via_env(monk
     )
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: {
+        lambda image_bytes, mime_type, source_hint=None: {
             "transcript": None,
             "observations": [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": None}],
             "provider": "doubao-ark",
@@ -183,15 +199,21 @@ def test_image_extraction_startup_for_ark_does_not_require_dashscope(monkeypatch
 
 
 def test_run_production_image_extraction_uses_ark_only_when_successful(monkeypatch):
-    monkeypatch.setattr(
-        "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: {
+    captured: dict[str, object] = {}
+
+    def fake_extract_visual_evidence(image_bytes, mime_type, source_hint=None):
+        captured["source_hint"] = source_hint
+        return {
             "transcript": "Ark transcript",
             "observations": [{"kind": "reaction", "content": "有人点了赞", "confidence": 0.6}],
             "provider": "doubao-ark",
             "model": "ark-model",
             "warnings": [],
-        },
+        }
+
+    monkeypatch.setattr(
+        "app.evidence_extractor.vision_provider.extract_visual_evidence",
+        fake_extract_visual_evidence,
     )
     monkeypatch.setattr(
         "app.evidence_extractor.ocr.image_to_text",
@@ -202,9 +224,11 @@ def test_run_production_image_extraction_uses_ark_only_when_successful(monkeypat
         b"fake-image",
         "image/png",
         provider=evidence_extractor.ARK_VISION_EXTRACTION_PROVIDER,
+        source_hint="微信-单聊",
         allow_ocr_fallback=True,
     )
 
+    assert captured["source_hint"] == "微信-单聊"
     assert result["configured_provider"] == "ark_vision"
     assert result["fallback_used"] is False
     assert result["detail"] is None
@@ -216,7 +240,7 @@ def test_run_production_image_extraction_falls_back_to_ocr_with_warning(monkeypa
     budget_calls = []
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: None,
+        lambda image_bytes, mime_type, source_hint=None: None,
     )
     monkeypatch.setattr("app.evidence_extractor.ocr.is_configured", lambda: True)
     monkeypatch.setattr(
@@ -243,7 +267,7 @@ def test_run_production_image_extraction_returns_safe_failure_when_fallback_unav
     budget_calls = []
     monkeypatch.setattr(
         "app.evidence_extractor.vision_provider.extract_visual_evidence",
-        lambda image_bytes, mime_type: None,
+        lambda image_bytes, mime_type, source_hint=None: None,
     )
     monkeypatch.setattr("app.evidence_extractor.ocr.is_configured", lambda: True)
     monkeypatch.setattr(
