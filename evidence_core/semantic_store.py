@@ -805,9 +805,11 @@ def create_submission(
     normalized_evidence_ids = _normalize_non_empty_ids("evidence_ids", evidence_ids)
     created_at = _now_ms() if created_at is None else created_at
     submission_id = submission_id or _new_id("sub")
+    started_transaction = not conn.in_transaction
 
     try:
-        _begin(conn)
+        if started_transaction:
+            _begin(conn)
         _ensure_evidence_exists(conn, normalized_evidence_ids)
 
         occupied = _fetch_existing_ids(
@@ -835,10 +837,12 @@ def create_submission(
                 (submission_id, evidence_id, position),
             )
         result = _load_submission(conn, submission_id)
-        conn.commit()
+        if started_transaction:
+            conn.commit()
         return result
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
         raise
 
 

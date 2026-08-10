@@ -154,7 +154,7 @@ V2 的目标底层关系为:
 `Submission → Evidence → Fact → Event → Derived State`
 
 其中:
-- **Submission**: 一次用户提交动作,可以包含多份 Evidence,并保留顺序
+- **Submission**: 一次用户提交动作,可以包含多份 Evidence,并保留选择顺序;当前允许 `1 段文字`、`1 个文档` 或 `N 张图片`,其中多文件批次只允许全部为图片
 - **Evidence**: 原始不可变材料,仍是哈希链唯一保护对象
 - **Fact**: 从一份或多份 Evidence 中抽出的中立事实表达
 - **Event**: 多个 Fact 归并后形成的事件容器
@@ -285,6 +285,11 @@ V2 的目标底层关系为:
 | submission_id | TEXT PK | 一次提交动作 |
 | created_at | INTEGER NOT NULL | 创建时间 |
 | source_hint | TEXT | 来源提示 |
+
+语义边界:
+- 新产生的单文字、单图片、单文档提交,也必须创建一个只含 `1` 个 Evidence 的 Submission
+- 多图提交时,每张图片都必须作为独立 Evidence 写入,不得把多图合并为一个 Evidence / blob / transcript / Semantic Run
+- 同一次多图提交里的 `submission_evidence.position` 只表示用户选择顺序,不代表真实发生时间顺序
 
 #### submission_evidence
 
@@ -598,6 +603,9 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - FastAPI + Jinja 首页 / 详情页 / 帮助页 / 搜索页 / 事项线页
 - 首页主体验已切到单列聚焦布局:Header 后直接进入主输入区,输入区下方保留独立的 `STEP 1 / STEP 2 / STEP 3` 轻量流程区,再往下才是 `我的事项`
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
+- 首页图片上传现支持一次多选多张图片:前端保留选择顺序、展示编号/缩略图/文件名/大小,允许逐项移除与继续添加,拖拽同样支持多图;文档仍保持一次一个
+- `/api/evidence` 现统一以 Submission 为入口:单文字/单图片/单文档会创建 `1 Submission + 1 Evidence`,多图会创建 `1 Submission + N Evidence`;后台对多图只启动一个顺序 wrapper,按 `submission_evidence.position` 逐张执行现有 `Extraction -> Semantic Parse -> Event Matcher`
+- 多图批次禁止共用一个 `record_date`:前端会禁用并清空日期输入,服务端也会拒绝 `multi-image + non-empty record_date`,避免把同一日期广播到全部图片
 - 首页补充信息现仅保留 `source / source_detail / record_date`,继续收纳进"补充信息(可选)"折叠区;前端已移除 `counterpart`,但服务端兼容字段仍保留
 - 首页示例 chips 已移除,避免次要引导继续抢占首屏与主输入动作
 - 首页主输入区下方不再保留额外产品说明或营销文案,只保留三步流程说明;Header 品牌副标题继续作为轻量品牌信息

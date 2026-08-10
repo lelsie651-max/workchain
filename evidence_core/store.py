@@ -90,8 +90,14 @@ def append_evidence(
     blobs_root = Path(blobs_root)
     generated_evidence_id = evidence_id or f"ev_{uuid.uuid4().hex[:12]}"
 
+    started_transaction = not conn.in_transaction
+    savepoint_name = f"sp_{uuid.uuid4().hex[:12]}"
+
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        if started_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute(f"SAVEPOINT {savepoint_name}")
         content_hash = chain.compute_content_hash(payload)
         blob_path = _write_blob(blobs_root, content_hash, blob_bytes)
 
@@ -177,10 +183,17 @@ def append_evidence(
             "SELECT * FROM evidence WHERE evidence_id = ?",
             (generated_evidence_id,),
         ).fetchone()
-        conn.commit()
+        if started_transaction:
+            conn.commit()
+        else:
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
         return _row_to_dict(row)
     except Exception:
-        conn.rollback()
+        if started_transaction:
+            conn.rollback()
+        else:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
         raise
 
 

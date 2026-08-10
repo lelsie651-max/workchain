@@ -61,6 +61,7 @@ from evidence_core.extraction_store import create_extraction, get_latest_extract
 from evidence_core.semantic_store import (
     ProtectedFactError,
     SemanticStoreError,
+    create_submission,
     create_event_change_run,
     create_semantic_run,
     create_event_match_run,
@@ -515,11 +516,22 @@ def _current_upload_storage_bytes(conn: sqlite3.Connection, blobs_root: Path) ->
     return total
 
 
-def _ensure_upload_budget(conn: sqlite3.Connection, blobs_root: Path, blob_bytes: bytes) -> None:
-    content_hash = chain.compute_content_hash(blob_bytes)
-    blob_path = blobs_root / content_hash[:2] / f"{content_hash}.bin"
-    additional_bytes = 0 if blob_path.exists() else len(blob_bytes)
+def _ensure_upload_budget(
+    conn: sqlite3.Connection,
+    blobs_root: Path,
+    blob_payloads: Iterable[bytes],
+) -> None:
     current_total = _current_upload_storage_bytes(conn, blobs_root)
+    additional_bytes = 0
+    seen_hashes: set[str] = set()
+    for blob_bytes in blob_payloads:
+        content_hash = chain.compute_content_hash(blob_bytes)
+        if content_hash in seen_hashes:
+            continue
+        seen_hashes.add(content_hash)
+        blob_path = blobs_root / content_hash[:2] / f"{content_hash}.bin"
+        if not blob_path.exists():
+            additional_bytes += len(blob_bytes)
     if current_total + additional_bytes > MAX_SANDBOX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="这个沙箱累计上传已超过 50 MB")
 
@@ -1444,26 +1456,33 @@ async def _parse_evidence_input(request: Request) -> dict[str, Any]:
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
-        file_value = form.get("file")
-        upload = file_value if _is_upload_value(file_value) else None
-        file_bytes = None
-        detected_media_type = None
-        detected_content_type = None
-        if upload is not None and upload.filename:
+        uploads: list[dict[str, Any]] = []
+        for form_value in form.getlist("file"):
+            upload = form_value if _is_upload_value(form_value) else None
+            if upload is None:
+                continue
             file_bytes = await upload.read()
+            if not file_bytes and not upload.filename:
+                continue
             if len(file_bytes) > MAX_FILE_BYTES:
                 raise HTTPException(status_code=400, detail="单个文件不能超过 8 MB")
             detected_media_type, detected_content_type = _detect_upload_type(upload, file_bytes)
+            uploads.append(
+                {
+                    "upload": upload,
+                    "file_bytes": file_bytes,
+                    "media_type": detected_media_type,
+                    "file_content_type": detected_content_type,
+                    "filename": upload.filename or None,
+                }
+            )
         return {
             "text": str(form.get("text", "")).strip(),
             "source": str(form.get("source", "")).strip(),
             "source_detail": str(form.get("source_detail", "")).strip() or None,
             "counterpart": str(form.get("counterpart", "")).strip() or None,
             "record_date": _normalize_record_date_input(form.get("record_date")),
-            "upload": upload,
-            "file_bytes": file_bytes,
-            "media_type": detected_media_type,
-            "file_content_type": detected_content_type,
+            "uploads": uploads,
         }
 
     payload = await request.json()
@@ -1473,10 +1492,7 @@ async def _parse_evidence_input(request: Request) -> dict[str, Any]:
         "source_detail": None if payload.get("source_detail") is None else str(payload.get("source_detail")).strip() or None,
         "counterpart": None if payload.get("counterpart") is None else str(payload.get("counterpart")).strip() or None,
         "record_date": _normalize_record_date_input(payload.get("record_date")),
-        "upload": None,
-        "file_bytes": None,
-        "media_type": None,
-        "file_content_type": None,
+        "uploads": [],
     }
 
 
@@ -2312,6 +2328,40 @@ def _run_image_pipeline(
         global_meta_db_path,
         evidence_id,
     )
+
+
+def _mark_pipeline_exception(
+    sandbox_db_path: Path,
+    evidence_id: str,
+    *,
+    detail: str = "解析暂不可用,记录已完整保存",
+) -> None:
+    conn = init_db(sandbox_db_path)
+    try:
+        _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
+        _set_parse_detail(conn, evidence_id, detail)
+        _set_extract_note(conn, evidence_id, detail)
+    finally:
+        conn.close()
+
+
+def _run_multi_image_pipeline(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    image_items: list[dict[str, Any]],
+) -> None:
+    for item in image_items:
+        try:
+            _run_image_pipeline(
+                sandbox_db_path,
+                global_meta_db_path,
+                item["evidence_id"],
+                item["image_bytes"],
+                item.get("filename"),
+                None,
+            )
+        except Exception:
+            _mark_pipeline_exception(sandbox_db_path, item["evidence_id"])
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -4359,12 +4409,10 @@ def create_app() -> FastAPI:
         payload = await _parse_evidence_input(request)
         text = payload["text"]
         record_date = payload["record_date"]
-        upload = payload["upload"]
-        file_bytes = payload["file_bytes"]
-        upload_media_type = payload["media_type"]
-        if not text and file_bytes is None:
-            raise HTTPException(status_code=400, detail="请输入内容或选择一个文件")
-        if text and file_bytes is not None:
+        uploads = payload["uploads"]
+        if not text and not uploads:
+            raise HTTPException(status_code=400, detail="请输入内容或选择文件")
+        if text and uploads:
             raise HTTPException(status_code=400, detail="文字记录和文件不能同时提交，请二选一。")
         if len(text) > MAX_TEXT_LENGTH:
             raise HTTPException(status_code=400, detail="内容过长,请控制在 20000 字以内")
@@ -4377,7 +4425,19 @@ def create_app() -> FastAPI:
 
         source_detail = payload["source_detail"]
         source_hint = source if not source_detail else f"{source}-{source_detail}"
-        counterpart = payload["counterpart"] or None
+        submission_size = 1 if text else len(uploads)
+
+        if len(uploads) > 1:
+            if record_date is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="多张图片不能同时补充同一个记录日期，请逐张上传或清空日期。",
+                )
+            if any(item["media_type"] != "image" for item in uploads):
+                raise HTTPException(
+                    status_code=400,
+                    detail="一次上传多个文件时，只支持多张图片；文档一次只能传一个。",
+                )
 
         conn = _open_write_connection(sandbox.db_path)
         try:
@@ -4389,133 +4449,243 @@ def create_app() -> FastAPI:
                 """,
                 (_start_of_current_day_ms(),),
             ).fetchone()["count"]
-            if today_count >= 50:
-                raise HTTPException(status_code=429, detail="你今天已经存了 50 条,明天再来继续")
+            if today_count + submission_size > 50:
+                if today_count >= 50:
+                    raise HTTPException(status_code=429, detail="你今天已经存了 50 条,明天再来继续")
+                raise HTTPException(status_code=429, detail="本次提交后今天会超过 50 条，请减少图片数量后再试")
+
+            if uploads:
+                _ensure_upload_budget(
+                    conn,
+                    sandbox.blobs_root,
+                    [item["file_bytes"] for item in uploads],
+                )
 
             now_ms = int(time.time() * 1000)
-            media_type = "text"
-            append_payload: bytes | str = text
-            raw_text_override = None
-            parse_status = PARSE_STATUS_LLM_RUNNING
-            parse_detail = ""
-            extract_note = None
-            image_pipeline_args = None
-            extracted_transcript = text if media_type == "text" else None
-            if file_bytes is not None and upload_media_type is not None:
-                _ensure_upload_budget(conn, sandbox.blobs_root, file_bytes)
-                media_type = upload_media_type
-                append_payload = file_bytes
-                filename = upload.filename if upload is not None else None
-                raw_text_override = _build_attachment_raw_text(media_type, filename)
-                extracted_transcript = None
-                if media_type == "image":
-                    image_startup = get_image_extraction_startup()
-                    if not image_startup["supported"] or not image_startup["configured"]:
-                        parse_status = PARSE_STATUS_UNSUPPORTED
-                        extract_note = image_startup["detail"] or "图片提取暂不可用"
-                        parse_detail = _saved_original_detail(extract_note)
-                    elif image_startup["requires_ocr_budget_on_start"]:
-                        allowed, reason = _consume_ocr_budget(sandbox.db_path, request.app.state.global_meta_db_path)
-                        if allowed:
-                            parse_status = PARSE_STATUS_OCR_RUNNING
-                            parse_detail = ""
-                            image_pipeline_args = (file_bytes, filename, counterpart)
+            prepared_items: list[dict[str, Any]] = []
+            if text:
+                prepared_items.append(
+                    {
+                        "media_type": "text",
+                        "append_payload": text,
+                        "raw_text_override": None,
+                        "parse_status": PARSE_STATUS_LLM_RUNNING,
+                        "parse_detail": "",
+                        "extract_note": None,
+                        "extracted_transcript": text,
+                        "filename": None,
+                        "image_pipeline_item": None,
+                    }
+                )
+            else:
+                for upload_item in uploads:
+                    media_type = upload_item["media_type"]
+                    file_bytes = upload_item["file_bytes"]
+                    filename = upload_item["filename"]
+                    prepared_item = {
+                        "media_type": media_type,
+                        "append_payload": file_bytes,
+                        "raw_text_override": _build_attachment_raw_text(media_type, filename),
+                        "parse_status": PARSE_STATUS_LLM_RUNNING,
+                        "parse_detail": "",
+                        "extract_note": None,
+                        "extracted_transcript": None,
+                        "filename": filename,
+                        "image_pipeline_item": None,
+                    }
+                    if media_type == "image":
+                        image_startup = get_image_extraction_startup()
+                        if not image_startup["supported"] or not image_startup["configured"]:
+                            prepared_item["parse_status"] = PARSE_STATUS_UNSUPPORTED
+                            prepared_item["extract_note"] = image_startup["detail"] or "图片提取暂不可用"
+                            prepared_item["parse_detail"] = _saved_original_detail(prepared_item["extract_note"])
+                        elif image_startup["requires_ocr_budget_on_start"]:
+                            allowed, reason = _consume_ocr_budget(
+                                sandbox.db_path,
+                                request.app.state.global_meta_db_path,
+                            )
+                            if allowed:
+                                prepared_item["parse_status"] = PARSE_STATUS_OCR_RUNNING
+                                prepared_item["image_pipeline_item"] = {
+                                    "image_bytes": file_bytes,
+                                    "filename": filename,
+                                }
+                            else:
+                                prepared_item["parse_status"] = PARSE_STATUS_UNSUPPORTED
+                                prepared_item["extract_note"] = reason
+                                prepared_item["parse_detail"] = _saved_original_detail(
+                                    reason or "图片识别暂不可用"
+                                )
                         else:
-                            parse_status = PARSE_STATUS_UNSUPPORTED
-                            extract_note = reason
-                            parse_detail = _saved_original_detail(reason or "图片识别暂不可用")
+                            prepared_item["parse_status"] = PARSE_STATUS_OCR_RUNNING
+                            prepared_item["image_pipeline_item"] = {
+                                "image_bytes": file_bytes,
+                                "filename": filename,
+                            }
                     else:
-                        parse_status = PARSE_STATUS_OCR_RUNNING
-                        parse_detail = ""
-                        image_pipeline_args = (file_bytes, filename, counterpart)
-                else:
-                    extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
-                    if extracted_text is not None:
-                        raw_text_override = _build_attachment_raw_text(media_type, filename, extracted_text)
-                        extracted_transcript = extracted_text
-                        parse_status = PARSE_STATUS_LLM_RUNNING
-                        parse_detail = ""
-                    else:
-                        parse_status = PARSE_STATUS_UNSUPPORTED
-                        extract_note = extract_status
-                        parse_detail = _saved_original_detail(extract_status)
+                        extracted_text, extract_status = extract_text(file_bytes, media_type, filename or "")
+                        if extracted_text is not None:
+                            prepared_item["raw_text_override"] = _build_attachment_raw_text(
+                                media_type,
+                                filename,
+                                extracted_text,
+                            )
+                            prepared_item["extracted_transcript"] = extracted_text
+                        else:
+                            prepared_item["parse_status"] = PARSE_STATUS_UNSUPPORTED
+                            prepared_item["extract_note"] = extract_status
+                            prepared_item["parse_detail"] = _saved_original_detail(extract_status)
+                    prepared_items.append(prepared_item)
 
-            row = append_evidence(
-                conn,
-                blobs_root=sandbox.blobs_root,
-                media_type=media_type,
-                payload=append_payload,
-                captured_at=now_ms,
-                occurred_at=now_ms,
-                source_hint=source_hint,
-                kind="reference",
-            )
-            if media_type == "text" and text:
-                _record_machine_extraction(
-                    conn,
-                    evidence_id=row["evidence_id"],
-                    transcript=text,
-                    observations=[],
-                    provider="builtin",
-                    model=None,
-                    warnings=[],
-                    created_at=now_ms,
-                )
-            if raw_text_override is not None:
-                conn.execute(
-                    "UPDATE evidence SET raw_text = ?, plain_summary = ? WHERE evidence_id = ?",
-                    (raw_text_override, text or None, row["evidence_id"]),
-                )
-                if media_type != "image" and extracted_transcript:
-                    _record_machine_extraction(
+            created_items: list[dict[str, Any]] = []
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for prepared_item in prepared_items:
+                    row = append_evidence(
                         conn,
-                        evidence_id=row["evidence_id"],
-                        transcript=extracted_transcript,
-                        observations=[],
-                        provider="builtin",
-                        model=None,
-                        warnings=[],
-                        created_at=now_ms,
+                        blobs_root=sandbox.blobs_root,
+                        media_type=prepared_item["media_type"],
+                        payload=prepared_item["append_payload"],
+                        captured_at=now_ms,
+                        occurred_at=now_ms,
+                        source_hint=source_hint,
+                        kind="reference",
                     )
-                row = conn.execute("SELECT * FROM evidence WHERE evidence_id = ?", (row["evidence_id"],)).fetchone()
-                row = dict(row)
-            _set_parse_status(conn, row["evidence_id"], parse_status)
-            _set_parse_detail(conn, row["evidence_id"], parse_detail)
-            if extract_note is not None:
-                _set_extract_note(conn, row["evidence_id"], extract_note)
-            if record_date is not None:
-                _set_semantic_anchor(conn, row["evidence_id"], record_date, "user", commit=False)
-            conn.commit()
+                    if prepared_item["media_type"] == "text" and text:
+                        _record_machine_extraction(
+                            conn,
+                            evidence_id=row["evidence_id"],
+                            transcript=text,
+                            observations=[],
+                            provider="builtin",
+                            model=None,
+                            warnings=[],
+                            created_at=now_ms,
+                        )
+                    if prepared_item["raw_text_override"] is not None:
+                        conn.execute(
+                            "UPDATE evidence SET raw_text = ?, plain_summary = ? WHERE evidence_id = ?",
+                            (prepared_item["raw_text_override"], text or None, row["evidence_id"]),
+                        )
+                        if (
+                            prepared_item["media_type"] != "image"
+                            and prepared_item["extracted_transcript"]
+                        ):
+                            _record_machine_extraction(
+                                conn,
+                                evidence_id=row["evidence_id"],
+                                transcript=prepared_item["extracted_transcript"],
+                                observations=[],
+                                provider="builtin",
+                                model=None,
+                                warnings=[],
+                                created_at=now_ms,
+                            )
+                        row = conn.execute(
+                            "SELECT * FROM evidence WHERE evidence_id = ?",
+                            (row["evidence_id"],),
+                        ).fetchone()
+                        row = dict(row)
+                    _set_parse_status(conn, row["evidence_id"], prepared_item["parse_status"])
+                    _set_parse_detail(conn, row["evidence_id"], prepared_item["parse_detail"])
+                    if prepared_item["extract_note"] is not None:
+                        _set_extract_note(conn, row["evidence_id"], prepared_item["extract_note"])
+                    if record_date is not None:
+                        _set_semantic_anchor(conn, row["evidence_id"], record_date, "user", commit=False)
+                    created_items.append(
+                        {
+                            "row": row,
+                            "parse_status": prepared_item["parse_status"],
+                            "image_pipeline_item": prepared_item["image_pipeline_item"],
+                        }
+                    )
+
+                submission = create_submission(
+                    conn,
+                    evidence_ids=[item["row"]["evidence_id"] for item in created_items],
+                    created_at=now_ms,
+                    source_hint=source_hint,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
         finally:
             conn.close()
 
-        if parse_status == PARSE_STATUS_LLM_RUNNING:
+        image_pipeline_items = [
+            {
+                "evidence_id": item["row"]["evidence_id"],
+                "image_bytes": item["image_pipeline_item"]["image_bytes"],
+                "filename": item["image_pipeline_item"]["filename"],
+            }
+            for item in created_items
+            if item["parse_status"] == PARSE_STATUS_OCR_RUNNING and item["image_pipeline_item"] is not None
+        ]
+        llm_pipeline_evidence_ids = [
+            item["row"]["evidence_id"]
+            for item in created_items
+            if item["parse_status"] == PARSE_STATUS_LLM_RUNNING
+        ]
+
+        for evidence_id in llm_pipeline_evidence_ids:
             background_tasks.add_task(
                 _run_parse_pipeline,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
-                row["evidence_id"],
+                evidence_id,
             )
-        elif parse_status == PARSE_STATUS_OCR_RUNNING and image_pipeline_args is not None:
+        if len(image_pipeline_items) == 1:
+            image_item = image_pipeline_items[0]
             background_tasks.add_task(
                 _run_image_pipeline,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
-                row["evidence_id"],
-                image_pipeline_args[0],
-                image_pipeline_args[1],
-                image_pipeline_args[2],
+                image_item["evidence_id"],
+                image_item["image_bytes"],
+                image_item["filename"],
+                None,
+            )
+        elif len(image_pipeline_items) > 1:
+            background_tasks.add_task(
+                _run_multi_image_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                image_pipeline_items,
             )
 
-        response = JSONResponse(
-            {
-                "evidence_id": row["evidence_id"],
-                "seq": row["seq"],
-                "occurred_at": row["occurred_at"],
-                "parse_status": parse_status,
-                "media_type": row["media_type"],
-            }
-        )
+        response_payload: dict[str, Any] = {
+            "submission_id": submission["submission_id"],
+        }
+        if len(created_items) == 1:
+            row = created_items[0]["row"]
+            response_payload.update(
+                {
+                    "evidence_id": row["evidence_id"],
+                    "seq": row["seq"],
+                    "occurred_at": row["occurred_at"],
+                    "parse_status": created_items[0]["parse_status"],
+                    "media_type": row["media_type"],
+                }
+            )
+        else:
+            response_payload.update(
+                {
+                    "evidence_ids": [item["row"]["evidence_id"] for item in created_items],
+                    "items": [
+                        {
+                            "evidence_id": item["row"]["evidence_id"],
+                            "seq": item["row"]["seq"],
+                            "occurred_at": item["row"]["occurred_at"],
+                            "parse_status": item["parse_status"],
+                            "media_type": item["row"]["media_type"],
+                        }
+                        for item in created_items
+                    ],
+                }
+            )
+
+        response = JSONResponse(response_payload)
         apply_sandbox_cookie(response, sandbox)
         return response
 

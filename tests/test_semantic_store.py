@@ -315,6 +315,19 @@ def test_create_submission_rolls_back_when_evidence_already_belongs_to_other_sub
     assert _count(conn, "submission_evidence") == 1
 
 
+def test_create_submission_supports_nested_transaction(db_file, blobs_root):
+    conn = init_db(db_file)
+    _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+
+    conn.execute("BEGIN IMMEDIATE")
+    create_submission(conn, submission_id="sub-1", created_at=10, evidence_ids=["ev-1", "ev-2"])
+    conn.rollback()
+
+    assert _count(conn, "submissions") == 0
+    assert _count(conn, "submission_evidence") == 0
+
+
 def test_create_event_trims_title_and_defaults_active(db_file):
     conn = init_db(db_file)
 

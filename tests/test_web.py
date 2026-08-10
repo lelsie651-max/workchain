@@ -29,7 +29,7 @@ from app import main as main_module
 from app.main import create_app
 from evidence_core.chain import compute_content_hash
 from evidence_core.db import init_db
-from evidence_core.store import verify_chain
+from evidence_core.store import append_evidence, verify_chain
 
 
 PNG_BYTES = base64.b64decode(
@@ -47,6 +47,12 @@ def _build_png_bytes(width: int, height: int, color: tuple[int, int, int] = (32,
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
+
+
+def _padded_png_bytes(total_size: int, fill_byte: bytes = b"0") -> bytes:
+    if total_size <= len(PNG_BYTES):
+        return PNG_BYTES[:total_size]
+    return PNG_BYTES + (fill_byte * (total_size - len(PNG_BYTES)))
 
 
 def _build_pdf_bytes(text: str | None = None, *, image_only: bool = False) -> bytes:
@@ -128,6 +134,7 @@ def _multipart_request(
     *,
     data: dict[str, str],
     file_part: tuple[str, bytes, str] | None = None,
+    file_parts: list[tuple[str, bytes, str]] | None = None,
 ):
     boundary = "----workchain-boundary"
     body = bytearray()
@@ -138,8 +145,8 @@ def _multipart_request(
         body.extend(str(value).encode("utf-8"))
         body.extend(b"\r\n")
 
-    if file_part is not None:
-        filename, payload, content_type = file_part
+    normalized_file_parts = file_parts or ([] if file_part is None else [file_part])
+    for filename, payload, content_type in normalized_file_parts:
         body.extend(f"--{boundary}\r\n".encode("ascii"))
         body.extend(
             f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode("utf-8")
@@ -1201,7 +1208,7 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert 'id="text-input-region"' in response.text
     assert 'id="file-picker-region"' in response.text
     assert 'id="text-mode-hint"' in response.text
-    assert "清空文字后可改用文件" in response.text
+    assert "清空文字后可继续选择图片或文档" in response.text
     assert "STEP 1" in response.text
     assert "STEP 2" in response.text
     assert "STEP 3" in response.text
@@ -1210,15 +1217,25 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert "EXAMPLE_TEXTS" not in response.text
     assert "counterpart" not in response.text
     assert "syncInputMode();" in response.text
+    assert 'type="file"' in response.text
+    assert "multiple" in response.text
     assert 'min="1900-01-01"' in response.text
     assert 'max="2100-12-31"' in response.text
     assert 'textInputRegion.classList.toggle("hidden", hideTextInput);' in response.text
-    assert 'filePickerRegion.classList.toggle("hidden", hasFile || hasTextInput);' in response.text
+    assert 'filePickerRegion.classList.toggle("hidden", hasTextInput);' in response.text
     assert 'textModeHint.classList.toggle("hidden", !hasTextInput || hasFile);' in response.text
     assert "fileInput.disabled = disableFileInput" in response.text
+    assert "let selectedFiles = [];" in response.text
+    assert 'formData.append("file", file, fallbackFileName(file));' in response.text
+    assert 'window.location.href = "/records";' in response.text
+    assert 'data-remove-selected-file="${index}"' in response.text
+    assert "Array.from(event.dataTransfer?.files || [])" in response.text
+    assert "recordDateInput.disabled = disableRecordDate;" in response.text
+    assert "recordDateInput.value = \"\";" in response.text
     assert 'name="record_date"' in response.text
     assert "记录发生日期" in response.text
     assert "有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。" in response.text
+    assert "多张图片不能共用同一个记录发生日期，请逐张上传后分别补充。" in response.text
     assert "recordDateInput.reportValidity();" in response.text
     assert 'formData.append("counterpart"' not in response.text
     assert 'window.location.reload()' not in response.text
@@ -2780,6 +2797,488 @@ def test_multipart_text_and_file_submission_returns_400(tmp_path, monkeypatch):
 
     assert response.status_code == 400
     assert response.json()["detail"] == "文字记录和文件不能同时提交，请二选一。"
+
+
+@pytest.mark.parametrize("kind", ["text", "image", "file"])
+def test_single_submission_also_creates_one_evidence_submission(tmp_path, monkeypatch, kind: str):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        if kind == "text":
+            response = client.post(
+                "/api/evidence",
+                json={"text": "单条文字记录", "source": "飞书", "source_detail": "项目复盘群"},
+            )
+        elif kind == "image":
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("single.png", PNG_BYTES, "image/png")},
+            )
+        else:
+            response = client.post(
+                "/api/evidence",
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                files={"file": ("single.pdf", _build_pdf_bytes("文档内容"), "application/pdf")},
+            )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["submission_id"]
+    assert payload["evidence_id"]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT evidence_id, position
+            FROM submission_evidence
+            WHERE submission_id = ?
+            ORDER BY position ASC
+            """,
+            (payload["submission_id"],),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [(row["evidence_id"], row["position"]) for row in rows] == [
+        (payload["evidence_id"], 0)
+    ]
+
+
+def test_multi_image_submission_creates_one_submission_and_three_evidence_in_order(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    image_a = _build_png_bytes(2, 2, (32, 96, 160))
+    image_b = _build_png_bytes(2, 2, (160, 96, 32))
+    image_c = _build_png_bytes(2, 2, (96, 160, 32))
+
+    with client:
+        response = _multipart_request(
+            client,
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            file_parts=[
+                ("a.png", image_a, "image/png"),
+                ("b.png", image_b, "image/png"),
+                ("c.png", image_c, "image/png"),
+            ],
+        )
+        payload = response.json()
+        blob_a = client.get(f"/blob/{payload['evidence_ids'][0]}")
+        blob_b = client.get(f"/blob/{payload['evidence_ids'][1]}")
+        blob_c = client.get(f"/blob/{payload['evidence_ids'][2]}")
+
+    assert response.status_code == 200
+    assert payload["submission_id"]
+    assert len(payload["evidence_ids"]) == 3
+    assert [item["parse_status"] for item in payload["items"]] == ["unsupported", "unsupported", "unsupported"]
+    assert blob_a.content == image_a
+    assert blob_b.content == image_b
+    assert blob_c.content == image_c
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        submission_rows = conn.execute(
+            """
+            SELECT evidence_id, position
+            FROM submission_evidence
+            WHERE submission_id = ?
+            ORDER BY position ASC
+            """,
+            (payload["submission_id"],),
+        ).fetchall()
+        assert [(row["evidence_id"], row["position"]) for row in submission_rows] == [
+            (payload["evidence_ids"][0], 0),
+            (payload["evidence_ids"][1], 1),
+            (payload["evidence_ids"][2], 2),
+        ]
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_multi_image_pipeline_runs_sequentially_and_scopes_semantics_per_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    image_a = _build_png_bytes(2, 2, (10, 20, 30))
+    image_b = _build_png_bytes(2, 2, (40, 50, 60))
+    image_c = _build_png_bytes(2, 2, (70, 80, 90))
+    transcript_by_image = {
+        image_a: ("第一张截图", "2026-08-09"),
+        image_b: ("第二张截图", "2026-08-10"),
+        image_c: ("第三张截图", "2026-08-11"),
+    }
+    call_order: list[tuple[str, str]] = []
+    semantic_inputs: list[tuple[str | None, list[dict[str, object]]]] = []
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        transcript, day = transcript_by_image[image_bytes]
+        call_order.append(("ark", transcript))
+        return {
+            "extraction": {
+                "transcript": transcript,
+                "observations": [{"kind": "timestamp", "content": day, "confidence": 0.9}],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+            },
+            "detail": None,
+        }
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        call_order.append(("deepseek", text or ""))
+        semantic_inputs.append((text, observations or []))
+        return _semantic_result(
+            facts=[
+                {
+                    "fact_type": "statement",
+                    "content": f"事实:{text}",
+                    "actors": [],
+                    "due_raw": None,
+                    "due_date": None,
+                    "due_anchor_date": None,
+                    "occurred_date": None,
+                    "confidence": 0.93,
+                }
+            ]
+        )
+
+    def fake_match_events(facts, *, existing_events=None):
+        call_order.append(("matcher", facts[0]["content"]))
+        return {
+            "groups": [
+                {
+                    "fact_indexes": list(range(len(facts))),
+                    "target": "unassigned",
+                    "event_id": None,
+                    "proposed_title": None,
+                    "confidence": 0.0,
+                    "reason": "先不自动归入",
+                }
+            ],
+            "ambiguities": [],
+        }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+                with patch("app.main.event_matcher.match_events", side_effect=fake_match_events):
+                    with client:
+                        response = _multipart_request(
+                            client,
+                            data={"source": "飞书", "source_detail": "项目复盘群"},
+                            file_parts=[
+                                ("a.png", image_a, "image/png"),
+                                ("b.png", image_b, "image/png"),
+                                ("c.png", image_c, "image/png"),
+                            ],
+                        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert call_order == [
+        ("ark", "第一张截图"),
+        ("deepseek", "第一张截图"),
+        ("matcher", "事实:第一张截图"),
+        ("ark", "第二张截图"),
+        ("deepseek", "第二张截图"),
+        ("matcher", "事实:第二张截图"),
+        ("ark", "第三张截图"),
+        ("deepseek", "第三张截图"),
+        ("matcher", "事实:第三张截图"),
+    ]
+    assert semantic_inputs == [
+        ("第一张截图", [{"kind": "timestamp", "content": "2026-08-09", "confidence": 0.9}]),
+        ("第二张截图", [{"kind": "timestamp", "content": "2026-08-10", "confidence": 0.9}]),
+        ("第三张截图", [{"kind": "timestamp", "content": "2026-08-11", "confidence": 0.9}]),
+    ]
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        fact_rows = conn.execute(
+            """
+            SELECT f.content, fe.evidence_id
+            FROM facts f
+            JOIN fact_evidence fe ON fe.fact_id = f.fact_id
+            ORDER BY f.created_at ASC, f.fact_id ASC
+            """
+        ).fetchall()
+        semantic_inputs_rows = conn.execute(
+            """
+            SELECT evidence_id, position
+            FROM semantic_run_inputs
+            ORDER BY semantic_run_id ASC, position ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [(row["content"], row["evidence_id"]) for row in fact_rows] == [
+        ("事实:第一张截图", payload["evidence_ids"][0]),
+        ("事实:第二张截图", payload["evidence_ids"][1]),
+        ("事实:第三张截图", payload["evidence_ids"][2]),
+    ]
+    assert len(semantic_inputs_rows) == 3
+    assert {row["evidence_id"] for row in semantic_inputs_rows} == set(payload["evidence_ids"])
+    assert all(row["position"] == 0 for row in semantic_inputs_rows)
+
+
+def test_multi_image_pipeline_failure_on_middle_item_does_not_block_later_items(tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    image_a = _build_png_bytes(2, 2, (11, 22, 33))
+    image_b = _build_png_bytes(2, 2, (44, 55, 66))
+    image_c = _build_png_bytes(2, 2, (77, 88, 99))
+    transcript_by_image = {
+        image_a: "第一张截图",
+        image_b: "第二张截图",
+        image_c: "第三张截图",
+    }
+    semantic_order: list[str] = []
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        return {
+            "extraction": {
+                "transcript": transcript_by_image[image_bytes],
+                "observations": [],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+            },
+            "detail": None,
+        }
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        semantic_order.append(text or "")
+        if text == "第二张截图":
+            return None
+        return _semantic_result(
+            facts=[
+                {
+                    "fact_type": "statement",
+                    "content": f"事实:{text}",
+                    "actors": [],
+                    "due_raw": None,
+                    "due_date": None,
+                    "due_anchor_date": None,
+                    "occurred_date": None,
+                    "confidence": 0.9,
+                }
+            ]
+        )
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+                with client:
+                    response = _multipart_request(
+                        client,
+                        data={"source": "飞书", "source_detail": "项目复盘群"},
+                        file_parts=[
+                            ("a.png", image_a, "image/png"),
+                            ("b.png", image_b, "image/png"),
+                            ("c.png", image_c, "image/png"),
+                        ],
+                    )
+                    payload = response.json()
+                    statuses = [
+                        client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
+                        for evidence_id in payload["evidence_ids"]
+                    ]
+
+    assert response.status_code == 200
+    assert semantic_order == ["第一张截图", "第二张截图", "第三张截图"]
+    assert statuses == ["done", "failed", "done"]
+
+
+@pytest.mark.parametrize(
+    "file_parts",
+    [
+        [("a.png", PNG_BYTES, "image/png"), ("b.pdf", _build_pdf_bytes("文档"), "application/pdf")],
+        [("a.pdf", _build_pdf_bytes("文档A"), "application/pdf"), ("b.pdf", _build_pdf_bytes("文档B"), "application/pdf")],
+    ],
+)
+def test_multi_file_non_image_batches_are_rejected_before_writing(tmp_path, monkeypatch, file_parts):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+        response = _multipart_request(
+            client,
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            file_parts=file_parts,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "一次上传多个文件时，只支持多张图片；文档一次只能传一个。"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE evidence_id NOT LIKE 'ev_demo_%'"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    assert count == 0
+
+
+def test_multi_image_submission_rejects_record_date_broadcast(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+        response = _multipart_request(
+            client,
+            data={"source": "飞书", "source_detail": "项目复盘群", "record_date": "2026-08-09"},
+            file_parts=[
+                ("a.png", PNG_BYTES, "image/png"),
+                ("b.png", PNG_BYTES, "image/png"),
+            ],
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "多张图片不能同时补充同一个记录日期，请逐张上传或清空日期。"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE evidence_id NOT LIKE 'ev_demo_%'"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    assert count == 0
+
+
+def test_multi_image_submission_rejects_when_today_limit_would_exceed_50(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+
+    with client:
+        client.get("/")
+        db_path = _sandbox_db_path(client, sandbox_root)
+        conn = init_db(db_path)
+        try:
+            for index in range(48):
+                append_evidence(
+                    conn,
+                    blobs_root=db_path.parent / "blobs",
+                    media_type="text",
+                    payload=f"existing-{index}",
+                    captured_at=int(time.time() * 1000),
+                    occurred_at=int(time.time() * 1000),
+                    source_hint="飞书-项目复盘群",
+                    kind="reference",
+                )
+        finally:
+            conn.close()
+
+        response = _multipart_request(
+            client,
+            data={"source": "飞书", "source_detail": "项目复盘群"},
+            file_parts=[
+                ("a.png", PNG_BYTES, "image/png"),
+                ("b.png", PNG_BYTES, "image/png"),
+                ("c.png", PNG_BYTES, "image/png"),
+            ],
+        )
+
+    assert response.status_code == 429
+    assert response.json()["detail"] == "本次提交后今天会超过 50 条，请减少图片数量后再试"
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE evidence_id NOT LIKE 'ev_demo_%'"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    assert count == 48
+
+
+def test_multi_image_upload_budget_counts_duplicate_new_blobs_once(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    duplicated_image = _padded_png_bytes(600 * 1024, b"7")
+    current_total = main_module.MAX_SANDBOX_UPLOAD_BYTES - (700 * 1024)
+
+    with patch("app.main._current_upload_storage_bytes", return_value=current_total):
+        with client:
+            response = _multipart_request(
+                client,
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                file_parts=[
+                    ("a.png", duplicated_image, "image/png"),
+                    ("b.png", duplicated_image, "image/png"),
+                ],
+            )
+
+    assert response.status_code == 200
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE evidence_id NOT LIKE 'ev_demo_%'"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    assert count == 2
+
+
+def test_multi_image_upload_budget_rejects_when_unique_new_blobs_exceed_limit(tmp_path, monkeypatch):
+    _disable_external_ai(monkeypatch)
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    image_a = _padded_png_bytes(400 * 1024, b"A")
+    image_b = _padded_png_bytes(400 * 1024, b"B")
+    current_total = main_module.MAX_SANDBOX_UPLOAD_BYTES - (700 * 1024)
+
+    with patch("app.main._current_upload_storage_bytes", return_value=current_total):
+        with client:
+            client.get("/")
+            response = _multipart_request(
+                client,
+                data={"source": "飞书", "source_detail": "项目复盘群"},
+                file_parts=[
+                    ("a.png", image_a, "image/png"),
+                    ("b.png", image_b, "image/png"),
+                ],
+            )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "这个沙箱累计上传已超过 50 MB"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence WHERE evidence_id NOT LIKE 'ev_demo_%'"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+    assert count == 0
 
 
 def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchable(tmp_path, monkeypatch):
