@@ -388,6 +388,8 @@ def test_index_uses_single_column_home_layout_and_hides_secondary_sections(tmp_p
     assert 'id="mobile-nav-toggle"' in html
     assert 'id="mobile-nav-panel"' in html
     assert "补充信息（可选）" in html
+    assert "信息来源 *" in html
+    assert html.index("信息来源 *") < html.index("补充信息（可选）")
     assert "开始整理" in html
     assert "STEP 1" in html
     assert "STEP 2" in html
@@ -1236,6 +1238,16 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert "dropzone.addEventListener(\"paste\", handleUploadAreaPaste);" in response.text
     assert "const clipboardImageFiles = (event) => {" in response.text
     assert "dropzone.focus();" in response.text
+    assert 'id="source-select"' in response.text
+    assert 'name="source"' in response.text
+    assert 'required' in response.text.split('id="source-select"', 1)[1].split("</select>", 1)[0]
+    assert '<option value="">请选择信息来源</option>' in response.text
+    assert response.text.index('<option value="">请选择信息来源</option>') < response.text.index('<option value="飞书">飞书</option>')
+    assert '<option value="飞书" selected' not in response.text
+    assert "Ctrl/Cmd + V 粘贴" in response.text
+    assert "拖拽图片" in response.text
+    assert "选择本地图片" in response.text
+    assert 'id="image-append-hint"' in response.text
     assert "recordDateInput.disabled = disableRecordDate;" in response.text
     assert "recordDateInput.value = \"\";" in response.text
     assert 'name="record_date"' in response.text
@@ -1243,6 +1255,7 @@ def test_home_page_contains_optional_meta_fields_and_mutually_exclusive_input(tm
     assert "有“今天、周五、下周”等相对时间时，补充日期可以换算得更准确。" in response.text
     assert "多张图片不能共用同一个记录发生日期，请逐张上传后分别补充。" in response.text
     assert "recordDateInput.reportValidity();" in response.text
+    assert "if (!form.reportValidity()) {" in response.text
     assert 'formData.append("counterpart"' not in response.text
     assert 'window.location.reload()' not in response.text
     assert 'window.location.href = `/evidence/${encodeURIComponent(parsed.value.evidence_id)}`;' in response.text

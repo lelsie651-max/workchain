@@ -49,40 +49,58 @@
                     <p id="text-mode-hint" class="mt-3 hidden text-sm text-cyan-200" aria-live="polite">清空文字后可继续选择图片或文档</p>
                     <div id="file-preview" class="mt-3 hidden rounded-[20px] border border-slate-800/80 bg-slate-900/70 p-4">
                         <div id="file-preview-list" class="space-y-3"></div>
+                        <div
+                            id="image-append-hint"
+                            class="mt-3 hidden rounded-2xl border border-cyan-400/20 bg-cyan-400/5 px-4 py-3 text-sm leading-6 text-cyan-100"
+                        >
+                            继续追加图片：<span class="font-medium">Ctrl/Cmd + V 粘贴</span>、<span class="font-medium">拖拽图片</span>、<span class="font-medium">选择本地图片</span>
+                        </div>
                     </div>
+                </div>
+            </div>
+
+            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                <div class="space-y-2">
+                    <label for="source-select" class="block text-sm font-medium text-slate-200">信息来源 *</label>
+                    <select
+                        id="source-select"
+                        name="source"
+                        required
+                        class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                    >
+                        <option value="">请选择信息来源</option>
+                        {% for source in source_presets %}
+                        <option value="{{ source }}">{{ source }}</option>
+                        {% endfor %}
+                        <option value="__custom__">自定义…</option>
+                    </select>
+                </div>
+                <div class="space-y-2">
+                    <label for="source-custom" class="block text-sm font-medium text-slate-200">自定义来源</label>
+                    <input
+                        id="source-custom"
+                        name="source_custom"
+                        type="text"
+                        maxlength="20"
+                        placeholder="填写自定义来源"
+                        class="hidden min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    >
                 </div>
             </div>
 
             <details class="rounded-[22px] border border-slate-800/80 bg-slate-900/45 px-4 py-3">
                 <summary class="cursor-pointer list-none text-sm font-medium text-slate-200">补充信息（可选）</summary>
-                <div class="mt-4 grid gap-3 md:grid-cols-3">
-                    <div class="space-y-3">
-                        <select
-                            id="source-select"
-                            name="source"
-                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
-                        >
-                            {% for source in source_presets %}
-                            <option value="{{ source }}">{{ source }}</option>
-                            {% endfor %}
-                            <option value="__custom__">自定义…</option>
-                        </select>
+                <div class="mt-4 grid gap-3 md:grid-cols-2">
+                    <div>
+                        <label for="source-detail" class="mb-2 block text-sm text-slate-300">具体位置</label>
                         <input
-                            id="source-custom"
-                            name="source_custom"
+                            id="source-detail"
+                            name="source_detail"
                             type="text"
-                            maxlength="20"
-                            placeholder="自定义来源"
-                            class="hidden min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                            placeholder="具体位置（可选）"
+                            class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
                         >
                     </div>
-                    <input
-                        id="source-detail"
-                        name="source_detail"
-                        type="text"
-                        placeholder="具体位置（可选）"
-                        class="min-h-11 w-full rounded-2xl border border-slate-700/80 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
-                    >
                     <div>
                         <label for="record-date" class="mb-2 block text-sm text-slate-300">记录发生日期</label>
                         <input
@@ -234,6 +252,7 @@
         const textModeHint = document.getElementById("text-mode-hint");
         const filePreview = document.getElementById("file-preview");
         const filePreviewList = document.getElementById("file-preview-list");
+        const imageAppendHint = document.getElementById("image-append-hint");
         const recordDateHint = document.getElementById("record-date-hint");
         let selectedFiles = [];
         let previewUrls = [];
@@ -339,10 +358,12 @@
                 fileInput.value = "";
                 filePreview.classList.add("hidden");
                 filePreviewList.innerHTML = "";
+                imageAppendHint.classList.add("hidden");
                 return;
             }
 
             filePreview.classList.remove("hidden");
+            imageAppendHint.classList.toggle("hidden", !selectedFiles.every(isImageFile));
             revokePreviewUrls();
             filePreviewList.innerHTML = selectedFiles.map((file, index) => {
                 const isImage = isImageFile(file);
@@ -426,6 +447,7 @@
         const syncCustomSource = () => {
             const isCustom = sourceSelect.value === "__custom__";
             sourceCustom.classList.toggle("hidden", !isCustom);
+            sourceCustom.required = isCustom;
             if (!isCustom) {
                 sourceCustom.value = "";
             }
@@ -463,6 +485,9 @@
 
         const submitForm = async () => {
             message.textContent = "";
+            if (!form.reportValidity()) {
+                return;
+            }
             if (recordDateInput && !recordDateInput.checkValidity()) {
                 recordDateInput.reportValidity();
                 return;

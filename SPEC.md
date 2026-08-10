@@ -109,11 +109,14 @@
 - OCR 模型只负责把图片转成文字,不负责理解业务语义
 - 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
 - Ark Vision 可同时产出 `transcript + observations`;其中 transcript 进入 production semantic route,observations 只进入 Extraction 层与 Semantic Parser 输入,不得混入 `raw_text`
-- `source_hint` 中的平台上下文属于 Extraction 输入上下文,只用于帮助 Vision 正确阅读 UI,不是 Evidence 原文的一部分,也不得被用来改写原图文字
-- 当 Ark Vision 处理聊天/IM 截图时,优先返回 platform-aware structured conversation extraction,再由代码确定性 normalize 成现有 `transcript + observations`;`chat_header` 只表示顶部直接可见 UI 文本,不等于 participant identity,但在已知平台/UI 结构下可用于建立 participant mapping
-- 聊天 transcript 中的 `speaker_ref` 永远必须是 stable neutral identity:direct chat 只允许 `left_account / right_account`;group chat 使用 `right_account / participant_n`;昵称只放 `display_name`,不得让 `left_戴雯 / left_饭之 / right_用户` 这类 ref 直接进入最终 transcript
+- `source` / `source_hint` 属于用户声明的 metadata(`declared_platform`),是 Extraction 输入上下文而非机器真值;它只帮助 Vision 阅读 UI,不是 Evidence 原文的一部分,也不得被用来改写原图文字
+- 当 Ark Vision 处理聊天/IM 截图时,优先返回 platform-aware structured conversation extraction,并将 `declared_platform` 与 `observed_platform` 分离:平台必须先由截图 UI 独立观察得到;若 `observed_platform` 与用户声明冲突,最终 transcript / observation / warning 必须保留 provenance,不得静默覆盖任一方
+- 当 `observed_platform=unknown` 时,不得仅因用户声明了来源就伪造成机器已观察到该平台;可在 transcript / observation 中保留 `declared_platform` 与 `source_consistency=unknown`
+- 聊天 transcript 中的 `speaker_ref` 必须是 stable neutral identity:direct chat 在 side 明确时使用 `left_account / right_account`,side 无法安全判断时只能保留 `unknown_account` / unknown side 或显式 warning;group chat 使用 `right_account / participant_n`;昵称只放 `display_name`,不得让 `left_戴雯 / left_饭之 / right_用户` 这类 ref 直接进入最终 transcript
+- `chat_header` 只表示顶部直接可见 UI 文本,不等于 participant identity;只有明确的平台特定 UI 规则才允许把它映射到 participant display_name,且这种规则不得跨平台套用(例如微信单聊可映射 left_account.display_name,其它平台没有规则时不得套用)
 - quote / reply / reaction 属于直接可观察 conversation structure,必须绑定在对应 message 上保留;actor 不可见时只能显式记为 `unknown`,不得推断含义
 - 当 Ark Vision 处理聊天/IM 截图时,最终 `transcript` 必须保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
+- Ark Vision 的 structured contract 优先使用 Responses API 官方 structured output(`text.format -> json_schema`, beta);本地 normalize / validation 继续作为第二层代码保护,用于处理模型输出偏差与 provenance 补强
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction

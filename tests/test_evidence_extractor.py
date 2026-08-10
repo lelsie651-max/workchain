@@ -84,8 +84,17 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
                 "[participant][right_account] display_name=unknown\n"
                 "[message 1][left_account] 饭之\n"
                 "[message 2][left_account] 刚开始给我13呢\n"
-                "[message 3][right_account] 怎么了\n"
-                '[message 6][left_account][quote speaker="戴雯" text="刚开始给我13呢"] 感觉被侮辱了'
+                "[message 3][left_account] 我脸都绿了\n"
+                "[message 4][right_account] 笑死我了\n"
+                "[message 5][left_account] 我说我理想中是18\n"
+                '[message 6][left_account][quote speaker="戴雯" text="我说我理想中是18"] 感觉被侮辱了\n'
+                "[message 7][left_account] 不是很开心\n"
+                "[message 8][right_account] 冷静，收集其他同事情况，不动声色！\n"
+                "[message 9][right_account] 先看看有没有周栋准备不带着去上海的\n"
+                "[message 10][right_account] 不要太高调免得让其他人可能没被带走的失落之类的\n"
+                "[message 11][left_account] 肯定是有的\n"
+                "[message 12][left_account] David还跟我强调说会有人不被带走\n"
+                "[message 13][left_account] 我自己都没啥心情了"
             ),
             "observations": [
                 {
@@ -116,8 +125,46 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
     assert "[participant][left_account] display_name=戴雯" in result["transcript"]
     assert "[participant][right_account] display_name=unknown" in result["transcript"]
     assert "[message 1][left_account] 饭之" in result["transcript"]
-    assert '[message 6][left_account][quote speaker="戴雯" text="刚开始给我13呢"] 感觉被侮辱了' in result["transcript"]
+    assert "[message 13][left_account] 我自己都没啥心情了" in result["transcript"]
+    assert '[message 6][left_account][quote speaker="戴雯" text="我说我理想中是18"] 感觉被侮辱了' in result["transcript"]
     assert "[left_饭之]" not in result["transcript"]
+
+
+def test_extract_image_evidence_preserves_platform_mismatch_provenance(monkeypatch):
+    monkeypatch.setattr(
+        "app.evidence_extractor.vision_provider.extract_visual_evidence",
+        lambda image_bytes, mime_type, source_hint=None: {
+            "transcript": (
+                "[scene] platform=微信; declared_platform=飞书; source_consistency=mismatch; "
+                "conversation_type=direct_chat\n"
+                "[chat_header] 戴雯\n"
+                "[participant][left_account] display_name=戴雯\n"
+                "[participant][right_account] display_name=unknown\n"
+                "[message 1][left_account] 饭之"
+            ),
+            "observations": [
+                {
+                    "kind": "chat_context",
+                    "content": "platform=微信; declared_platform=飞书; source_consistency=mismatch; conversation_type=direct_chat",
+                    "confidence": None,
+                }
+            ],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": ["source_platform_mismatch:declared=飞书;observed=微信"],
+        },
+    )
+
+    result = evidence_extractor.extract_image_evidence(
+        b"fake-image",
+        "image/png",
+        provider=evidence_extractor.ARK_VISION_EXTRACTION_PROVIDER,
+        source_hint="飞书-单聊",
+    )
+
+    assert "declared_platform=飞书" in result["transcript"]
+    assert "source_consistency=mismatch" in result["transcript"]
+    assert result["warnings"] == ["source_platform_mismatch:declared=飞书;observed=微信"]
 
 
 def test_extract_image_evidence_ocr_text_only_path_does_not_fabricate_speaker_refs(monkeypatch):
