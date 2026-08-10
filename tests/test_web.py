@@ -117,6 +117,7 @@ def _upload_png(
     text: str = "",
     source: str = "飞书",
     source_detail: str = "项目复盘群",
+    record_date: str = "",
 ):
     return client.post(
         "/api/evidence",
@@ -124,6 +125,7 @@ def _upload_png(
             "text": text,
             "source": source,
             "source_detail": source_detail,
+            "record_date": record_date,
         },
         files={"file": (filename, PNG_BYTES, "image/png")},
     )
@@ -490,7 +492,12 @@ def test_index_shows_real_event_in_my_events_without_secondary_home_sections(tmp
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 index_response = client.get("/")
 
@@ -565,7 +572,12 @@ def test_home_pending_event_card_shows_for_pending_assignments(tmp_path, monkeyp
                 with client:
                     create_response = client.post(
                         "/api/evidence",
-                        json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                        json={
+                            "text": "请今天补签供应商合同。",
+                            "source": "飞书",
+                            "source_detail": "项目复盘群",
+                            "record_date": "2026-08-09",
+                        },
                     )
                     evidence_id = create_response.json()["evidence_id"]
                     index_response = client.get("/")
@@ -618,7 +630,12 @@ def test_home_pending_card_disappears_after_assignment_confirmation_and_active_e
                 with client:
                     create_response = client.post(
                         "/api/evidence",
-                        json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                        json={
+                            "text": "请今天补签供应商合同。",
+                            "source": "飞书",
+                            "source_detail": "项目复盘群",
+                            "record_date": "2026-08-09",
+                        },
                     )
                     evidence_id = create_response.json()["evidence_id"]
                     home_before = client.get("/")
@@ -695,7 +712,12 @@ def test_event_detail_shows_facts_and_evidence_link(tmp_path, monkeypatch):
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
 
@@ -824,7 +846,12 @@ def test_evidence_detail_hides_legacy_slots_form_for_semantic_records(tmp_path, 
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
                 detail_response = client.get(f"/evidence/{evidence_id}")
@@ -957,7 +984,12 @@ def test_event_title_can_be_updated(tmp_path, monkeypatch):
             with client:
                 client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
@@ -1028,7 +1060,12 @@ def test_correct_event_fact_marks_user_and_keeps_provenance(tmp_path, monkeypatc
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
 
@@ -1130,7 +1167,12 @@ def test_correct_event_fact_rejects_provenance_tampering_fields(tmp_path, monkey
             with client:
                 client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
@@ -1399,7 +1441,12 @@ def test_home_event_card_shows_due_text_when_event_has_due_at(tmp_path, monkeypa
             with client:
                 response = client.post(
                     "/api/evidence",
-                    json={"text": "张伟说下周五前提交渠道复盘数据。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "张伟说下周五前提交渠道复盘数据。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-01",
+                    },
                 )
                 home_response = client.get("/")
 
@@ -1602,7 +1649,7 @@ def test_user_facing_pages_hide_internal_semantic_field_names(tmp_path, monkeypa
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert response.status_code == 200
-    friendly_copy = "还无法确定“周五”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
+    friendly_copy = "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。"
     assert friendly_copy in detail_response.text
     home_visible = home_response.text.split("<script>", 1)[0]
     detail_visible = detail_response.text.split("<script>", 1)[0]
@@ -2596,7 +2643,11 @@ def test_image_html_shows_parse_summary_before_collapsed_ocr_text(tmp_path, monk
     with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
         with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
             with client:
-                create_response = _upload_png(client, filename="ordered.png")
+                create_response = _upload_png(
+                    client,
+                    filename="ordered.png",
+                    record_date="2026-08-09",
+                )
                 evidence_id = create_response.json()["evidence_id"]
                 index_response = client.get("/")
                 detail_response = client.get(f"/evidence/{evidence_id}")
@@ -3355,8 +3406,9 @@ def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchab
     assert response.status_code == 200
     assert response.json()["parse_status"] == "ocr_running"
     assert status_response.status_code == 200
-    assert status_response.json()["parse_status"] == "done"
-    mock_extract.assert_called_once()
+    assert status_response.json()["parse_status"] == "clarification_required"
+    assert status_response.json()["clarification_reason"] == "temporal_context"
+    mock_extract.assert_not_called()
     assert search_response.status_code == 200
     assert "审批通过" in search_response.text
 
@@ -3369,6 +3421,11 @@ def test_image_upload_with_mocked_ocr_text_enters_parse_pipeline_and_is_searchab
         ).fetchone()
         assert row["raw_text"].startswith("[图片] ocr-success.png\n\n")
         assert "审批通过,周五前交付渠道复盘数据" in row["raw_text"]
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert semantic_run_count == 0
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()
@@ -3606,6 +3663,157 @@ def test_source_gate_does_not_block_unknown_or_low_confidence_platform_results(t
     assert low_conf_status["source_gate"]["requires_clarification"] is False
     assert low_conf_status["source_gate"]["observed_platform"] == "微信"
     assert mock_llm.call_count == 2
+
+
+def test_temporal_gate_blocks_relative_time_before_semantic_for_image(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    ark_extraction = {
+        "transcript": "今天同步一下，周五前补材料。",
+        "observations": [],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.semantic_llm.extract_semantics") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="temporal-gate.png")
+                evidence_id = response.json()["evidence_id"]
+                status_payload = client.get(f"/api/evidence/{evidence_id}/status").json()
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert response.status_code == 200
+    assert status_payload["parse_status"] == "clarification_required"
+    assert status_payload["clarification_reason"] == "temporal_context"
+    assert status_payload["temporal_gate"]["prompt"] == "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。"
+    assert "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。" in detail_response.text
+    mock_llm.assert_not_called()
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert semantic_run_count == 0
+    finally:
+        conn.close()
+
+
+def test_temporal_gate_blocks_month_day_without_year_before_semantic(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    ark_extraction = {
+        "transcript": "8月16日补交材料。",
+        "observations": [],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.semantic_llm.extract_semantics") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="month-day-no-year.png")
+                status_payload = client.get(f"/api/evidence/{response.json()['evidence_id']}/status").json()
+
+    assert response.status_code == 200
+    assert status_payload["parse_status"] == "clarification_required"
+    assert status_payload["clarification_reason"] == "temporal_context"
+    mock_llm.assert_not_called()
+
+
+def test_source_gate_precedes_temporal_gate_when_both_would_block(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    ark_extraction = {
+        "transcript": "今天补材料。",
+        "observations": [
+            _platform_detection_observation(
+                declared_platform="飞书",
+                observed_platform="微信",
+                platform_confidence=0.91,
+            )
+        ],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.semantic_llm.extract_semantics") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="source-before-temporal.png")
+                status_payload = client.get(f"/api/evidence/{response.json()['evidence_id']}/status").json()
+
+    assert response.status_code == 200
+    assert status_payload["parse_status"] == "clarification_required"
+    assert status_payload["clarification_reason"] == "source_context"
+    assert status_payload["source_gate"]["requires_clarification"] is True
+    mock_llm.assert_not_called()
+
+
+def test_record_date_for_temporal_gate_starts_first_semantic_parse_with_user_anchor(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    captured: dict[str, Any] = {}
+    ark_extraction = {
+        "transcript": "今天补一下，周五前给你。",
+        "observations": [],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        captured["anchor_date"] = anchor_date
+        return _semantic_result()
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.semantic_llm.extract_semantics") as initial_llm:
+            with client:
+                response = _upload_png(client, filename="temporal-record-date.png")
+                evidence_id = response.json()["evidence_id"]
+                status_before = client.get(f"/api/evidence/{evidence_id}/status").json()
+
+    assert response.status_code == 200
+    initial_llm.assert_not_called()
+    assert status_before["clarification_reason"] == "temporal_context"
+
+    with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract) as resumed_llm:
+        with client:
+            update_response = client.post(
+                f"/api/evidence/{evidence_id}/record-date",
+                json={"record_date": "2026-08-09"},
+            )
+            status_after = client.get(f"/api/evidence/{evidence_id}/status").json()
+
+    assert update_response.status_code == 200
+    assert update_response.json()["updated_fact_count"] == 0
+    assert update_response.json()["parse_status"] == "llm_running"
+    assert resumed_llm.call_count == 1
+    assert captured["anchor_date"] == "2026-08-09"
+    assert status_after["parse_status"] == "done"
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert semantic_run_count == 1
+    finally:
+        conn.close()
 
 
 def test_source_review_confirmed_declared_resumes_parse_without_rerunning_ark(tmp_path, monkeypatch):
@@ -4186,7 +4394,11 @@ def test_image_upload_status_sequence_includes_ocr_running_then_llm_running(tmp_
         with patch("app.extract.ocr.image_to_text", return_value=("审批通过,周五前交付渠道复盘数据", "")):
             with patch("app.main.semantic_llm.extract_semantics", return_value=parsed):
                 with client:
-                    response = _upload_png(client, filename="sequence.png")
+                        response = _upload_png(
+                            client,
+                            filename="sequence.png",
+                            record_date="2026-08-09",
+                        )
 
     assert response.status_code == 200
     assert response.json()["parse_status"] == "ocr_running"
@@ -5793,7 +6005,12 @@ def test_successful_parse_persists_semantic_run_and_facts_and_chain_stays_valid(
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "活爹:下周五前把渠道复盘数据给我。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "活爹:下周五前把渠道复盘数据给我。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-01",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
                 status_response = client.get(f"/api/evidence/{evidence_id}/status")
@@ -5860,7 +6077,7 @@ def test_successful_parse_persists_semantic_run_and_facts_and_chain_stays_valid(
         assert run_row["provider"] == "deepseek"
         assert run_row["model"] == "deepseek-v4-flash"
         assert run_row["parser_version"] == "2.3"
-        assert run_row["anchor_date"] is None
+        assert run_row["anchor_date"] == "2026-08-01"
         assert run_row["extraction_id"] is not None
         assert fact_row["fact_type"] == "request"
         assert fact_row["content"] == "张伟要求下周五前提交渠道复盘数据。"
@@ -6032,7 +6249,12 @@ def test_event_matcher_auto_new_creates_event_and_updates_detail_status(tmp_path
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
                 detail_response = client.get(f"/evidence/{evidence_id}")
@@ -6690,7 +6912,12 @@ def test_event_change_detection_failure_does_not_break_auto_assignment(tmp_path,
                 ):
                     create_response = client.post(
                         "/api/evidence",
-                        json={"text": "改成周三交。", "source": "飞书", "source_detail": "项目群"},
+                        json={
+                            "text": "改成周三交。",
+                            "source": "飞书",
+                            "source_detail": "项目群",
+                            "record_date": "2026-05-03",
+                        },
                     )
                     event_response = client.get("/event/evt-1")
 
@@ -6809,7 +7036,12 @@ def test_event_change_detection_runs_after_user_confirmation_and_renders_deadlin
             with patch("app.main.event_matcher.match_events", return_value=normalized_match):
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "改成周三交。", "source": "飞书", "source_detail": "项目群"},
+                    json={
+                        "text": "改成周三交。",
+                        "source": "飞书",
+                        "source_detail": "项目群",
+                        "record_date": "2026-05-03",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
 
@@ -7293,7 +7525,12 @@ def test_evidence_detail_record_date_update_recomputes_due_without_calling_deeps
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请周五前补材料。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请周五前补材料。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-08",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
                 detail_before = client.get(f"/evidence/{evidence_id}")
@@ -7332,12 +7569,8 @@ def test_evidence_detail_record_date_update_recomputes_due_without_calling_deeps
     finally:
         conn.close()
 
-    friendly_copy = "还无法确定“周五”具体是哪一天。补充这段记录发生的日期后，可以换算成具体日期。"
     assert create_response.status_code == 200
-    assert friendly_copy in detail_before.text
-    assert "这份记录含有“今天 / 周五”等相对时间。" in detail_before.text
-    assert detail_before.text.index("AI 整理") < detail_before.text.index("这份记录含有“今天 / 周五”等相对时间。")
-    assert detail_before.text.index("这份记录含有“今天 / 周五”等相对时间。") < detail_before.text.index("事实 01")
+    assert "记录日期 2026-08-08" in detail_before.text
     assert update_response.status_code == 200
     assert update_response.json()["updated_fact_count"] == 1
     assert fact_row["due_at"] == main_module.llm.due_date_to_millis("2026-08-14")
@@ -7346,7 +7579,6 @@ def test_evidence_detail_record_date_update_recomputes_due_without_calling_deeps
     assert fact_row["review_status"] == "corrected"
     assert anchor_meta[f"semantic_anchor_date:{evidence_id}"] == "2026-08-09"
     assert anchor_meta[f"semantic_anchor_source:{evidence_id}"] == "user"
-    assert friendly_copy not in detail_after.text
     assert "负责人还不够明确。" in detail_after.text
     assert "记录日期 2026-08-09" in detail_after.text
     assert detail_after.text.index("AI 整理") < detail_after.text.index("记录日期 2026-08-09")
@@ -7407,9 +7639,22 @@ def test_event_page_can_update_record_date_for_image_evidence_and_time_only_obse
                     evidence_id = create_response.json()["evidence_id"]
 
     assert create_response.status_code == 200
-    assert mock_llm.call_args.kwargs["anchor_date"] is None
+    mock_llm.assert_not_called()
 
-    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as resumed_llm:
+        with patch("app.main.event_matcher.match_events", return_value=normalized_match):
+            with client:
+                detail_before = client.get(f"/evidence/{evidence_id}")
+                update_response = client.post(
+                    f"/api/evidence/{evidence_id}/record-date",
+                    json={"record_date": "2026-08-09"},
+                )
+
+    assert resumed_llm.call_count == 1
+    assert resumed_llm.call_args.kwargs["anchor_date"] == "2026-08-09"
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
     try:
         row = conn.execute(
             """
@@ -7422,20 +7667,6 @@ def test_event_page_can_update_record_date_for_image_evidence_and_time_only_obse
             """,
             (evidence_id,),
         ).fetchone()
-    finally:
-        conn.close()
-
-    with client:
-        detail_before = client.get(f"/event/{row['event_id']}")
-        update_response = client.post(
-            f"/api/evidence/{evidence_id}/record-date",
-            json={"record_date": "2026-08-09"},
-        )
-        detail_after = client.get(f"/event/{row['event_id']}")
-
-    db_path = _sandbox_db_path(client, sandbox_root)
-    conn = init_db(db_path)
-    try:
         fact_row = conn.execute(
             "SELECT due_at, due_anchor_at, origin, review_status FROM facts WHERE fact_id = ?",
             (row["fact_id"],),
@@ -7444,16 +7675,17 @@ def test_event_page_can_update_record_date_for_image_evidence_and_time_only_obse
     finally:
         conn.close()
 
-    assert "这条证据里有“今天 / 周五”等相对时间。" in detail_before.text
-    assert "相关原始记录" in detail_before.text
-    assert f'data-related-evidence-card="{evidence_id}"' in detail_before.text
-    assert f'data-evidence-id="{evidence_id}"' in detail_before.text
+    with client:
+        detail_after = client.get(f"/event/{row['event_id']}")
+
+    assert "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。" in detail_before.text
     assert update_response.status_code == 200
-    assert update_response.json()["updated_fact_count"] == 1
-    assert fact_row["due_at"] == main_module.llm.due_date_to_millis("2026-08-14")
-    assert fact_row["due_anchor_at"] == main_module.llm.due_date_to_millis("2026-08-09")
-    assert fact_row["origin"] == "user"
-    assert fact_row["review_status"] == "corrected"
+    assert update_response.json()["updated_fact_count"] == 0
+    assert update_response.json()["parse_status"] == "llm_running"
+    assert fact_row["due_at"] is None
+    assert fact_row["due_anchor_at"] is None
+    assert fact_row["origin"] == "ai"
+    assert fact_row["review_status"] == "unreviewed"
     assert "记录日期：2026-08-09" in detail_after.text
     assert "来源：你填写的" in detail_after.text
     assert "修改" in detail_after.text
@@ -7611,7 +7843,12 @@ def test_event_status_moves_between_active_and_history_without_touching_facts_or
             with client:
                 create_response = client.post(
                     "/api/evidence",
-                    json={"text": "请今天补签供应商合同。", "source": "飞书", "source_detail": "项目复盘群"},
+                    json={
+                        "text": "请今天补签供应商合同。",
+                        "source": "飞书",
+                        "source_detail": "项目复盘群",
+                        "record_date": "2026-08-09",
+                    },
                 )
                 evidence_id = create_response.json()["evidence_id"]
 

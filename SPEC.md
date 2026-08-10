@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.3 · 最后更新 2026-08-09
+> 版本 v1.4 · 最后更新 2026-08-10
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -113,16 +113,23 @@
 - `evidence.source_hint` 是原始提交时写入哈希链的 immutable provenance,后续不得直接改写;用户若核实或修正来源,必须写入独立 `source_reviews` 履历,并通过 `effective source` 解析当前生效来源
 - 当 Ark Vision 处理聊天/IM 截图时,优先返回 platform-aware structured conversation extraction,并将 `declared_platform` 与 `observed_platform` 分离:平台必须先由截图 UI 独立观察得到;若 `observed_platform` 与用户声明冲突,最终 transcript / observation / warning 必须保留 provenance,不得静默覆盖任一方
 - 当 `observed_platform=unknown` 时,不得仅因用户声明了来源就伪造成机器已观察到该平台;可在 transcript / observation 中保留 `declared_platform` 与 `source_consistency=unknown`
+- 当 Ark Vision 处理聊天/IM 截图时,structured contract 必须支持 `system_events`;至少覆盖 `message_recalled / system_notice / unknown`,并保留 `type / visible_text / actor_display_name`;system event 里的名字不得单独推断出新的 participant
 - 聊天 transcript 中的 `speaker_ref` 必须是 stable neutral identity:direct chat 在 side 明确时使用 `left_account / right_account`,side 无法安全判断时只能保留 `unknown_account` / unknown side 或显式 warning;group chat 使用 `right_account / participant_n`;昵称只放 `display_name`,不得让 `left_戴雯 / left_饭之 / right_用户` 这类 ref 直接进入最终 transcript
 - `chat_header` 只表示顶部直接可见 UI 文本,不等于 participant identity;只有明确的平台特定 UI 规则才允许把它映射到 participant display_name,且这种规则不得跨平台套用(例如微信单聊可映射 left_account.display_name,其它平台没有规则时不得套用)
+- group_chat / direct_chat 的接受与纠偏必须基于结构证据,而不是标题语义:可用强证据包括 `visible_sender_label`、`avatar_ref` 或等价布局身份;若模型给出 `group_chat` 但看不到两个以上可区分的非右侧发送者,代码层必须降级为 `direct_chat` 或 `unknown`,不得凭 `chat_header` 中的“群/组/group”、成员数、system event 里的名字或正文提到的人名来伪造群聊参与者
 - quote / reply / reaction 属于直接可观察 conversation structure,必须绑定在对应 message 上保留;actor 不可见时只能显式记为 `unknown`,不得推断含义
+- emoji 属于 Evidence transcript 边界:能可靠辨认具体 Unicode emoji 时必须原样保留;无法可靠区分时只能写 `[emoji_unknown]` 并附 warning,不得用语义相近 emoji 替换,也不得翻译成解释性文字;sticker 不得伪装成 emoji 或 reaction
 - 当 Ark Vision 处理聊天/IM 截图时,最终 `transcript` 必须保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
 - Ark Vision 的 structured contract 优先使用 Responses API 官方 structured output(`text.format -> json_schema`, beta);本地 normalize / validation 继续作为第二层代码保护,用于处理模型输出偏差与 provenance 补强
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
+- 图片链路中的 pre-semantic gate 顺序固定为 `Extraction -> Source Gate -> Temporal Gate -> Semantic Parser`;Source Gate 优先于 Temporal Gate,只要来源仍待核实,就不得进入日期检查或 DeepSeek
 - 图片链路中的 Source Gate 固定放在 `Extraction -> Semantic Parser` 之间:当 declared platform 明确、`observed_platform` 明确且与 declared 不同、并且 `platform_confidence >= 0.75` 时,当前 Evidence 进入 `clarification_required`,禁止创建 Semantic Run、禁止调用 DeepSeek / Event Matcher,直到用户确认或修正来源
 - Source Gate 只要求用户核实,不会自动覆盖用户来源;一旦用户确认 declared source,该 Extraction 的同一 mismatch 不得再次阻断;若用户修正来源,必须基于 `effective source` 重新跑 Vision,而不是直接拿旧 Extraction 继续 Semantic Parse
+- Temporal Gate 使用确定性代码检查 Extraction transcript / observations 中是否存在依赖记录日期才能解释的相对/不完整时间;至少包括 `今天/明天/后天/昨天/前天`、`周X/星期X`、`本周/这周/下周/下下周`、`这个月/本月/下个月/今年/明年`、`这个月16号`、缺少年份的 `8月16日` 等
+- 若命中 Temporal Gate 且当前没有可靠 `anchor_date`,当前 Evidence 必须进入 `clarification_required` 且 `clarification_reason=temporal_context`;禁止创建 Semantic Run、禁止调用 DeepSeek、禁止调用 Event Matcher;UI 复用现有 `record_date` 输入并提示“这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。”
+- 对于尚未创建过 Semantic Run 的 gated Evidence,用户补充 `record_date` 后必须先重跑 Source Gate / Temporal Gate;全部通过后才首次进入 `llm_running` 并后台启动 `_run_parse_pipeline`;这一路径不得误走“已有结果只修 due_at”的兼容逻辑
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
 - production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;其中 `source_hint` 必须取 `effective source`,不传 `self_names`,也不使用 `counterpart` 参与事实判断
 - `anchor_date` 优先级固定为:1) 用户明确填写的 `record_date`;2) `infer_reliable_anchor_date(...)` 从 transcript / observation 中确定性识别出的同日消息时间;3) `None`
@@ -718,6 +725,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-09 | Competition UX V1:首页主体验切到真实 Event / Fact,新增只读 Event 详情页,Help 同步真实能力 | 让用户首先看到 `我的事项` 与可回看原始证据的事实链路,同时把 demo threads 降级为示例区并清理过时文案 |
 | 2026-08-09 | Competition Core UX Polish:首页输入互斥、首页直确认事项、人话日期提示、事项截止展示 | 抹平首页与详情之间的确认断点,并明确"记录发生日期"只能来自用户显式填写,不能自动借用上传时间 |
 | 2026-08-10 | V10 新增 Source Review / effective source / clarification_required Source Gate | 固定把来源核实放在 `Extraction -> Semantic Parser` 之间,保持 `evidence.source_hint` 不可变,并让用户确认优先于机器平台判断 |
+| 2026-08-10 | 新增 Pre-Semantic Temporal Gate、system_events、结构证据群聊保护与 emoji exact-or-unknown | 固定图片链路为 `Extraction -> Source Gate -> Temporal Gate -> Semantic Parser`,避免缺少可靠时间锚点时误调 DeepSeek,并禁止 system event / 标题语义伪造 participant 或群聊结构 |
 | 2026-08-09 | Competition Date & Input UX Hardening:输入模式真互斥、可靠 anchor 识别、详情补日期闭环、确定性相对日期换算 | 保持"用户填写优先、正文可靠日期次之、上传时间禁用"的锚点边界,并让补日期后 due_at 与首页事项截止立即联动 |
 
 ---

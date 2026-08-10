@@ -8,7 +8,7 @@
 </li>
 {% endmacro %}
 
-{% macro render_record_date_section(result) %}
+{% macro render_record_date_section(result, empty_title=None, empty_detail=None) %}
 <div id="record-date-section" class="rounded-2xl border border-slate-800/80 bg-slate-950/55 p-4">
     <div id="record-date-display" class="{% if not result.record_date %}space-y-1{% endif %}">
         {% if result.record_date %}
@@ -22,8 +22,8 @@
         <p class="mt-2 text-xs leading-6 text-emerald-200">{{ result.date_resolution_notice }}</p>
         {% endif %}
         {% else %}
-        <p class="text-sm text-slate-100">这份记录含有“今天 / 周五”等相对时间。</p>
-        <p class="text-sm text-slate-400">补充记录发生日期后，可以换算成具体日期。</p>
+        <p class="text-sm text-slate-100">{{ empty_title or "这份记录含有“今天 / 周五”等相对时间。" }}</p>
+        <p class="text-sm text-slate-400">{{ empty_detail or "补充记录发生日期后，可以换算成具体日期。" }}</p>
         {% endif %}
     </div>
     <form id="record-date-form" class="mt-3 flex flex-wrap items-center gap-3 {% if result.record_date %}hidden{% endif %}">
@@ -135,6 +135,16 @@
         <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</span></p>
         {% elif parse_status == "failed" %}
         <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</span></p>
+        {% elif parse_status == "clarification_required" and clarification_reason == "temporal_context" %}
+        <div id="temporal-clarification-card" class="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
+            <p class="text-sm font-medium text-amber-100">{{ temporal_gate.title if temporal_gate else "这份记录需要先补充记录日期" }}</p>
+            <p id="parse-status-message" class="mt-3 text-sm leading-7 text-slate-200">
+                <span id="parse-status-message-text">{{ (temporal_gate.prompt if temporal_gate else None) or "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。" }}</span>
+            </p>
+            <div class="mt-4">
+                {{ render_record_date_section(record_date_state, (temporal_gate.prompt if temporal_gate else None) or "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。", "补充记录发生日期后，系统会重新检查来源与时间条件，通过后再开始 AI 整理。") }}
+            </div>
+        </div>
         {% elif parse_status == "clarification_required" %}
         <div id="source-clarification-card" class="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
             <p class="text-sm font-medium text-amber-100">{{ source_gate.title or "信息来源可能需要核实" }}</p>

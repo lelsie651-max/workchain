@@ -109,6 +109,30 @@ PARSE_STATUS_FAILED = "failed"
 PARSE_STATUS_UNSUPPORTED = "unsupported"
 PARSE_STATUS_CLARIFICATION_REQUIRED = "clarification_required"
 SOURCE_GATE_PLATFORM_CONFIDENCE_THRESHOLD = 0.75
+CLARIFICATION_REASON_SOURCE_CONTEXT = "source_context"
+CLARIFICATION_REASON_TEMPORAL_CONTEXT = "temporal_context"
+TEMPORAL_GATE_PROMPT = "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。"
+_TEMPORAL_RELATIVE_TOKENS = (
+    "今天",
+    "明天",
+    "后天",
+    "昨天",
+    "前天",
+    "本周",
+    "这周",
+    "下周",
+    "下下周",
+    "这个月",
+    "本月",
+    "下个月",
+    "今年",
+    "明年",
+)
+_TEMPORAL_WEEKDAY_PATTERN = re.compile(r"(?:星期|周)[一二三四五六日天]")
+_TEMPORAL_THIS_MONTH_DAY_PATTERN = re.compile(r"(?:这个月|本月)\s*\d{1,2}\s*[日号]")
+_TEMPORAL_MONTH_DAY_WITHOUT_YEAR_PATTERN = re.compile(
+    r"(?<!\d{4}[./-])(?<!\d{4}年)\b(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?"
+)
 PACKAGE_README_TEXT = (
     "这个文件夹里的记录不能被偷偷修改。\n"
     "如果你想自己确认,在装有 Python 的电脑上,\n"
@@ -134,6 +158,14 @@ def _parse_status_label(status: str | None) -> str:
         PARSE_STATUS_CLARIFICATION_REQUIRED: "等待核实信息来源",
     }
     return mapping.get(status, status or "未知")
+
+
+def _parse_status_label_with_reason(status: str | None, clarification_reason: str | None = None) -> str:
+    if status == PARSE_STATUS_CLARIFICATION_REQUIRED:
+        if clarification_reason == CLARIFICATION_REASON_TEMPORAL_CONTEXT:
+            return "等待补充记录日期"
+        return "等待核实信息来源"
+    return _parse_status_label(status)
 
 
 def _format_due_display(value: int | None) -> str | None:
@@ -868,6 +900,110 @@ def _clarification_detail(state: dict[str, Any]) -> str:
     return f"等待核实信息来源：你填写的是「{declared}」，机器识别为「{observed}」。"
 
 
+def _temporal_clarification_detail(*, matched_tokens: list[str]) -> str:
+    if matched_tokens:
+        return (
+            "等待补充记录日期：这份记录包含相对时间"
+            f"（如「{matched_tokens[0]}」），需要先确认记录发生日期，再进行 AI 整理。"
+        )
+    return f"等待补充记录日期：{TEMPORAL_GATE_PROMPT}"
+
+
+def _temporal_gate_payload(*, matched_tokens: list[str], reviewable: bool) -> dict[str, Any]:
+    return {
+        "requires_clarification": True,
+        "reviewable": reviewable,
+        "matched_tokens": matched_tokens,
+        "title": "这份记录需要先补充记录日期",
+        "detail": _temporal_clarification_detail(matched_tokens=matched_tokens),
+        "prompt": TEMPORAL_GATE_PROMPT,
+    }
+
+
+def _contains_relative_or_incomplete_time(text: str | None) -> list[str]:
+    normalized = (text or "").strip()
+    if not normalized:
+        return []
+    matches: list[str] = []
+    for token in _TEMPORAL_RELATIVE_TOKENS:
+        if token in normalized and token not in matches:
+            matches.append(token)
+    for match in _TEMPORAL_WEEKDAY_PATTERN.finditer(normalized):
+        token = match.group(0)
+        if token not in matches:
+            matches.append(token)
+    for match in _TEMPORAL_THIS_MONTH_DAY_PATTERN.finditer(normalized):
+        token = re.sub(r"\s+", "", match.group(0))
+        if token not in matches:
+            matches.append(token)
+    for match in _TEMPORAL_MONTH_DAY_WITHOUT_YEAR_PATTERN.finditer(normalized):
+        start = match.start()
+        if start > 0 and normalized[start - 1].isdigit():
+            continue
+        token = re.sub(r"\s+", "", match.group(0))
+        if token not in matches:
+            matches.append(token)
+    return matches
+
+
+def _temporal_gate_state(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction: dict[str, Any] | None,
+    anchor_date: str | None = None,
+) -> dict[str, Any]:
+    reliable_anchor = _normalize_record_date_input(anchor_date) or semantic_llm.infer_reliable_anchor_date(
+        None if extraction is None else extraction.get("transcript"),
+        observations=None if extraction is None else extraction.get("observations"),
+    )
+    transcript = None if extraction is None else extraction.get("transcript")
+    observations = [] if extraction is None else extraction.get("observations")
+    matched_tokens = _contains_relative_or_incomplete_time(transcript)
+    if isinstance(observations, list):
+        for item in observations:
+            if not isinstance(item, dict):
+                continue
+            matched_tokens.extend(_contains_relative_or_incomplete_time(item.get("content")))
+    deduped_tokens: list[str] = []
+    for token in matched_tokens:
+        if token not in deduped_tokens:
+            deduped_tokens.append(token)
+    return {
+        "requires_clarification": bool(deduped_tokens) and reliable_anchor is None,
+        "matched_tokens": deduped_tokens,
+        "anchor_date": reliable_anchor,
+    }
+
+
+def _current_temporal_gate_payload(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    parse_status: str | None = None,
+    reviewable: bool | None = None,
+) -> dict[str, Any] | None:
+    latest_extraction = get_latest_extraction(conn, evidence_id)
+    if latest_extraction is None:
+        return None
+    if parse_status is None:
+        parse_status = _get_parse_status(conn, evidence_id)
+    if reviewable is None:
+        reviewable = parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_")
+    state = _temporal_gate_state(
+        conn,
+        evidence_id=evidence_id,
+        extraction=latest_extraction,
+        anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+    )
+    if not state["requires_clarification"]:
+        return None
+    return _temporal_gate_payload(
+        matched_tokens=state["matched_tokens"],
+        reviewable=reviewable,
+    )
+
+
 def _build_source_gate_payload(
     state: dict[str, Any],
     *,
@@ -910,6 +1046,36 @@ def _current_source_gate_payload(
     if reviewable is None:
         reviewable = parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_")
     return _build_source_gate_payload(state, reviewable=reviewable)
+
+
+def _apply_source_gate_clarification(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    gate_state: dict[str, Any],
+) -> None:
+    _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+    _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_SOURCE_CONTEXT)
+    _set_parse_detail(conn, evidence_id, _clarification_detail(gate_state))
+
+
+def _apply_temporal_gate_clarification(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    gate_state: dict[str, Any],
+) -> None:
+    _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+    _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_TEMPORAL_CONTEXT)
+    _set_parse_detail(
+        conn,
+        evidence_id,
+        _temporal_clarification_detail(matched_tokens=gate_state["matched_tokens"]),
+    )
+
+
+def _clear_clarification_state(conn: sqlite3.Connection, evidence_id: str) -> None:
+    _set_clarification_reason(conn, evidence_id, None)
 
 
 def _build_relative_due_updates(
@@ -1746,6 +1912,10 @@ def _semantic_anchor_source_key(evidence_id: str) -> str:
     return f"semantic_anchor_source:{evidence_id}"
 
 
+def _clarification_reason_key(evidence_id: str) -> str:
+    return f"clarification_reason:{evidence_id}"
+
+
 def _verified_key(evidence_id: str) -> str:
     return f"verified:{evidence_id}"
 
@@ -1768,6 +1938,14 @@ def _global_ocr_count_key(today: str) -> str:
 
 def _set_parse_status(conn: sqlite3.Connection, evidence_id: str, status: str) -> None:
     _set_meta_value(conn, _parse_status_key(evidence_id), status)
+
+
+def _set_clarification_reason(conn: sqlite3.Connection, evidence_id: str, reason: str | None) -> None:
+    key = _clarification_reason_key(evidence_id)
+    if reason is None:
+        conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+        return
+    _set_meta_value(conn, key, reason)
     conn.commit()
 
 
@@ -1778,6 +1956,10 @@ def _set_parse_detail(conn: sqlite3.Connection, evidence_id: str, detail: str) -
 
 def _get_parse_status(conn: sqlite3.Connection, evidence_id: str) -> str:
     return _get_meta_value(conn, _parse_status_key(evidence_id)) or PARSE_STATUS_FAILED
+
+
+def _get_clarification_reason(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    return _get_meta_value(conn, _clarification_reason_key(evidence_id))
 
 
 def _get_parse_detail(conn: sqlite3.Connection, evidence_id: str) -> str | None:
@@ -2051,6 +2233,7 @@ def _run_parse_pipeline(
     anchor_date: str | None = None
     anchor_source: str | None = None
     effective_source_hint: str | None = None
+    temporal_gate_state: dict[str, Any] | None = None
     try:
         evidence_row = conn.execute(
             "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
@@ -2073,6 +2256,12 @@ def _run_parse_pipeline(
                 anchor_date = semantic_llm.infer_reliable_anchor_date(transcript, observations=observations)
                 anchor_source = None if anchor_date is None else "content"
                 _set_semantic_anchor(conn, evidence_id, anchor_date, anchor_source)
+            temporal_gate_state = _temporal_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+                anchor_date=anchor_date,
+            )
     finally:
         conn.close()
 
@@ -2092,10 +2281,17 @@ def _run_parse_pipeline(
     try:
         previous_run = get_latest_semantic_run_for_evidence(conn, evidence_id)
         if extraction is None:
+            _clear_clarification_state(conn, evidence_id)
             _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析缺少提取版本,记录已完整保存")
             return
-
+        if temporal_gate_state is not None and temporal_gate_state["requires_clarification"]:
+            _apply_temporal_gate_clarification(
+                conn,
+                evidence_id=evidence_id,
+                gate_state=temporal_gate_state,
+            )
+            return
         semantic_run = create_semantic_run(
             conn,
             provider="deepseek",
@@ -2165,6 +2361,7 @@ def _run_parse_pipeline(
                 facts=fact_payloads,
                 interpretations=interpretation_payloads,
             )
+            _clear_clarification_state(conn, evidence_id)
             _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
             _set_parse_detail(conn, evidence_id, "")
         except Exception:
@@ -2414,6 +2611,7 @@ def _run_parse_pipeline(
                     event_match_run_id=event_match_run["event_match_run_id"],
                     failure_type="persistence_error",
                 )
+        _clear_clarification_state(conn, evidence_id)
         _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
         _set_parse_detail(conn, evidence_id, "")
         _emit_structured_log(
@@ -2523,12 +2721,31 @@ def _run_image_pipeline(
             extraction=latest_extraction,
         )
         if gate_state["requires_clarification"]:
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
-            _set_parse_detail(conn, evidence_id, _clarification_detail(gate_state))
+            _apply_source_gate_clarification(
+                conn,
+                evidence_id=evidence_id,
+                gate_state=gate_state,
+            )
+            conn.commit()
+            return
+
+        temporal_gate_state = _temporal_gate_state(
+            conn,
+            evidence_id=evidence_id,
+            extraction=latest_extraction,
+            anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+        )
+        if temporal_gate_state["requires_clarification"]:
+            _apply_temporal_gate_clarification(
+                conn,
+                evidence_id=evidence_id,
+                gate_state=temporal_gate_state,
+            )
             conn.commit()
             return
 
         _clear_extract_note(conn, evidence_id)
+        _clear_clarification_state(conn, evidence_id)
         _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
         _set_parse_detail(conn, evidence_id, "")
         conn.commit()
@@ -3860,6 +4077,7 @@ def create_app() -> FastAPI:
             if row is None:
                 raise HTTPException(status_code=404, detail="evidence not found")
             parse_status = _get_parse_status(conn, evidence_id)
+            clarification_reason = _get_clarification_reason(conn, evidence_id)
             extract_note = _get_extract_note(conn, evidence_id)
             parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
             semantic_result = _build_semantic_result(conn, evidence_id)
@@ -3874,9 +4092,20 @@ def create_app() -> FastAPI:
                 if row["media_type"] == "image"
                 else None
             )
+            temporal_gate = (
+                _current_temporal_gate_payload(
+                    conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                    reviewable=parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_"),
+                )
+                if row["media_type"] == "image"
+                else None
+            )
             return {
                 "parse_status": parse_status,
-                "parse_status_label": _parse_status_label(parse_status),
+                "parse_status_label": _parse_status_label_with_reason(parse_status, clarification_reason),
+                "clarification_reason": clarification_reason,
                 "slots_filled": row["slots_filled"],
                 "plain_summary": row["plain_summary"],
                 "deliverable": row["slot_deliverable"],
@@ -3893,6 +4122,7 @@ def create_app() -> FastAPI:
                 "media_type": row["media_type"],
                 "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
                 "source_gate": source_gate,
+                "temporal_gate": temporal_gate,
             }
         finally:
             conn.close()
@@ -3983,6 +4213,7 @@ def create_app() -> FastAPI:
                 decision=decision,
             )
             _clear_extract_note(conn, evidence_id)
+            _clear_clarification_state(conn, evidence_id)
             _set_meta_value(conn, _parse_status_key(evidence_id), next_status)
             _set_meta_value(conn, _parse_detail_key(evidence_id), "")
             conn.commit()
@@ -4034,6 +4265,7 @@ def create_app() -> FastAPI:
     async def update_evidence_record_date(
         evidence_id: str,
         request: Request,
+        background_tasks: BackgroundTasks,
         sandbox: SandboxContext = Depends(get_sandbox),
     ) -> JSONResponse:
         payload = await request.json()
@@ -4051,15 +4283,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="请选择记录发生日期")
 
         conn = init_db(sandbox.db_path)
+        should_start_parse = False
+        next_parse_status: str | None = None
         try:
             evidence_row = conn.execute(
-                "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
+                "SELECT evidence_id, media_type FROM evidence WHERE evidence_id = ?",
                 (evidence_id,),
             ).fetchone()
             if evidence_row is None:
                 raise HTTPException(status_code=404, detail="evidence not found")
 
             latest_run = get_latest_semantic_run_for_evidence(conn, evidence_id, status="succeeded")
+            latest_extraction = get_latest_extraction(conn, evidence_id)
             relative_due_updates: list[dict[str, Any]] = []
             if latest_run is not None:
                 latest_facts = list_facts_for_semantic_run(
@@ -4083,6 +4318,43 @@ def create_app() -> FastAPI:
                     due_updates=relative_due_updates,
                     updated_at=updated_at,
                 )
+            elif latest_run is None and latest_extraction is not None:
+                source_gate_state = _source_gate_state(
+                    conn,
+                    evidence_id=evidence_id,
+                    extraction=latest_extraction,
+                )
+                if source_gate_state["requires_clarification"]:
+                    _apply_source_gate_clarification(
+                        conn,
+                        evidence_id=evidence_id,
+                        gate_state=source_gate_state,
+                    )
+                    next_parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
+                else:
+                    temporal_gate_state = _temporal_gate_state(
+                        conn,
+                        evidence_id=evidence_id,
+                        extraction=latest_extraction,
+                        anchor_date=record_date,
+                    )
+                    if temporal_gate_state["requires_clarification"]:
+                        _apply_temporal_gate_clarification(
+                            conn,
+                            evidence_id=evidence_id,
+                            gate_state=temporal_gate_state,
+                        )
+                        next_parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
+                    elif _can_run_semantic_parse(
+                        latest_extraction.get("transcript"),
+                        latest_extraction.get("observations"),
+                    ):
+                        _clear_extract_note(conn, evidence_id)
+                        _clear_clarification_state(conn, evidence_id)
+                        _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+                        _set_parse_detail(conn, evidence_id, "")
+                        next_parse_status = PARSE_STATUS_LLM_RUNNING
+                        should_start_parse = True
             conn.commit()
         except HTTPException:
             if conn.in_transaction:
@@ -4099,6 +4371,14 @@ def create_app() -> FastAPI:
         finally:
             conn.close()
 
+        if should_start_parse:
+            background_tasks.add_task(
+                _run_parse_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                evidence_id,
+            )
+
         response = JSONResponse(
             {
                 "evidence_id": evidence_id,
@@ -4106,6 +4386,7 @@ def create_app() -> FastAPI:
                 "record_date_source": "user",
                 "record_date_source_label": _semantic_anchor_source_label("user"),
                 "updated_fact_count": len(relative_due_updates),
+                "parse_status": next_parse_status,
             }
         )
         apply_sandbox_cookie(response, sandbox)
@@ -4272,6 +4553,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="识别文字过长,请控制在 50000 字以内")
 
         conn = init_db(sandbox.db_path)
+        should_start_parse = False
+        parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
         try:
             row = conn.execute(
                 """
@@ -4307,25 +4590,41 @@ def create_app() -> FastAPI:
                 extraction=latest_extraction,
             )
             if gate_state["requires_clarification"]:
-                _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
-                _set_parse_detail(conn, evidence_id, _clarification_detail(gate_state))
+                _apply_source_gate_clarification(
+                    conn,
+                    evidence_id=evidence_id,
+                    gate_state=gate_state,
+                )
             else:
-                _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
-                _set_parse_detail(conn, evidence_id, "")
+                temporal_gate_state = _temporal_gate_state(
+                    conn,
+                    evidence_id=evidence_id,
+                    extraction=latest_extraction,
+                    anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+                )
+                if temporal_gate_state["requires_clarification"]:
+                    _apply_temporal_gate_clarification(
+                        conn,
+                        evidence_id=evidence_id,
+                        gate_state=temporal_gate_state,
+                    )
+                else:
+                    _clear_clarification_state(conn, evidence_id)
+                    _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+                    _set_parse_detail(conn, evidence_id, "")
+                    should_start_parse = True
+                    parse_status = PARSE_STATUS_LLM_RUNNING
             conn.commit()
         finally:
             conn.close()
 
-        if gate_state["requires_clarification"]:
-            parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
-        else:
+        if should_start_parse:
             background_tasks.add_task(
                 _run_parse_pipeline,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 evidence_id,
             )
-            parse_status = PARSE_STATUS_LLM_RUNNING
         response = JSONResponse(
             {
                 "evidence_id": evidence_id,
@@ -4644,6 +4943,7 @@ def create_app() -> FastAPI:
         status_conn = init_db(sandbox.db_path)
         try:
             parse_status = _get_parse_status(status_conn, evidence_id)
+            clarification_reason = _get_clarification_reason(status_conn, evidence_id)
             extract_note = _get_extract_note(status_conn, evidence_id)
             parse_detail = _humanize_user_facing_text(extract_note or _get_parse_detail(status_conn, evidence_id)) or (
                 extract_note or _get_parse_detail(status_conn, evidence_id)
@@ -4660,6 +4960,24 @@ def create_app() -> FastAPI:
                 if context["media_type"] == "image"
                 else None
             )
+            temporal_gate = (
+                _current_temporal_gate_payload(
+                    status_conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                    reviewable=parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_"),
+                )
+                if context["media_type"] == "image"
+                else None
+            )
+            record_date = _get_semantic_anchor_date(status_conn, evidence_id)
+            record_date_source = _get_semantic_anchor_source(status_conn, evidence_id)
+            record_date_state = {
+                "record_date": record_date,
+                "record_date_source": record_date_source,
+                "record_date_source_label": _semantic_anchor_source_label(record_date_source),
+                "date_resolution_notice": None,
+            }
             diagnostics = None
             diagnostics_json = None
             if _diagnostics_enabled():
@@ -4684,11 +5002,14 @@ def create_app() -> FastAPI:
                     parse_status=parse_status,
                 ),
                 "parse_status": parse_status,
-                "parse_status_label": _parse_status_label(parse_status),
+                "parse_status_label": _parse_status_label_with_reason(parse_status, clarification_reason),
+                "clarification_reason": clarification_reason,
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
                 "is_ocr_corrected": is_ocr_corrected,
                 "source_gate": source_gate,
+                "temporal_gate": temporal_gate,
+                "record_date_state": record_date_state,
                 "source_presets": SOURCE_PRESETS,
                 "diagnostics_enabled": _diagnostics_enabled(),
                 "diagnostics": diagnostics,

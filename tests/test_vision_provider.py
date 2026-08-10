@@ -245,6 +245,125 @@ def test_normalize_visual_result_wechat_direct_chat_keeps_baomaqun_as_header_not
     assert "[participant][participant_2]" not in result["transcript"]
 
 
+def test_normalize_visual_result_project_yanfaqun_recall_becomes_system_event_without_participant_2():
+    payload = {
+        "observed_platform": "微信",
+        "platform_confidence": 0.95,
+        "conversation_type": "group_chat",
+        "chat_header": "项目研发群",
+        "participants": [],
+        "messages": [
+            {"index": 1, "speaker_ref": "left_user", "side": "left", "text": "今天先这样"},
+            {"index": 2, "speaker_ref": "right_user", "side": "right", "text": "收到"},
+        ],
+        "system_events": [
+            {
+                "type": "message_recalled",
+                "visible_text": "冉冉孤生竹🎋撤回了一条消息",
+                "actor_display_name": "冉冉孤生竹🎋",
+            }
+        ],
+        "observations": [],
+        "warnings": [],
+    }
+
+    result = vision_provider._normalize_visual_result(payload, source_hint="微信-单聊")
+
+    assert "[scene] platform=微信; conversation_type=direct_chat" in result["transcript"]
+    assert "[chat_header] 项目研发群" in result["transcript"]
+    assert '[system_event][message_recalled actor="冉冉孤生竹🎋"] 撤回了一条消息' in result["transcript"]
+    assert "[participant][participant_2]" not in result["transcript"]
+    assert "group_chat_downgraded_to_direct_without_structural_evidence" in result["warnings"]
+
+
+def test_normalize_visual_result_requires_structural_evidence_for_group_chat():
+    payload = {
+        "observed_platform": "微信",
+        "platform_confidence": 0.9,
+        "conversation_type": "group_chat",
+        "chat_header": "项目研发群",
+        "participants": [],
+        "messages": [
+            {"index": 1, "speaker_ref": "left_user", "side": "left", "text": "收到"},
+            {"index": 2, "speaker_ref": "right_user", "side": "right", "text": "好"},
+        ],
+        "system_events": [{"type": "system_notice", "visible_text": "凡加入了群聊", "actor_display_name": "凡"}],
+        "observations": [],
+        "warnings": [],
+    }
+
+    result = vision_provider._normalize_visual_result(payload, source_hint="微信-单聊")
+
+    assert "[scene] platform=微信; conversation_type=direct_chat" in result["transcript"]
+    assert "group_chat_downgraded_to_direct_without_structural_evidence" in result["warnings"]
+
+
+def test_normalize_visual_result_real_group_fixture_reuses_two_left_participants():
+    payload = {
+        "observed_platform": "微信",
+        "platform_confidence": 0.93,
+        "conversation_type": "group_chat",
+        "chat_header": "项目研发群",
+        "participants": [
+            {"speaker_ref": "left_a", "side": "left", "display_name": "凡", "layout_identity": "avatar-a"},
+            {"speaker_ref": "left_b", "side": "left", "display_name": "念文雯", "layout_identity": "avatar-b"},
+        ],
+        "messages": [
+            {"index": 1, "speaker_ref": "left_a", "side": "left", "visible_sender_label": "凡", "avatar_ref": "avatar-a", "text": "我先看下"},
+            {"index": 2, "speaker_ref": "left_b", "side": "left", "visible_sender_label": "念文雯", "avatar_ref": "avatar-b", "text": "我补截图"},
+            {"index": 3, "speaker_ref": "left_b", "side": "left", "visible_sender_label": "念文雯", "avatar_ref": "avatar-b", "text": "已经发群里了"},
+            {"index": 4, "speaker_ref": "right_me", "side": "right", "text": "收到"},
+        ],
+        "system_events": [],
+        "observations": [],
+        "warnings": [],
+    }
+
+    result = vision_provider._normalize_visual_result(payload, source_hint="微信-项目群")
+
+    assert "[scene] platform=微信; conversation_type=group_chat" in result["transcript"]
+    assert "[participant][participant_1] side=left display_name=凡" in result["transcript"]
+    assert "[participant][participant_2] side=left display_name=念文雯" in result["transcript"]
+    assert "[message 2][participant_2] 我补截图" in result["transcript"]
+    assert "[message 3][participant_2] 已经发群里了" in result["transcript"]
+    assert "[message 4][right_account] 收到" in result["transcript"]
+
+
+def test_normalize_visual_result_keeps_exact_emoji_or_unknown():
+    payload = {
+        "observed_platform": "飞书",
+        "platform_confidence": 0.9,
+        "conversation_type": "group_chat",
+        "chat_header": "A大冲小强",
+        "participants": [
+            {"speaker_ref": "A大", "side": "left", "display_name": "A大", "layout_identity": "avatar-a"},
+            {"speaker_ref": "冲小强", "side": "left", "display_name": "冲小强", "layout_identity": "avatar-b"},
+        ],
+        "messages": [
+            {
+                "index": 1,
+                "speaker_ref": "冲小强",
+                "side": "left",
+                "text": "我先改文案😄",
+                "reactions": [
+                    {"emoji": "👍", "actor_display_name": "unknown"},
+                    {"emoji": "uncertain emoji", "actor_display_name": "unknown"},
+                ],
+            },
+            {"index": 2, "speaker_ref": "right_me", "side": "right", "text": "收到"},
+        ],
+        "system_events": [],
+        "observations": [],
+        "warnings": [],
+    }
+
+    result = vision_provider._normalize_visual_result(payload, source_hint="飞书-项目群")
+
+    assert '[reaction emoji="👍" actor="unknown"]' in result["transcript"]
+    assert '[reaction emoji="[emoji_unknown]" actor="unknown"]' in result["transcript"]
+    assert "emoji_uncertain_normalized_to_unknown" in result["warnings"]
+
+
 def test_normalize_visual_result_unknown_side_does_not_default_to_left():
     payload = {
         "observed_platform": "微信",
