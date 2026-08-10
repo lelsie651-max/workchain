@@ -15,16 +15,19 @@ from evidence_core.semantic_store import (
     create_event,
     create_event_change_run,
     create_event_match_run,
+    create_source_review,
     create_fact,
     create_interpretation,
     create_semantic_run,
     create_submission,
     correct_relative_due_dates_by_user,
     correct_fact_by_user,
+    get_effective_source_hint,
     get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
     get_semantic_run,
     get_latest_semantic_run_for_evidence,
+    get_latest_source_review,
     list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
@@ -205,6 +208,79 @@ def test_create_submission_keeps_evidence_order(db_file, blobs_root):
     assert created["submission_id"] == "sub-1"
     assert created["created_at"] == 10
     assert [row["evidence_id"] for row in created["evidence"]] == ["ev-2", "ev-1"]
+
+
+def test_source_review_updates_effective_source_hint_without_touching_original_evidence(db_file, blobs_root):
+    conn = init_db(db_file)
+    evidence = append_evidence(
+        conn,
+        blobs_root=blobs_root,
+        media_type="image",
+        payload=b"fake-image",
+        captured_at=1,
+        occurred_at=1,
+        source_hint="飞书-项目A",
+        kind="reference",
+        evidence_id="ev-1",
+    )
+    extraction_v1 = _create_machine_extraction(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id="ext-1",
+        transcript="第一次提取",
+        created_at=10,
+    )
+
+    assert get_effective_source_hint(conn, evidence["evidence_id"]) == "飞书-项目A"
+
+    corrected_review = create_source_review(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id=extraction_v1["extraction_id"],
+        original_source_hint="飞书-项目A",
+        observed_platform="微信",
+        resolved_source_hint="微信-项目A",
+        decision="corrected",
+        review_id="srev-1",
+        created_at=11,
+    )
+    extraction_v2 = create_extraction(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id="ext-2",
+        origin="machine",
+        provider="doubao-ark",
+        model="seed-2.1",
+        transcript="第二次提取",
+        observations=[],
+        warnings=[],
+        created_at=12,
+        supersedes_extraction_id=extraction_v1["extraction_id"],
+    )
+    confirmed_review = create_source_review(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id=extraction_v2["extraction_id"],
+        original_source_hint="微信-项目A",
+        observed_platform="微信",
+        resolved_source_hint="微信-项目A",
+        decision="confirmed_declared",
+        review_id="srev-2",
+        created_at=13,
+    )
+
+    evidence_row = conn.execute(
+        "SELECT source_hint FROM evidence WHERE evidence_id = ?",
+        (evidence["evidence_id"],),
+    ).fetchone()
+
+    assert evidence_row["source_hint"] == "飞书-项目A"
+    assert corrected_review["decision"] == "corrected"
+    assert confirmed_review["decision"] == "confirmed_declared"
+    assert get_effective_source_hint(conn, evidence["evidence_id"]) == "微信-项目A"
+    assert get_latest_source_review(conn, evidence["evidence_id"])["review_id"] == "srev-2"
+    assert get_latest_source_review(conn, evidence["evidence_id"], extraction_id="ext-1")["review_id"] == "srev-1"
+    assert get_latest_source_review(conn, evidence["evidence_id"], extraction_id="ext-2")["review_id"] == "srev-2"
 
 
 def test_create_semantic_run_supports_single_and_multiple_inputs(db_file, blobs_root):

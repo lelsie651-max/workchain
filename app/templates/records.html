@@ -65,6 +65,10 @@
                         <p>来源：{{ record.platform }}{% if record.scene %} / {{ record.scene }}{% endif %}</p>
                         <p>媒体类型：{{ record.media_type_label }}</p>
                         <p>解析状态：{{ record.parse_status_label }}</p>
+                        {% if record.parse_status == "clarification_required" %}
+                        <p class="text-amber-200">待核实来源</p>
+                        <p class="text-slate-400">这条图片记录需要先确认信息来源，进入详情后可以保持原来源或改成正确来源。</p>
+                        {% endif %}
                         {% if record.parse_detail and record.parse_status != "done" %}
                         <p class="text-slate-400">{{ record.parse_detail }}</p>
                         {% endif %}

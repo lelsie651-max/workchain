@@ -87,7 +87,7 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
                 "[message 3][left_account] 我脸都绿了\n"
                 "[message 4][right_account] 笑死我了\n"
                 "[message 5][left_account] 我说我理想中是18\n"
-                '[message 6][left_account][quote speaker="戴雯" text="我说我理想中是18"] 感觉被侮辱了\n'
+                '[message 6][left_account][quote speaker="unknown" text="戴雯: 刚开始给我13呢"] 感觉被侮辱了\n'
                 "[message 7][left_account] 不是很开心\n"
                 "[message 8][right_account] 冷静，收集其他同事情况，不动声色！\n"
                 "[message 9][right_account] 先看看有没有周栋准备不带着去上海的\n"
@@ -97,6 +97,11 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
                 "[message 13][left_account] 我自己都没啥心情了"
             ),
             "observations": [
+                {
+                    "kind": "platform_detection",
+                    "content": '{"declared_platform": "微信", "observed_platform": "微信", "source_consistency": "match", "platform_confidence": 0.97}',
+                    "confidence": 0.97,
+                },
                 {
                     "kind": "chat_context",
                     "content": "platform=微信; conversation_type=direct_chat",
@@ -126,7 +131,7 @@ def test_extract_image_evidence_can_use_experimental_ark_vision_provider(monkeyp
     assert "[participant][right_account] display_name=unknown" in result["transcript"]
     assert "[message 1][left_account] 饭之" in result["transcript"]
     assert "[message 13][left_account] 我自己都没啥心情了" in result["transcript"]
-    assert '[message 6][left_account][quote speaker="戴雯" text="我说我理想中是18"] 感觉被侮辱了' in result["transcript"]
+    assert '[message 6][left_account][quote speaker="unknown" text="戴雯: 刚开始给我13呢"] 感觉被侮辱了' in result["transcript"]
     assert "[left_饭之]" not in result["transcript"]
 
 

@@ -308,6 +308,20 @@ def _load_submission(conn: sqlite3.Connection, submission_id: str) -> dict[str, 
     return result
 
 
+def _get_source_review_row(conn: sqlite3.Connection, review_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM source_reviews WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"source review not found: {review_id}")
+    return row
+
+
+def _load_source_review(conn: sqlite3.Connection, review_id: str) -> dict[str, Any]:
+    return dict(_get_source_review_row(conn, review_id))
+
+
 def _load_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any]:
     run = _get_semantic_run_row(conn, semantic_run_id)
     input_rows = conn.execute(
@@ -600,6 +614,55 @@ def get_latest_semantic_run_for_evidence(
     return _load_semantic_run(conn, row["semantic_run_id"])
 
 
+def get_latest_source_review(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+    *,
+    extraction_id: str | None = None,
+) -> dict[str, Any] | None:
+    evidence_id = _coerce_required_text("evidence_id", evidence_id)
+    extraction_id = _coerce_optional_text(extraction_id)
+    if extraction_id is None:
+        row = conn.execute(
+            """
+            SELECT review_id
+            FROM source_reviews
+            WHERE evidence_id = ?
+            ORDER BY created_at DESC, review_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT review_id
+            FROM source_reviews
+            WHERE evidence_id = ? AND extraction_id = ?
+            ORDER BY created_at DESC, review_id DESC
+            LIMIT 1
+            """,
+            (evidence_id, extraction_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return _load_source_review(conn, row["review_id"])
+
+
+def get_effective_source_hint(conn: sqlite3.Connection, evidence_id: str) -> str | None:
+    evidence_id = _coerce_required_text("evidence_id", evidence_id)
+    latest_review = get_latest_source_review(conn, evidence_id)
+    if latest_review is not None:
+        return latest_review["resolved_source_hint"]
+    row = conn.execute(
+        "SELECT source_hint FROM evidence WHERE evidence_id = ?",
+        (evidence_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"evidence not found: {evidence_id}")
+    return row["source_hint"]
+
+
 def get_latest_event_match_for_evidence(
     conn: sqlite3.Connection,
     evidence_id: str,
@@ -837,6 +900,65 @@ def create_submission(
                 (submission_id, evidence_id, position),
             )
         result = _load_submission(conn, submission_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def create_source_review(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction_id: str,
+    original_source_hint: str,
+    observed_platform: str | None,
+    resolved_source_hint: str,
+    decision: str,
+    review_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    evidence_id = _coerce_required_text("evidence_id", evidence_id)
+    extraction_id = _coerce_required_text("extraction_id", extraction_id)
+    original_source_hint = _coerce_required_text("original_source_hint", original_source_hint)
+    resolved_source_hint = _coerce_required_text("resolved_source_hint", resolved_source_hint)
+    observed_platform = _coerce_optional_text(observed_platform)
+    if decision not in {"confirmed_declared", "corrected"}:
+        raise SemanticStoreError("decision must be confirmed_declared or corrected")
+
+    review_id = review_id or _new_id("srev")
+    created_at = _now_ms() if created_at is None else created_at
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        _ensure_evidence_exists(conn, [evidence_id])
+        extraction = _get_extraction_row(conn, extraction_id)
+        if extraction["evidence_id"] != evidence_id:
+            raise SemanticStoreError("extraction_id must belong to the same evidence")
+        conn.execute(
+            """
+            INSERT INTO source_reviews (
+                review_id, evidence_id, extraction_id, original_source_hint,
+                observed_platform, resolved_source_hint, decision, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id,
+                evidence_id,
+                extraction_id,
+                original_source_hint,
+                observed_platform,
+                resolved_source_hint,
+                decision,
+                created_at,
+            ),
+        )
+        result = _load_source_review(conn, review_id)
         if started_transaction:
             conn.commit()
         return result

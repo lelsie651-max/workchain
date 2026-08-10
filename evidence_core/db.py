@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -476,6 +476,31 @@ def _create_v9_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_v10_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS source_reviews (
+            review_id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL,
+            extraction_id TEXT NOT NULL,
+            original_source_hint TEXT NOT NULL,
+            observed_platform TEXT,
+            resolved_source_hint TEXT NOT NULL,
+            decision TEXT NOT NULL CHECK (decision IN ('confirmed_declared', 'corrected')),
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT,
+            FOREIGN KEY (extraction_id) REFERENCES evidence_extractions(extraction_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_source_reviews_evidence_id_created_at
+            ON source_reviews(evidence_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_source_reviews_extraction_id_created_at
+            ON source_reviews(extraction_id, created_at DESC);
+        """
+    )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -552,6 +577,11 @@ def _migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 9)
 
 
+def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    _create_v10_schema(conn)
+    _set_schema_version(conn, 10)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -580,6 +610,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v7_schema(conn)
         _create_v8_schema(conn)
         _create_v9_schema(conn)
+        _create_v10_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -601,6 +632,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -611,6 +643,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -621,6 +654,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 4:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -631,6 +665,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 5:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -641,6 +676,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 6:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -651,6 +687,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v6_to_v7(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 7:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -661,6 +698,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v7_schema(conn)
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 8:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -671,6 +709,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v7_schema(conn)
         _create_v8_schema(conn)
         _migrate_v8_to_v9(conn)
+        _migrate_v9_to_v10(conn)
     elif schema_version == 9:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -681,6 +720,18 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v7_schema(conn)
         _create_v8_schema(conn)
         _create_v9_schema(conn)
+        _migrate_v9_to_v10(conn)
+    elif schema_version == 10:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
+        _create_v5_schema(conn)
+        _create_v6_schema(conn)
+        _create_v7_schema(conn)
+        _create_v8_schema(conn)
+        _create_v9_schema(conn)
+        _create_v10_schema(conn)
     else:
         conn.close()
         raise ValueError(

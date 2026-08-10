@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from app import vision_provider
 from app.vision_provider import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT
 
@@ -25,7 +27,7 @@ def _daiwen_payload(*, observed_platform: str = "微信") -> dict:
                 "speaker_ref": "left_戴雯",
                 "side": "left",
                 "text": "感觉被侮辱了",
-                "quote": {"speaker_display_name": "戴雯", "text": "我说我理想中是18"},
+                "quote": {"speaker_display_name": None, "text": "戴雯: 刚开始给我13呢"},
             },
             {"index": 7, "speaker_ref": "left_戴雯", "side": "left", "text": "不是很开心"},
             {"index": 8, "speaker_ref": "right_用户", "side": "right", "text": "冷静，收集其他同事情况，不动声色！"},
@@ -66,6 +68,7 @@ def test_vision_prompt_requires_declared_vs_observed_platform_and_safe_unknown_s
     assert "chat_header 只表示顶部直接可见 UI 文本" in VISION_SYSTEM_PROMPT
     assert "不得把这种规则跨平台套用" in VISION_SYSTEM_PROMPT
     assert "direct_chat 中如果某条 message 的 side 无法确定" in VISION_SYSTEM_PROMPT
+    assert "不得只因为 chat_header 含有" in VISION_SYSTEM_PROMPT
     assert "structured conversation" in VISION_USER_PROMPT
 
 
@@ -134,7 +137,7 @@ def test_normalize_visual_result_gold_case_wechat_direct_chat():
         "[message 3][left_account] 我脸都绿了\n"
         "[message 4][right_account] 笑死我了\n"
         "[message 5][left_account] 我说我理想中是18\n"
-        '[message 6][left_account][quote speaker="戴雯" text="我说我理想中是18"] 感觉被侮辱了\n'
+        '[message 6][left_account][quote speaker="unknown" text="戴雯: 刚开始给我13呢"] 感觉被侮辱了\n'
         "[message 7][left_account] 不是很开心\n"
         "[message 8][right_account] 冷静，收集其他同事情况，不动声色！\n"
         "[message 9][right_account] 先看看有没有周栋准备不带着去上海的\n"
@@ -151,7 +154,14 @@ def test_normalize_visual_result_gold_case_wechat_direct_chat():
         "normalized_direct_chat_speaker_ref:right_用户",
         "normalized_direct_chat_speaker_ref:left_饭之",
     ]
-    assert result["observations"][0] == {
+    assert result["observations"][0]["kind"] == "platform_detection"
+    assert json.loads(result["observations"][0]["content"]) == {
+        "declared_platform": "微信",
+        "observed_platform": "微信",
+        "source_consistency": "match",
+        "platform_confidence": 0.97,
+    }
+    assert result["observations"][1] == {
         "kind": "chat_context",
         "content": "platform=微信; conversation_type=direct_chat",
         "confidence": None,
@@ -165,6 +175,12 @@ def test_normalize_visual_result_preserves_declared_vs_observed_platform_mismatc
 
     assert "[scene] platform=微信; declared_platform=飞书; source_consistency=mismatch; conversation_type=direct_chat" in result["transcript"]
     assert "source_platform_mismatch:declared=飞书;observed=微信" in result["warnings"]
+    assert json.loads(result["observations"][0]["content"]) == {
+        "declared_platform": "飞书",
+        "observed_platform": "微信",
+        "source_consistency": "mismatch",
+        "platform_confidence": 0.97,
+    }
     assert "[scene] platform=飞书;" not in result["transcript"]
 
 
@@ -175,6 +191,12 @@ def test_normalize_visual_result_observed_unknown_is_not_forced_by_declared_sour
 
     assert "[scene] platform=unknown; declared_platform=微信; source_consistency=unknown; conversation_type=direct_chat" in result["transcript"]
     assert "[participant][left_account] display_name=unknown" in result["transcript"]
+    assert json.loads(result["observations"][0]["content"]) == {
+        "declared_platform": "微信",
+        "observed_platform": "unknown",
+        "source_consistency": "unknown",
+        "platform_confidence": None,
+    }
     assert "source_platform_mismatch:declared=微信;observed=unknown" not in result["warnings"]
 
 
@@ -197,6 +219,30 @@ def test_normalize_visual_result_does_not_apply_cross_platform_header_mapping():
 
     assert "[participant][left_account] display_name=unknown" in result["transcript"]
     assert "[participant][right_account] display_name=unknown" in result["transcript"]
+
+
+def test_normalize_visual_result_wechat_direct_chat_keeps_baomaqun_as_header_not_group():
+    payload = {
+        "observed_platform": "微信",
+        "platform_confidence": 0.94,
+        "conversation_type": "direct_chat",
+        "chat_header": "宝妈群",
+        "participants": [],
+        "messages": [
+            {"index": 1, "speaker_ref": "left_user", "side": "left", "text": "今天先这样"},
+            {"index": 2, "speaker_ref": "right_user", "side": "right", "text": "收到"},
+        ],
+        "observations": [],
+        "warnings": [],
+    }
+
+    result = vision_provider._normalize_visual_result(payload, source_hint="微信-单聊")
+
+    assert "[scene] platform=微信; conversation_type=direct_chat" in result["transcript"]
+    assert "[chat_header] 宝妈群" in result["transcript"]
+    assert "[participant][left_account] display_name=宝妈群" in result["transcript"]
+    assert "[participant][participant_1]" not in result["transcript"]
+    assert "[participant][participant_2]" not in result["transcript"]
 
 
 def test_normalize_visual_result_unknown_side_does_not_default_to_left():
@@ -280,7 +326,14 @@ def test_normalize_visual_result_non_chat_keeps_plain_transcript():
 
     assert result == {
         "transcript": "审批通过,周五前交付渠道复盘数据",
-        "observations": [{"kind": "timestamp", "content": "2026-08-09 19:21", "confidence": 0.91}],
+        "observations": [
+            {
+                "kind": "platform_detection",
+                "content": '{"declared_platform": null, "observed_platform": "unknown", "source_consistency": "unknown", "platform_confidence": null}',
+                "confidence": None,
+            },
+            {"kind": "timestamp", "content": "2026-08-09 19:21", "confidence": 0.91},
+        ],
         "provider": "doubao-ark",
         "model": vision_provider.get_ark_vision_model(),
         "warnings": [],

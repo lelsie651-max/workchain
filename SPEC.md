@@ -110,6 +110,7 @@
 - 生产图片链统一通过受控 extraction provider 路由;默认值仍是 OCR,避免部署瞬间行为突变
 - Ark Vision 可同时产出 `transcript + observations`;其中 transcript 进入 production semantic route,observations 只进入 Extraction 层与 Semantic Parser 输入,不得混入 `raw_text`
 - `source` / `source_hint` 属于用户声明的 metadata(`declared_platform`),是 Extraction 输入上下文而非机器真值;它只帮助 Vision 阅读 UI,不是 Evidence 原文的一部分,也不得被用来改写原图文字
+- `evidence.source_hint` 是原始提交时写入哈希链的 immutable provenance,后续不得直接改写;用户若核实或修正来源,必须写入独立 `source_reviews` 履历,并通过 `effective source` 解析当前生效来源
 - 当 Ark Vision 处理聊天/IM 截图时,优先返回 platform-aware structured conversation extraction,并将 `declared_platform` 与 `observed_platform` 分离:平台必须先由截图 UI 独立观察得到;若 `observed_platform` 与用户声明冲突,最终 transcript / observation / warning 必须保留 provenance,不得静默覆盖任一方
 - 当 `observed_platform=unknown` 时,不得仅因用户声明了来源就伪造成机器已观察到该平台;可在 transcript / observation 中保留 `declared_platform` 与 `source_consistency=unknown`
 - 聊天 transcript 中的 `speaker_ref` 必须是 stable neutral identity:direct chat 在 side 明确时使用 `left_account / right_account`,side 无法安全判断时只能保留 `unknown_account` / unknown side 或显式 warning;group chat 使用 `right_account / participant_n`;昵称只放 `display_name`,不得让 `left_戴雯 / left_饭之 / right_用户` 这类 ref 直接进入最终 transcript
@@ -120,8 +121,10 @@
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
+- 图片链路中的 Source Gate 固定放在 `Extraction -> Semantic Parser` 之间:当 declared platform 明确、`observed_platform` 明确且与 declared 不同、并且 `platform_confidence >= 0.75` 时,当前 Evidence 进入 `clarification_required`,禁止创建 Semantic Run、禁止调用 DeepSeek / Event Matcher,直到用户确认或修正来源
+- Source Gate 只要求用户核实,不会自动覆盖用户来源;一旦用户确认 declared source,该 Extraction 的同一 mismatch 不得再次阻断;若用户修正来源,必须基于 `effective source` 重新跑 Vision,而不是直接拿旧 Extraction 继续 Semantic Parse
 - Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
-- production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;不传 `self_names`,也不使用 `counterpart` 参与事实判断
+- production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;其中 `source_hint` 必须取 `effective source`,不传 `self_names`,也不使用 `counterpart` 参与事实判断
 - `anchor_date` 优先级固定为:1) 用户明确填写的 `record_date`;2) `infer_reliable_anchor_date(...)` 从 transcript / observation 中确定性识别出的同日消息时间;3) `None`
 - 自动识别 `anchor_date` 只允许命中明确消息时间结构(如 `小李(2026-08-09): ...`、`[2026-08-09 10:30] 小李：...`);若出现多个不同日期、普通正文交付日期,或 observation 里没有明确 `消息日期/日期/timestamp + 完整年月日`(可带时间),一律返回 `None`
 - 截图/图片 observation 若直接可见完整年月日或完整日期+时间,允许提取为 `kind="timestamp"`;若只有 `19:21` 这类时分,不得补造年月日,也不得拿上传时间冒充聊天日期
@@ -445,6 +448,28 @@ V2 的目标底层关系为:
 - `evidence_extractions` 不进入 Evidence 哈希链,不改变原件与 `content_hash`
 - `semantic_runs / semantic_run_inputs / facts.semantic_run_id / interpretations.semantic_run_id` 同样不进入 Evidence 哈希链
 
+### 3.11 V10 来源核实 provenance
+
+#### source_reviews
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| review_id | TEXT PK | 一次来源核实记录 |
+| evidence_id | TEXT NOT NULL | 对应 Evidence |
+| extraction_id | TEXT NOT NULL | 被核实的 Extraction 版本 |
+| original_source_hint | TEXT NOT NULL | 本次核实时生效的 declared source |
+| observed_platform | TEXT NULL | 机器观察到的平台 |
+| resolved_source_hint | TEXT NOT NULL | 用户确认/修正后的来源 |
+| decision | TEXT NOT NULL | `confirmed_declared` / `corrected` |
+| created_at | INTEGER NOT NULL | 创建时间 |
+
+语义边界:
+- `source_reviews` 不进入 Evidence 哈希链,不改变原始 `evidence.source_hint / content_hash / chain_hash`
+- 无来源核实时,`effective source = evidence.source_hint`
+- 有来源核实时,`effective source = 最新 source_review.resolved_source_hint`
+- Vision 重跑、Semantic Parser 输入与当前用户可见来源,都必须读取 `effective source`
+- 用户确认高于机器判断;机器发现 mismatch 只负责提示核实,不得自动覆盖来源
+
 ### 3.10 V8 事项归属确认履历
 
 #### event_match_runs
@@ -588,7 +613,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - Semantic Run provenance:Fact / Interpretation 可追溯到具体 parser run 与输入 Evidence / Extraction
 - PDF / docx / txt 文档提取
 - text / file / image 新记录都会先落 Extraction provenance,再由 production semantic route 读取 latest Extraction 进入 V2.2
-- 图片链路:OCR 或 Ark Vision 提取 `transcript + observations` 后直接进入 production semantic route
+- 图片链路:OCR 或 Ark Vision 提取 `transcript + observations` 后,先经过 Source Gate;只有 gate 通过才进入 production semantic route
 - 身份设置(`self_names`)与私人词典(`glossary`)
 - 人工槽位修正
 - OCR 文字人工校正后会生成新的 user extraction,并触发 superseding semantic run
@@ -692,6 +717,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-09 | V8 新增 Event Assignment Confirmation:pending/completed review 状态、Evidence 详情确认归属 UI、整批原子提交 | 让 confirm / needs_context 不再停留在只读建议,而是能由用户一次性确认归入已有事项、新建事项或暂不归入 |
 | 2026-08-09 | Competition UX V1:首页主体验切到真实 Event / Fact,新增只读 Event 详情页,Help 同步真实能力 | 让用户首先看到 `我的事项` 与可回看原始证据的事实链路,同时把 demo threads 降级为示例区并清理过时文案 |
 | 2026-08-09 | Competition Core UX Polish:首页输入互斥、首页直确认事项、人话日期提示、事项截止展示 | 抹平首页与详情之间的确认断点,并明确"记录发生日期"只能来自用户显式填写,不能自动借用上传时间 |
+| 2026-08-10 | V10 新增 Source Review / effective source / clarification_required Source Gate | 固定把来源核实放在 `Extraction -> Semantic Parser` 之间,保持 `evidence.source_hint` 不可变,并让用户确认优先于机器平台判断 |
 | 2026-08-09 | Competition Date & Input UX Hardening:输入模式真互斥、可靠 anchor 识别、详情补日期闭环、确定性相对日期换算 | 保持"用户填写优先、正文可靠日期次之、上传时间禁用"的锚点边界,并让补日期后 due_at 与首页事项截止立即联动 |
 
 ---

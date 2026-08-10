@@ -61,16 +61,19 @@ from evidence_core.extraction_store import create_extraction, get_latest_extract
 from evidence_core.semantic_store import (
     ProtectedFactError,
     SemanticStoreError,
+    create_source_review,
     create_submission,
     create_event_change_run,
     create_semantic_run,
     create_event_match_run,
     correct_fact_by_user,
     correct_relative_due_dates_by_user,
+    get_effective_source_hint,
     get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
     get_latest_event_match_for_semantic_run,
     get_latest_semantic_run_for_evidence,
+    get_latest_source_review,
     list_event_candidates,
     list_facts_for_semantic_run,
     list_interpretations_for_semantic_run,
@@ -104,6 +107,8 @@ PARSE_STATUS_LLM_RUNNING = "llm_running"
 PARSE_STATUS_DONE = "done"
 PARSE_STATUS_FAILED = "failed"
 PARSE_STATUS_UNSUPPORTED = "unsupported"
+PARSE_STATUS_CLARIFICATION_REQUIRED = "clarification_required"
+SOURCE_GATE_PLATFORM_CONFIDENCE_THRESHOLD = 0.75
 PACKAGE_README_TEXT = (
     "这个文件夹里的记录不能被偷偷修改。\n"
     "如果你想自己确认,在装有 Python 的电脑上,\n"
@@ -126,6 +131,7 @@ def _parse_status_label(status: str | None) -> str:
         PARSE_STATUS_DONE: "已完成",
         PARSE_STATUS_FAILED: "暂不可用",
         PARSE_STATUS_UNSUPPORTED: "当前不支持自动解析",
+        PARSE_STATUS_CLARIFICATION_REQUIRED: "等待核实信息来源",
     }
     return mapping.get(status, status or "未知")
 
@@ -718,6 +724,192 @@ def _can_run_semantic_parse(transcript: str | None, observations: list[dict[str,
 
 def _date_to_millis(value: str | None) -> int | None:
     return llm.due_date_to_millis(value)
+
+
+def _normalize_user_source_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if normalized not in SOURCE_PRESETS and len(normalized) > 20:
+        raise HTTPException(status_code=400, detail="自定义来源不能超过 20 个字")
+    return normalized
+
+
+def _platform_detection_snapshot(
+    *,
+    declared_platform: str | None,
+    observed_platform: str | None,
+    source_consistency: str,
+    platform_confidence: float | None,
+) -> dict[str, Any]:
+    return {
+        "declared_platform": declared_platform,
+        "observed_platform": observed_platform or "unknown",
+        "source_consistency": source_consistency,
+        "platform_confidence": platform_confidence,
+    }
+
+
+def _parse_platform_detection_observation(
+    observations: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(observations, list):
+        return None
+    for item in observations:
+        if not isinstance(item, dict) or item.get("kind") != "platform_detection":
+            continue
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        snapshot = _platform_detection_snapshot(
+            declared_platform=payload.get("declared_platform"),
+            observed_platform=payload.get("observed_platform"),
+            source_consistency=str(payload.get("source_consistency") or "unknown"),
+            platform_confidence=payload.get("platform_confidence"),
+        )
+        confidence = snapshot["platform_confidence"]
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            snapshot["platform_confidence"] = None
+        else:
+            numeric = float(confidence)
+            snapshot["platform_confidence"] = numeric if 0.0 <= numeric <= 1.0 else None
+        return snapshot
+    return None
+
+
+def _effective_source_components(source_hint: str | None) -> tuple[str, str]:
+    source_hint = source_hint or ""
+    source, detail = source_label(source_hint)
+    return source, detail
+
+
+def _build_resolved_source_hint(current_source_hint: str | None, resolved_source: str) -> str:
+    _, scene = _effective_source_components(current_source_hint)
+    return resolved_source if not scene else f"{resolved_source}-{scene}"
+
+
+def _effective_source_display(source_hint: str | None) -> dict[str, Any]:
+    source, scene = _effective_source_components(source_hint)
+    return {
+        "source_hint": source_hint,
+        "platform": source,
+        "scene": scene,
+        "platform_class": source_badge_class(source),
+    }
+
+
+def _source_gate_state(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction: dict[str, Any] | None,
+) -> dict[str, Any]:
+    effective_source_hint = get_effective_source_hint(conn, evidence_id)
+    effective_source = _effective_source_display(effective_source_hint)
+    detection = None if extraction is None else _parse_platform_detection_observation(extraction.get("observations"))
+    latest_review_for_extraction = None
+    if extraction is not None:
+        latest_review_for_extraction = get_latest_source_review(
+            conn,
+            evidence_id,
+            extraction_id=extraction["extraction_id"],
+        )
+
+    if detection is None:
+        detection = _platform_detection_snapshot(
+            declared_platform=effective_source["platform"],
+            observed_platform="unknown",
+            source_consistency="unknown",
+            platform_confidence=None,
+        )
+
+    declared_platform = detection.get("declared_platform")
+    observed_platform = detection.get("observed_platform") or "unknown"
+    confidence = detection.get("platform_confidence")
+    requires_clarification = (
+        isinstance(declared_platform, str)
+        and declared_platform not in {"", "其他", "unknown"}
+        and isinstance(observed_platform, str)
+        and observed_platform not in {"", "其他", "unknown"}
+        and observed_platform != declared_platform
+        and isinstance(confidence, (int, float))
+        and confidence >= SOURCE_GATE_PLATFORM_CONFIDENCE_THRESHOLD
+        and not (
+            latest_review_for_extraction is not None
+            and latest_review_for_extraction["decision"] == "confirmed_declared"
+        )
+    )
+    return {
+        "requires_clarification": requires_clarification,
+        "effective_source_hint": effective_source_hint,
+        "effective_platform": effective_source["platform"],
+        "effective_scene": effective_source["scene"],
+        "declared_platform": declared_platform,
+        "observed_platform": observed_platform,
+        "source_consistency": detection.get("source_consistency") or "unknown",
+        "platform_confidence": confidence,
+        "reviewed_for_current_extraction": latest_review_for_extraction is not None,
+        "latest_review_for_current_extraction": latest_review_for_extraction,
+        "latest_review": get_latest_source_review(conn, evidence_id),
+    }
+
+
+def _clarification_detail(state: dict[str, Any]) -> str:
+    declared = state.get("declared_platform") or state.get("effective_platform") or "当前来源"
+    observed = state.get("observed_platform") or "unknown"
+    return f"等待核实信息来源：你填写的是「{declared}」，机器识别为「{observed}」。"
+
+
+def _build_source_gate_payload(
+    state: dict[str, Any],
+    *,
+    reviewable: bool,
+) -> dict[str, Any]:
+    declared = state.get("declared_platform") or state.get("effective_platform") or "其他"
+    observed = state.get("observed_platform") or "unknown"
+    requires_clarification = bool(state.get("requires_clarification"))
+    return {
+        "requires_clarification": requires_clarification,
+        "reviewable": reviewable,
+        "effective_source_hint": state.get("effective_source_hint"),
+        "effective_platform": state.get("effective_platform"),
+        "effective_scene": state.get("effective_scene"),
+        "declared_platform": declared,
+        "observed_platform": observed,
+        "source_consistency": state.get("source_consistency") or "unknown",
+        "platform_confidence": state.get("platform_confidence"),
+        "title": "信息来源可能需要核实" if requires_clarification else None,
+        "detail": _clarification_detail(state) if requires_clarification else None,
+        "prompt": "请确认这份记录实际来自哪里。" if requires_clarification else None,
+    }
+
+
+def _current_source_gate_payload(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    parse_status: str | None = None,
+    reviewable: bool | None = None,
+) -> dict[str, Any]:
+    if parse_status is None:
+        parse_status = _get_parse_status(conn, evidence_id)
+    latest_extraction = get_latest_extraction(conn, evidence_id)
+    state = _source_gate_state(
+        conn,
+        evidence_id=evidence_id,
+        extraction=latest_extraction,
+    )
+    if reviewable is None:
+        reviewable = parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_")
+    return _build_source_gate_payload(state, reviewable=reviewable)
 
 
 def _build_relative_due_updates(
@@ -1858,9 +2050,10 @@ def _run_parse_pipeline(
     glossary: list[dict[str, Any]] = []
     anchor_date: str | None = None
     anchor_source: str | None = None
+    effective_source_hint: str | None = None
     try:
         evidence_row = conn.execute(
-            "SELECT evidence_id, source_hint FROM evidence WHERE evidence_id = ?",
+            "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
             (evidence_id,),
         ).fetchone()
         extraction = get_latest_extraction(conn, evidence_id)
@@ -1868,6 +2061,7 @@ def _run_parse_pipeline(
             glossary = get_settings(sandbox_db_path).get("glossary", [])
             stored_anchor_date = _get_semantic_anchor_date(conn, evidence_id)
             stored_anchor_source = _get_semantic_anchor_source(conn, evidence_id)
+            effective_source_hint = get_effective_source_hint(conn, evidence_id)
         if extraction is not None:
             transcript = extraction.get("transcript")
             observations = extraction.get("observations") if isinstance(extraction.get("observations"), list) else []
@@ -2080,7 +2274,7 @@ def _run_parse_pipeline(
             observations=observations,
             anchor_date=anchor_date,
             glossary=glossary,
-            source_hint=evidence_row["source_hint"],
+            source_hint=effective_source_hint,
         )
         diagnostic = semantic_llm.pop_last_extract_diagnostic()
     except Exception as exc:
@@ -2272,11 +2466,7 @@ def _run_image_pipeline(
     selected_provider = get_image_extraction_provider()
     conn = init_db(sandbox_db_path)
     try:
-        evidence_row = conn.execute(
-            "SELECT source_hint FROM evidence WHERE evidence_id = ?",
-            (evidence_id,),
-        ).fetchone()
-        source_hint = None if evidence_row is None else evidence_row["source_hint"]
+        source_hint = get_effective_source_hint(conn, evidence_id)
     finally:
         conn.close()
     extraction_result = run_production_image_extraction(
@@ -2317,12 +2507,24 @@ def _run_image_pipeline(
             "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
             (_build_attachment_raw_text("image", filename, transcript), evidence_id),
         )
+        latest_extraction = get_latest_extraction(conn, evidence_id)
         _clear_extract_note(conn, evidence_id)
         if not _can_run_semantic_parse(transcript, observations):
             note = "图片提取未产生可供语义解析的 transcript 或 observations"
             _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
             _set_parse_detail(conn, evidence_id, _saved_original_detail(note))
             _set_extract_note(conn, evidence_id, note)
+            conn.commit()
+            return
+
+        gate_state = _source_gate_state(
+            conn,
+            evidence_id=evidence_id,
+            extraction=latest_extraction,
+        )
+        if gate_state["requires_clarification"]:
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+            _set_parse_detail(conn, evidence_id, _clarification_detail(gate_state))
             conn.commit()
             return
 
@@ -2419,7 +2621,8 @@ def _prepare_recent_row(
     row: sqlite3.Row,
     sandbox: SandboxContext,
 ) -> dict[str, Any]:
-    platform, scene = source_label(row["source_hint"])
+    effective_source_hint = get_effective_source_hint(conn, row["evidence_id"])
+    platform, scene = source_label(effective_source_hint)
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
     extracted_text = _extract_file_text(raw_text)
@@ -2439,6 +2642,7 @@ def _prepare_recent_row(
     ).fetchall()
     return {
         "evidence_id": row["evidence_id"],
+        "effective_source_hint": effective_source_hint,
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
         "captured_at_text": _format_datetime(row.get("captured_at"), "%m-%d %H:%M"),
         "platform": platform,
@@ -2894,7 +3098,8 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
         }
 
     def build_related_evidence_card(row: sqlite3.Row) -> dict[str, Any]:
-        platform, scene = source_label(row["source_hint"])
+        effective_source_hint = get_effective_source_hint(conn, row["evidence_id"])
+        platform, scene = source_label(effective_source_hint)
         raw_text = row["raw_text"] or ""
         filename = _extract_filename(raw_text)
         extracted_text = _extract_file_text(raw_text)
@@ -2910,6 +3115,7 @@ def _fetch_event_detail(conn: sqlite3.Connection, event_id: str) -> dict[str, An
                 "file": "文件记录",
             }.get(row["media_type"], "记录"),
             "filename": filename,
+            "effective_source_hint": effective_source_hint,
             "preview_text": preview_text,
             "platform": platform,
             "scene": scene,
@@ -3107,7 +3313,8 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
     if row is None:
         return None
 
-    platform, scene = source_label(row["source_hint"])
+    effective_source_hint = get_effective_source_hint(conn, evidence_id)
+    platform, scene = source_label(effective_source_hint)
     raw_text = row["raw_text"] or ""
     filename = _extract_filename(raw_text)
     extracted_text = _extract_file_text(raw_text)
@@ -3125,6 +3332,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
     semantic_result = _build_semantic_result(conn, evidence_id)
     return {
         "evidence_id": row["evidence_id"],
+        "effective_source_hint": effective_source_hint,
         "seq": row["seq"],
         "occurred_at_text": _format_datetime(row["occurred_at"], "%m-%d %H:%M"),
         "captured_at_text": _format_datetime(row["captured_at"], "%m-%d %H:%M"),
@@ -3178,7 +3386,12 @@ def _should_show_legacy_editor(
 ) -> bool:
     if evidence.get("semantic_result") is not None:
         return False
-    if parse_status in {PARSE_STATUS_OCR_RUNNING, PARSE_STATUS_LLM_RUNNING, "pending"}:
+    if parse_status in {
+        PARSE_STATUS_OCR_RUNNING,
+        PARSE_STATUS_LLM_RUNNING,
+        PARSE_STATUS_CLARIFICATION_REQUIRED,
+        "pending",
+    }:
         return False
     return _has_legacy_semantic_data(evidence)
 
@@ -3651,6 +3864,16 @@ def create_app() -> FastAPI:
             parse_detail = extract_note or _get_parse_detail(conn, evidence_id)
             semantic_result = _build_semantic_result(conn, evidence_id)
             event_match = None if semantic_result is None else semantic_result.get("event_match")
+            source_gate = (
+                _current_source_gate_payload(
+                    conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                    reviewable=parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_"),
+                )
+                if row["media_type"] == "image"
+                else None
+            )
             return {
                 "parse_status": parse_status,
                 "parse_status_label": _parse_status_label(parse_status),
@@ -3669,9 +3892,143 @@ def create_app() -> FastAPI:
                 "is_verified": _is_verified(conn, evidence_id),
                 "media_type": row["media_type"],
                 "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
+                "source_gate": source_gate,
             }
         finally:
             conn.close()
+
+    @app.post("/api/evidence/{evidence_id}/source-review")
+    async def submit_source_review(
+        evidence_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"decision", "resolved_source"})
+        if unexpected_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported fields: {', '.join(unexpected_fields)}",
+            )
+
+        decision = str(payload.get("decision", "")).strip()
+        if decision not in {"confirmed_declared", "corrected"}:
+            raise HTTPException(status_code=400, detail="decision must be confirmed_declared or corrected")
+
+        resolved_source = _normalize_user_source_value(payload.get("resolved_source"))
+        conn = init_db(sandbox.db_path)
+        rerun_image_bytes: bytes | None = None
+        rerun_filename: str | None = None
+        response_payload: dict[str, Any]
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT evidence_id, media_type, raw_text, blob_path
+                FROM evidence
+                WHERE evidence_id = ?
+                """,
+                (evidence_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if evidence_id.startswith("ev_demo_"):
+                raise HTTPException(status_code=403, detail="演示记录不可修改")
+            if row["media_type"] != "image":
+                raise HTTPException(status_code=400, detail="只有图片记录支持核实信息来源")
+
+            parse_status = _get_meta_value(conn, _parse_status_key(evidence_id)) or PARSE_STATUS_FAILED
+            if parse_status != PARSE_STATUS_CLARIFICATION_REQUIRED:
+                raise HTTPException(status_code=409, detail="当前记录不处于待核实来源状态")
+
+            latest_extraction = get_latest_extraction(conn, evidence_id)
+            if latest_extraction is None:
+                raise HTTPException(status_code=400, detail="当前记录缺少可核实的提取版本")
+
+            gate_state = _source_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=latest_extraction,
+            )
+            if not gate_state["requires_clarification"]:
+                raise HTTPException(status_code=409, detail="当前记录不需要再次核实来源")
+
+            current_effective_source_hint = gate_state["effective_source_hint"]
+            if decision == "confirmed_declared":
+                resolved_source_hint = current_effective_source_hint
+                next_status = PARSE_STATUS_LLM_RUNNING
+            else:
+                if resolved_source is None:
+                    raise HTTPException(status_code=400, detail="请选择或填写修正后的信息来源")
+                resolved_source_hint = _build_resolved_source_hint(current_effective_source_hint, resolved_source)
+                next_status = PARSE_STATUS_OCR_RUNNING
+                if row["blob_path"] is None:
+                    raise HTTPException(status_code=400, detail="当前图片缺少原始文件")
+                blob_path = sandbox.blobs_root / row["blob_path"]
+                if not blob_path.exists():
+                    raise HTTPException(status_code=404, detail="blob not found")
+                rerun_image_bytes = blob_path.read_bytes()
+                rerun_filename = _extract_filename(row["raw_text"])
+
+            create_source_review(
+                conn,
+                evidence_id=evidence_id,
+                extraction_id=latest_extraction["extraction_id"],
+                original_source_hint=current_effective_source_hint,
+                observed_platform=gate_state["observed_platform"],
+                resolved_source_hint=resolved_source_hint,
+                decision=decision,
+            )
+            _clear_extract_note(conn, evidence_id)
+            _set_meta_value(conn, _parse_status_key(evidence_id), next_status)
+            _set_meta_value(conn, _parse_detail_key(evidence_id), "")
+            conn.commit()
+            response_payload = {
+                "evidence_id": evidence_id,
+                "decision": decision,
+                "parse_status": next_status,
+                "source_gate": _current_source_gate_payload(
+                    conn,
+                    evidence_id=evidence_id,
+                    parse_status=next_status,
+                    reviewable=False,
+                ),
+            }
+        except HTTPException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if decision == "confirmed_declared":
+            background_tasks.add_task(
+                _run_parse_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                evidence_id,
+            )
+        else:
+            background_tasks.add_task(
+                _run_image_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                evidence_id,
+                rerun_image_bytes,
+                rerun_filename,
+                None,
+            )
+
+        response = JSONResponse(response_payload)
+        apply_sandbox_cookie(response, sandbox)
+        return response
 
     @app.post("/api/evidence/{evidence_id}/record-date")
     async def update_evidence_record_date(
@@ -3943,22 +4300,36 @@ def create_app() -> FastAPI:
             )
             _clear_extract_note(conn, evidence_id)
             _set_ocr_corrected(conn, evidence_id, True)
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
-            _set_parse_detail(conn, evidence_id, "")
+            latest_extraction = get_latest_extraction(conn, evidence_id)
+            gate_state = _source_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=latest_extraction,
+            )
+            if gate_state["requires_clarification"]:
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+                _set_parse_detail(conn, evidence_id, _clarification_detail(gate_state))
+            else:
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+                _set_parse_detail(conn, evidence_id, "")
             conn.commit()
         finally:
             conn.close()
 
-        background_tasks.add_task(
-            _run_parse_pipeline,
-            sandbox.db_path,
-            request.app.state.global_meta_db_path,
-            evidence_id,
-        )
+        if gate_state["requires_clarification"]:
+            parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
+        else:
+            background_tasks.add_task(
+                _run_parse_pipeline,
+                sandbox.db_path,
+                request.app.state.global_meta_db_path,
+                evidence_id,
+            )
+            parse_status = PARSE_STATUS_LLM_RUNNING
         response = JSONResponse(
             {
                 "evidence_id": evidence_id,
-                "parse_status": PARSE_STATUS_LLM_RUNNING,
+                "parse_status": parse_status,
             }
         )
         apply_sandbox_cookie(response, sandbox)
@@ -4279,6 +4650,16 @@ def create_app() -> FastAPI:
             )
             is_verified = _is_verified(status_conn, evidence_id)
             is_ocr_corrected = _is_ocr_corrected(status_conn, evidence_id)
+            source_gate = (
+                _current_source_gate_payload(
+                    status_conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                    reviewable=parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_"),
+                )
+                if context["media_type"] == "image"
+                else None
+            )
             diagnostics = None
             diagnostics_json = None
             if _diagnostics_enabled():
@@ -4307,6 +4688,8 @@ def create_app() -> FastAPI:
                 "parse_detail": parse_detail,
                 "is_verified": is_verified,
                 "is_ocr_corrected": is_ocr_corrected,
+                "source_gate": source_gate,
+                "source_presets": SOURCE_PRESETS,
                 "diagnostics_enabled": _diagnostics_enabled(),
                 "diagnostics": diagnostics,
                 "diagnostics_json": diagnostics_json,

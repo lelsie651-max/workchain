@@ -176,6 +176,31 @@ def _semantic_result(
     }
 
 
+def _platform_detection_observation(
+    *,
+    declared_platform: str | None,
+    observed_platform: str,
+    platform_confidence: float | None,
+) -> dict[str, object]:
+    return {
+        "kind": "platform_detection",
+        "content": json.dumps(
+            {
+                "declared_platform": declared_platform,
+                "observed_platform": observed_platform,
+                "source_consistency": (
+                    "unknown"
+                    if declared_platform is None or observed_platform == "unknown"
+                    else ("match" if declared_platform == observed_platform else "mismatch")
+                ),
+                "platform_confidence": platform_confidence,
+            },
+            ensure_ascii=False,
+        ),
+        "confidence": platform_confidence,
+    }
+
+
 def _insert_text_evidence(
     conn: sqlite3.Connection,
     *,
@@ -1331,7 +1356,7 @@ def test_image_evidence_detail_shows_processing_state_and_status_polling_script(
     assert "看看系统读到了什么" not in html
     assert "记录信息" in html
     assert f'const evidenceId = "{evidence_id}";' in html
-    assert 'const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);' in html
+    assert 'const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported", "clarification_required"]);' in html
     assert 'fetch(`/api/evidence/${evidenceId}/status`)' in html
     assert 'statusPollTimer = window.setInterval(pollStatus, 1800);' in html
     assert "window.clearInterval(statusPollTimer);" in html
@@ -3476,6 +3501,369 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
         assert semantic_run["parser_version"] == "2.3"
         assert semantic_run["extraction_id"] is not None
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_source_gate_blocks_high_confidence_platform_mismatch_before_semantic(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    ark_extraction = {
+        "transcript": "Ark transcript",
+        "observations": [
+            _platform_detection_observation(
+                declared_platform="飞书",
+                observed_platform="微信",
+                platform_confidence=0.91,
+            )
+        ],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction):
+        with patch("app.main.semantic_llm.extract_semantics") as mock_llm:
+            with client:
+                response = _upload_png(client, filename="source-gate.png")
+                evidence_id = response.json()["evidence_id"]
+                status_payload = client.get(f"/api/evidence/{evidence_id}/status").json()
+                detail_response = client.get(f"/evidence/{evidence_id}")
+                records_response = client.get("/records")
+
+    assert response.status_code == 200
+    assert status_payload["parse_status"] == "clarification_required"
+    assert status_payload["source_gate"]["requires_clarification"] is True
+    assert status_payload["source_gate"]["declared_platform"] == "飞书"
+    assert status_payload["source_gate"]["observed_platform"] == "微信"
+    assert status_payload["source_gate"]["detail"] == "等待核实信息来源：你填写的是「飞书」，机器识别为「微信」。"
+    assert "信息来源可能需要核实" in detail_response.text
+    assert "请确认这份记录实际来自哪里。" in detail_response.text
+    assert "待核实来源" in records_response.text
+    mock_llm.assert_not_called()
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert semantic_run_count == 0
+    finally:
+        conn.close()
+
+
+def test_source_gate_does_not_block_unknown_or_low_confidence_platform_results(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result()
+    extractions = [
+        {
+            "transcript": "Unknown platform transcript",
+            "observations": [
+                _platform_detection_observation(
+                    declared_platform="飞书",
+                    observed_platform="unknown",
+                    platform_confidence=None,
+                )
+            ],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": [],
+        },
+        {
+            "transcript": "Low confidence mismatch transcript",
+            "observations": [
+                _platform_detection_observation(
+                    declared_platform="飞书",
+                    observed_platform="微信",
+                    platform_confidence=0.51,
+                )
+            ],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": [],
+        },
+    ]
+
+    with patch("app.vision_provider.extract_visual_evidence", side_effect=extractions):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+            with client:
+                unknown_response = _upload_png(client, filename="unknown-platform.png")
+                unknown_status = client.get(f"/api/evidence/{unknown_response.json()['evidence_id']}/status").json()
+                low_conf_response = _upload_png(client, filename="low-confidence.png")
+                low_conf_status = client.get(f"/api/evidence/{low_conf_response.json()['evidence_id']}/status").json()
+
+    assert unknown_status["parse_status"] == "done"
+    assert unknown_status["source_gate"]["requires_clarification"] is False
+    assert unknown_status["source_gate"]["observed_platform"] == "unknown"
+    assert low_conf_status["parse_status"] == "done"
+    assert low_conf_status["source_gate"]["requires_clarification"] is False
+    assert low_conf_status["source_gate"]["observed_platform"] == "微信"
+    assert mock_llm.call_count == 2
+
+
+def test_source_review_confirmed_declared_resumes_parse_without_rerunning_ark(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result()
+    ark_extraction = {
+        "transcript": "Ark transcript",
+        "observations": [
+            _platform_detection_observation(
+                declared_platform="飞书",
+                observed_platform="微信",
+                platform_confidence=0.91,
+            )
+        ],
+        "provider": "doubao-ark",
+        "model": "doubao-seed-2-0-lite-260215",
+        "warnings": [],
+    }
+
+    with patch("app.vision_provider.extract_visual_evidence", return_value=ark_extraction) as mock_vision:
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+            with client:
+                create_response = _upload_png(client, filename="confirm-source.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+                db_path = _sandbox_db_path(client, sandbox_root)
+                conn = init_db(db_path)
+                try:
+                    before = conn.execute(
+                        "SELECT source_hint, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+                        (evidence_id,),
+                    ).fetchone()
+                    assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+                finally:
+                    conn.close()
+
+                review_response = client.post(
+                    f"/api/evidence/{evidence_id}/source-review",
+                    json={"decision": "confirmed_declared"},
+                )
+                status_payload = client.get(f"/api/evidence/{evidence_id}/status").json()
+
+    assert review_response.status_code == 200
+    assert review_response.json()["parse_status"] == "llm_running"
+    assert status_payload["parse_status"] == "done"
+    assert mock_vision.call_count == 1
+    mock_llm.assert_called_once()
+    assert mock_llm.call_args.kwargs["source_hint"] == "飞书-项目复盘群"
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        after = conn.execute(
+            "SELECT source_hint, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        review_row = conn.execute(
+            """
+            SELECT decision, resolved_source_hint
+            FROM source_reviews
+            WHERE evidence_id = ?
+            ORDER BY created_at DESC, review_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert before["source_hint"] == after["source_hint"] == "飞书-项目复盘群"
+        assert before["content_hash"] == after["content_hash"]
+        assert before["chain_hash"] == after["chain_hash"]
+        assert review_row["decision"] == "confirmed_declared"
+        assert review_row["resolved_source_hint"] == "飞书-项目复盘群"
+        assert semantic_run_count == 1
+        assert verify_chain(conn, blobs_root=_sandbox_db_path(client, sandbox_root).parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_source_review_corrected_reruns_ark_with_effective_source_before_first_parse(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result()
+    seen_source_hints: list[str | None] = []
+
+    def fake_extract_visual_evidence(image_bytes, mime_type, source_hint=None):
+        seen_source_hints.append(source_hint)
+        if len(seen_source_hints) == 1:
+            return {
+                "transcript": "First Ark transcript",
+                "observations": [
+                    _platform_detection_observation(
+                        declared_platform="飞书",
+                        observed_platform="微信",
+                        platform_confidence=0.91,
+                    )
+                ],
+                "provider": "doubao-ark",
+                "model": "doubao-seed-2-0-lite-260215",
+                "warnings": [],
+            }
+        return {
+            "transcript": "Second Ark transcript",
+            "observations": [
+                _platform_detection_observation(
+                    declared_platform="微信",
+                    observed_platform="微信",
+                    platform_confidence=0.96,
+                )
+            ],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": [],
+        }
+
+    with patch("app.vision_provider.extract_visual_evidence", side_effect=fake_extract_visual_evidence):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+            with client:
+                create_response = _upload_png(client, filename="correct-source.png")
+                evidence_id = create_response.json()["evidence_id"]
+
+                db_path = _sandbox_db_path(client, sandbox_root)
+                conn = init_db(db_path)
+                try:
+                    before = conn.execute(
+                        "SELECT source_hint, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+                        (evidence_id,),
+                    ).fetchone()
+                    assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+                finally:
+                    conn.close()
+
+                review_response = client.post(
+                    f"/api/evidence/{evidence_id}/source-review",
+                    json={"decision": "corrected", "resolved_source": "微信"},
+                )
+                status_payload = client.get(f"/api/evidence/{evidence_id}/status").json()
+                detail_response = client.get(f"/evidence/{evidence_id}")
+
+    assert review_response.status_code == 200
+    assert review_response.json()["parse_status"] == "ocr_running"
+    assert seen_source_hints == ["飞书-项目复盘群", "微信-项目复盘群"]
+    assert status_payload["parse_status"] == "done"
+    mock_llm.assert_called_once()
+    assert mock_llm.call_args.kwargs["source_hint"] == "微信-项目复盘群"
+    assert "微信" in detail_response.text
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        after = conn.execute(
+            "SELECT source_hint, content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        review_row = conn.execute(
+            """
+            SELECT decision, resolved_source_hint
+            FROM source_reviews
+            WHERE evidence_id = ?
+            ORDER BY created_at DESC, review_id DESC
+            LIMIT 1
+            """,
+            (evidence_id,),
+        ).fetchone()
+        extraction_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()["count"]
+        assert before["source_hint"] == after["source_hint"] == "飞书-项目复盘群"
+        assert before["content_hash"] == after["content_hash"]
+        assert before["chain_hash"] == after["chain_hash"]
+        assert review_row["decision"] == "corrected"
+        assert review_row["resolved_source_hint"] == "微信-项目复盘群"
+        assert extraction_count == 2
+        assert semantic_run_count == 1
+        assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
+    finally:
+        conn.close()
+
+
+def test_multi_image_source_gate_blocks_only_target_evidence_and_allows_later_images(tmp_path, monkeypatch):
+    monkeypatch.setenv("WORKCHAIN_IMAGE_EXTRACTION_PROVIDER", "ark_vision")
+    monkeypatch.setenv("ARK_API_KEY", "ark-test")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result()
+    call_index = {"value": 0}
+
+    def fake_extract_visual_evidence(image_bytes, mime_type, source_hint=None):
+        call_index["value"] += 1
+        if call_index["value"] == 2:
+            observation = _platform_detection_observation(
+                declared_platform="飞书",
+                observed_platform="微信",
+                platform_confidence=0.91,
+            )
+            transcript = "Second transcript"
+        else:
+            observation = _platform_detection_observation(
+                declared_platform="飞书",
+                observed_platform="飞书",
+                platform_confidence=0.91,
+            )
+            transcript = f"Transcript {call_index['value']}"
+        return {
+            "transcript": transcript,
+            "observations": [observation],
+            "provider": "doubao-ark",
+            "model": "doubao-seed-2-0-lite-260215",
+            "warnings": [],
+        }
+
+    file_parts = [
+        ("first.png", _build_png_bytes(4, 4, (40, 80, 120)), "image/png"),
+        ("second.png", _build_png_bytes(4, 4, (120, 80, 40)), "image/png"),
+        ("third.png", _build_png_bytes(4, 4, (20, 140, 80)), "image/png"),
+    ]
+
+    with patch("app.vision_provider.extract_visual_evidence", side_effect=fake_extract_visual_evidence):
+        with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+            with client:
+                response = _multipart_request(
+                    client,
+                    data={"source": "飞书", "source_detail": "项目复盘群"},
+                    file_parts=file_parts,
+                )
+                payload = response.json()
+                statuses = [
+                    client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
+                    for evidence_id in payload["evidence_ids"]
+                ]
+
+    assert response.status_code == 200
+    assert statuses == ["done", "clarification_required", "done"]
+    assert mock_llm.call_count == 2
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        middle_semantic_runs = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
+            (payload["evidence_ids"][1],),
+        ).fetchone()["count"]
+        third_extractions = conn.execute(
+            "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
+            (payload["evidence_ids"][2],),
+        ).fetchone()["count"]
+        assert middle_semantic_runs == 0
+        assert third_extractions == 1
     finally:
         conn.close()
 

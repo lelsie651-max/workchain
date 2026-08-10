@@ -135,6 +135,61 @@
         <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "这是一张图片/文档,系统暂不能自动读懂它的内容,但原件已完整保存,任何改动都会被发现。" }}</span></p>
         {% elif parse_status == "failed" %}
         <p id="parse-status-message" class="mt-4 text-sm leading-7 text-slate-300"><span id="parse-status-message-text">{{ parse_detail or "解析暂不可用,记录已完整保存" }}</span></p>
+        {% elif parse_status == "clarification_required" %}
+        <div id="source-clarification-card" class="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
+            <p class="text-sm font-medium text-amber-100">{{ source_gate.title or "信息来源可能需要核实" }}</p>
+            <p class="mt-3 text-sm leading-7 text-slate-200">
+                你填写的是「{{ source_gate.declared_platform if source_gate else evidence.platform }}」，机器根据图片界面识别为「{{ source_gate.observed_platform if source_gate else "unknown" }}」。
+            </p>
+            <p id="parse-status-message" class="mt-2 text-sm leading-7 text-slate-300">
+                <span id="parse-status-message-text">{{ (source_gate.prompt if source_gate else None) or "请确认这份记录实际来自哪里。" }}</span>
+            </p>
+            {% if not evidence.evidence_id.startswith("ev_demo_") %}
+            <div class="mt-4 flex flex-wrap gap-3">
+                <button
+                    id="confirm-declared-source"
+                    type="button"
+                    class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                >
+                    保持原来源
+                </button>
+            </div>
+            <form id="source-review-form" class="mt-4 grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                <div class="space-y-2">
+                    <label for="source-review-select" class="block text-sm text-slate-300">修改信息来源</label>
+                    <select
+                        id="source-review-select"
+                        class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                    >
+                        <option value="">请选择信息来源</option>
+                        {% for source in source_presets %}
+                        <option value="{{ source }}">{{ source }}</option>
+                        {% endfor %}
+                        <option value="__custom__">自定义…</option>
+                    </select>
+                </div>
+                <div class="space-y-2">
+                    <label for="source-review-custom" class="block text-sm text-slate-300">自定义来源</label>
+                    <input
+                        id="source-review-custom"
+                        type="text"
+                        maxlength="20"
+                        placeholder="填写自定义来源"
+                        class="hidden min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                    >
+                </div>
+                <div class="flex items-end">
+                    <button
+                        id="submit-corrected-source"
+                        type="submit"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        修改信息来源
+                    </button>
+                </div>
+            </form>
+            {% endif %}
+        </div>
         {% endif %}
 
         {% if evidence.semantic_result and parse_status in ["done", "failed"] %}
@@ -398,7 +453,7 @@
         const parseStatusContainer = document.querySelector("[data-current-parse-status]");
         const parseStatusLabel = document.getElementById("parse-status-label");
         const parseStatusMessageTextNode = document.getElementById("parse-status-message-text");
-        const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported"]);
+        const STABLE_PARSE_STATUSES = new Set(["done", "failed", "unsupported", "clarification_required"]);
 
         const showFlash = (text, tone) => {
             if (!flash) {
@@ -491,6 +546,9 @@
             }
             if (status === "llm_running" || status === "pending") {
                 return "正在整理发生了什么…";
+            }
+            if (status === "clarification_required") {
+                return detail || "请确认这份记录实际来自哪里。";
             }
             if (status === "failed") {
                 return detail || "解析暂不可用，记录已完整保存。";
@@ -664,6 +722,85 @@
                     }
                 }
             });
+        };
+
+        const initSourceReviewForm = () => {
+            const reviewForm = document.getElementById("source-review-form");
+            const reviewSelect = document.getElementById("source-review-select");
+            const reviewCustom = document.getElementById("source-review-custom");
+            const confirmButton = document.getElementById("confirm-declared-source");
+            const correctedButton = document.getElementById("submit-corrected-source");
+            if (!reviewForm || !reviewSelect || !reviewCustom || !confirmButton || !correctedButton) {
+                return;
+            }
+
+            const setBusy = (busy) => {
+                [confirmButton, correctedButton, reviewSelect, reviewCustom].forEach((node) => {
+                    node.disabled = busy;
+                });
+                [confirmButton, correctedButton].forEach((button) => {
+                    button.classList.toggle("opacity-60", busy);
+                    button.classList.toggle("cursor-not-allowed", busy);
+                });
+            };
+
+            const syncCustom = () => {
+                const isCustom = reviewSelect.value === "__custom__";
+                reviewCustom.classList.toggle("hidden", !isCustom);
+                reviewCustom.required = isCustom;
+                if (!isCustom) {
+                    reviewCustom.value = "";
+                }
+            };
+
+            const submitDecision = async (decision, resolvedSource = null) => {
+                setBusy(true);
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/source-review`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(
+                            resolvedSource
+                                ? { decision, resolved_source: resolvedSource }
+                                : { decision }
+                        ),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "提交来源核实失败", "error");
+                        return;
+                    }
+                    showFlash(
+                        decision === "confirmed_declared" ? "已保持原来源，正在继续整理。" : "信息来源已更新，正在重新核对图片。",
+                        "success",
+                    );
+                    window.setTimeout(() => window.location.reload(), 250);
+                } catch (error) {
+                    showFlash("提交来源核实失败，请稍后再试", "error");
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            confirmButton.addEventListener("click", () => submitDecision("confirmed_declared"));
+            reviewSelect.addEventListener("change", syncCustom);
+            reviewForm.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                let resolvedSource = reviewSelect.value;
+                if (!resolvedSource) {
+                    showFlash("请选择修正后的信息来源", "error");
+                    return;
+                }
+                if (resolvedSource === "__custom__") {
+                    resolvedSource = reviewCustom.value.trim();
+                    if (!resolvedSource) {
+                        reviewCustom.reportValidity();
+                        return;
+                    }
+                }
+                await submitDecision("corrected", resolvedSource);
+            });
+            syncCustom();
         };
 
         const initEventAssignmentForm = () => {
@@ -913,6 +1050,7 @@
         initRecordDateEditor();
         initEventAssignmentForm();
         initSlotsForm();
+        initSourceReviewForm();
         initStatusPolling();
         {% if diagnostics_enabled %}
         initDiagnostics();
