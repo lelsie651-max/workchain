@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from app import vision_provider
+from app import context_assembler, semantic_projection, vision_provider
 from app.vision_provider import VISION_SYSTEM_PROMPT, VISION_USER_PROMPT
 
 
@@ -456,4 +456,152 @@ def test_normalize_visual_result_non_chat_keeps_plain_transcript():
         "provider": "doubao-ark",
         "model": vision_provider.get_ark_vision_model(),
         "warnings": [],
+        "structured_payload": None,
+    }
+
+
+def test_normalize_visual_result_persists_structured_payload_for_chat():
+    result = vision_provider._normalize_visual_result(_daiwen_payload(), source_hint="微信-单聊")
+
+    structured_payload = result["structured_payload"]
+    assert structured_payload["conversation_type"] == "direct_chat"
+    assert structured_payload["participants"] == [
+        {"speaker_ref": "left_account", "side": "left", "display_name": "戴雯"},
+        {"speaker_ref": "right_account", "side": "right", "display_name": None},
+    ]
+    assert structured_payload["messages"][0]["speaker_ref"] == "left_account"
+    assert structured_payload["messages"][5]["quote"] == {
+        "speaker_display_name": None,
+        "text": "戴雯: 刚开始给我13呢",
+    }
+    assert structured_payload["system_events"] == []
+
+
+def test_semantic_projection_filters_system_events_and_keeps_message_context():
+    normalized = vision_provider._normalize_visual_result(
+        {
+            "observed_platform": "飞书",
+            "platform_confidence": 0.95,
+            "conversation_type": "direct_chat",
+            "chat_header": "项目研发群",
+            "participants": [
+                {"speaker_ref": "left_raw", "side": "left", "display_name": None},
+                {"speaker_ref": "right_raw", "side": "right", "display_name": "我"},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "left_raw",
+                    "side": "left",
+                    "text": "今天先这样",
+                    "reply": {"speaker_display_name": "我", "text": "收到"},
+                    "reactions": [{"emoji": "👍", "actor_display_name": "unknown"}],
+                }
+            ],
+            "system_events": [
+                {
+                    "type": "message_recalled",
+                    "visible_text": "张三撤回了一条消息",
+                    "actor_display_name": "张三",
+                }
+            ],
+            "observations": [{"kind": "timestamp", "content": "2026-08-09 19:21", "confidence": 0.91}],
+            "warnings": [],
+        },
+        source_hint="飞书-单聊",
+    )
+
+    projection = semantic_projection.build_semantic_projection(
+        transcript=normalized["transcript"],
+        observations=normalized["observations"],
+        structured_payload=normalized["structured_payload"],
+    )
+    rendered = semantic_projection.serialize_semantic_projection(projection, evidence_id="ev-1")
+
+    assert projection["time_markers"] == ["2026-08-09 19:21"]
+    assert projection["missing_speaker_refs"] == ["left_account"]
+    assert projection["messages"] == [
+        {
+            "index": 1,
+            "speaker_ref": "left_account",
+            "display_name": None,
+            "text": "今天先这样",
+            "quote": None,
+            "reply": {"speaker_display_name": "我", "text": "收到"},
+            "reactions": [{"emoji": "👍", "actor_display_name": "unknown"}],
+        }
+    ]
+    assert "system_event" not in rendered
+    assert "chat_header" not in rendered
+    assert "participant" not in rendered
+    assert "[time_marker] 2026-08-09 19:21" in rendered
+    assert '[reply speaker="我" text="收到"]' in rendered
+    assert '[reaction emoji="👍" actor="unknown"]' in rendered
+
+
+def test_context_assembly_normalization_adds_singleton_for_uncovered_evidence():
+    result = context_assembler.normalize_context_assembly_result(
+        {
+            "groups": [
+                {
+                    "group_key": "group-1",
+                    "evidence_ids": ["ev-1", "ev-2"],
+                    "analysis_order": ["ev-2", "ev-1"],
+                    "relation": "continuation",
+                    "confidence": 0.93,
+                }
+            ],
+            "ambiguities": [],
+        },
+        evidence_ids=["ev-1", "ev-2", "ev-3"],
+    )
+
+    assert result == {
+        "groups": [
+            {
+                "group_key": "group-1",
+                "evidence_ids": ["ev-1", "ev-2"],
+                "analysis_order": ["ev-2", "ev-1"],
+                "relation": "continuation",
+                "confidence": 0.93,
+            },
+            {
+                "group_key": "singleton_ev-3",
+                "evidence_ids": ["ev-3"],
+                "analysis_order": ["ev-3"],
+                "relation": "standalone",
+                "confidence": 0.0,
+            },
+        ],
+        "ambiguities": [],
+    }
+
+
+def test_context_assembly_fallback_singletons_preserve_every_evidence():
+    result = context_assembler.fallback_singleton_groups(
+        [
+            {"evidence_id": "ev-1", "projection_text": "A"},
+            {"evidence_id": "ev-2", "projection_text": "B"},
+        ],
+        warning="context_assembly_failed_fallback_to_singletons",
+    )
+
+    assert result == {
+        "groups": [
+            {
+                "group_key": "singleton_ev-1",
+                "evidence_ids": ["ev-1"],
+                "analysis_order": ["ev-1"],
+                "relation": "standalone",
+                "confidence": 0.0,
+            },
+            {
+                "group_key": "singleton_ev-2",
+                "evidence_ids": ["ev-2"],
+                "analysis_order": ["ev-2"],
+                "relation": "standalone",
+                "confidence": 0.0,
+            },
+        ],
+        "ambiguities": ["context_assembly_failed_fallback_to_singletons"],
     }

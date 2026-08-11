@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 def _connect(path: str | Path) -> sqlite3.Connection:
@@ -501,6 +501,82 @@ def _create_v10_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _create_v11_schema(conn: sqlite3.Connection) -> None:
+    if not _column_exists(conn, "evidence_extractions", "structured_payload"):
+        conn.execute(
+            """
+            ALTER TABLE evidence_extractions
+            ADD COLUMN structured_payload TEXT
+            """
+        )
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS extraction_speaker_reviews (
+            review_id TEXT PRIMARY KEY,
+            evidence_id TEXT NOT NULL,
+            extraction_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('provided', 'skipped')),
+            labels_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (evidence_id) REFERENCES evidence(evidence_id) ON DELETE RESTRICT,
+            FOREIGN KEY (extraction_id) REFERENCES evidence_extractions(extraction_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_extraction_speaker_reviews_evidence_id_created_at
+            ON extraction_speaker_reviews(evidence_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_extraction_speaker_reviews_extraction_id_created_at
+            ON extraction_speaker_reviews(extraction_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS context_assembly_runs (
+            assembly_run_id TEXT PRIMARY KEY,
+            submission_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            assembler_version TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+            result_json TEXT,
+            failure_type TEXT,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            FOREIGN KEY (submission_id) REFERENCES submissions(submission_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_assembly_runs_submission_id_created_at
+            ON context_assembly_runs(submission_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS context_group_reviews (
+            review_id TEXT PRIMARY KEY,
+            assembly_run_id TEXT NOT NULL,
+            group_key TEXT NOT NULL,
+            review_status TEXT NOT NULL CHECK (review_status IN ('accepted', 'needs_user_review')),
+            decision_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (assembly_run_id) REFERENCES context_assembly_runs(assembly_run_id) ON DELETE RESTRICT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_context_group_reviews_assembly_run_id_created_at
+            ON context_group_reviews(assembly_run_id, created_at DESC);
+        """
+    )
+
+    if not _column_exists(conn, "semantic_runs", "context_group_key"):
+        conn.execute(
+            """
+            ALTER TABLE semantic_runs
+            ADD COLUMN context_group_key TEXT
+            """
+        )
+    if not _column_exists(conn, "semantic_runs", "context_assembly_run_id"):
+        conn.execute(
+            """
+            ALTER TABLE semantic_runs
+            ADD COLUMN context_assembly_run_id TEXT REFERENCES context_assembly_runs(assembly_run_id) ON DELETE RESTRICT
+            """
+        )
+
+
 def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.execute(
         """
@@ -582,6 +658,11 @@ def _migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     _set_schema_version(conn, 10)
 
 
+def _migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    _create_v11_schema(conn)
+    _set_schema_version(conn, 11)
+
+
 def _is_fresh_database(conn: sqlite3.Connection) -> bool:
     rows = conn.execute(
         """
@@ -611,6 +692,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v8_schema(conn)
         _create_v9_schema(conn)
         _create_v10_schema(conn)
+        _create_v11_schema(conn)
         _set_schema_version(conn, SCHEMA_VERSION)
     elif schema_version > SCHEMA_VERSION:
         conn.close()
@@ -633,6 +715,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 2:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -644,6 +727,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 3:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -655,6 +739,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 4:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -666,6 +751,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 5:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -677,6 +763,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 6:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -688,6 +775,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 7:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -699,6 +787,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _migrate_v7_to_v8(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 8:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -710,6 +799,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v8_schema(conn)
         _migrate_v8_to_v9(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 9:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -721,6 +811,7 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v8_schema(conn)
         _create_v9_schema(conn)
         _migrate_v9_to_v10(conn)
+        _migrate_v10_to_v11(conn)
     elif schema_version == 10:
         _create_v1_schema(conn)
         _create_v2_schema(conn)
@@ -732,6 +823,19 @@ def init_db(path: str | Path) -> sqlite3.Connection:
         _create_v8_schema(conn)
         _create_v9_schema(conn)
         _create_v10_schema(conn)
+        _migrate_v10_to_v11(conn)
+    elif schema_version == 11:
+        _create_v1_schema(conn)
+        _create_v2_schema(conn)
+        _create_v3_schema(conn)
+        _create_v4_schema(conn)
+        _create_v5_schema(conn)
+        _create_v6_schema(conn)
+        _create_v7_schema(conn)
+        _create_v8_schema(conn)
+        _create_v9_schema(conn)
+        _create_v10_schema(conn)
+        _create_v11_schema(conn)
     else:
         conn.close()
         raise ValueError(

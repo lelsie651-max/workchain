@@ -86,6 +86,7 @@ def _prepend_warning(extraction: dict[str, Any], warning: str) -> dict[str, Any]
         provider=extraction.get("provider") or "unknown",
         model=extraction.get("model"),
         warnings=warnings,
+        structured_payload=extraction.get("structured_payload"),
     )
 
 

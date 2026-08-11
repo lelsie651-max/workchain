@@ -6,7 +6,11 @@ import time
 import uuid
 from typing import Any
 
-from evidence_core.extraction_contract import normalize_observations, normalize_warnings
+from evidence_core.extraction_contract import (
+    normalize_observations,
+    normalize_structured_payload,
+    normalize_warnings,
+)
 
 
 class ExtractionStoreError(ValueError):
@@ -73,10 +77,21 @@ def _decode_warnings(value: Any) -> list[str]:
     return normalize_warnings(parsed)
 
 
+def _decode_structured_payload(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return normalize_structured_payload(parsed)
+
+
 def _row_to_extraction(row: sqlite3.Row) -> dict[str, Any]:
     result = dict(row)
     result["observations"] = _decode_observations(row["observations"])
     result["warnings"] = _decode_warnings(row["warnings"])
+    result["structured_payload"] = _decode_structured_payload(row["structured_payload"])
     return result
 
 
@@ -90,6 +105,7 @@ def create_extraction(
     transcript: str | None = None,
     observations: Any = None,
     warnings: Any = None,
+    structured_payload: Any = None,
     created_at: int | None = None,
     extraction_id: str | None = None,
     supersedes_extraction_id: str | None = None,
@@ -105,6 +121,7 @@ def create_extraction(
     model = _coerce_text(model)
     normalized_observations = normalize_observations(observations if observations is not None else [])
     normalized_warnings = normalize_warnings(warnings)
+    normalized_structured_payload = normalize_structured_payload(structured_payload)
     if transcript is None and not normalized_observations:
         raise ExtractionStoreError("extraction requires transcript or observations")
 
@@ -128,8 +145,8 @@ def create_extraction(
             """
             INSERT INTO evidence_extractions (
                 extraction_id, evidence_id, origin, provider, model,
-                transcript, observations, warnings, created_at, supersedes_extraction_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                transcript, observations, warnings, structured_payload, created_at, supersedes_extraction_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 extraction_id,
@@ -140,6 +157,9 @@ def create_extraction(
                 transcript,
                 json.dumps(normalized_observations, ensure_ascii=False, separators=(",", ":")),
                 json.dumps(normalized_warnings, ensure_ascii=False, separators=(",", ":")),
+                None
+                if normalized_structured_payload is None
+                else json.dumps(normalized_structured_payload, ensure_ascii=False, separators=(",", ":")),
                 created_at,
                 supersedes_extraction_id,
             ),

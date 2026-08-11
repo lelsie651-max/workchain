@@ -120,17 +120,29 @@
 - quote / reply / reaction 属于直接可观察 conversation structure,必须绑定在对应 message 上保留;actor 不可见时只能显式记为 `unknown`,不得推断含义
 - emoji 属于 Evidence transcript 边界:能可靠辨认具体 Unicode emoji 时必须原样保留;无法可靠区分时只能写 `[emoji_unknown]` 并附 warning,不得用语义相近 emoji 替换,也不得翻译成解释性文字;sticker 不得伪装成 emoji 或 reaction
 - 当 Ark Vision 处理聊天/IM 截图时,最终 `transcript` 必须保留消息视觉顺序、稳定 neutral speaker_ref 与左右/昵称布局关系,不得把聊天压平成无说话人的普通 OCR 段落,也不得在 Vision 层自行改写"打错了/改成/更正"这类原句
+- 聊天类图片 Extraction 与 Semantic Projection 必须严格分层:`structured_payload / transcript / observations / warnings` 仍属于 Extraction provenance;Projection 是进入 Semantic Parser 之前由代码确定性生成的只读派生物,不得回写 Evidence 哈希链,也不得让模型代替代码生成
+- Schema V11 必须为图片 Extraction 持久化 normalized `structured_payload`;text / doc Extraction 可继续为 `NULL`;后续语义链路读取该 payload 时不得通过反向解析 transcript 标签来重建聊天结构
+- Semantic Projection 只允许包含:稳定 `speaker_ref` + 原文 message、可见 `date/time marker`、`quote / reply`、`reaction`、可可靠识别的 inline Unicode emoji;必须排除 `platform / scene`、`chat_header`、participant 声明、`system_event`(含撤回)、菜单/人数/UI noise 与无文字 sticker
+- `system_events` 可以保留在 Extraction 中作为机器观测 provenance,但绝不能进入 Semantic Projection,也不能直接参与 Semantic Parser 的事实判断
 - Ark Vision 的 structured contract 优先使用 Responses API 官方 structured output(`text.format -> json_schema`, beta);本地 normalize / validation 继续作为第二层代码保护,用于处理模型输出偏差与 provenance 补强
 - 当 Ark 失败且 DashScope OCR 已配置且 OCR 配额允许时,允许自动 fallback 到 OCR;fallback 必须保留真实 provider/model 与 warning provenance
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
-- 图片链路中的 pre-semantic gate 顺序固定为 `Extraction -> Source Gate -> Temporal Gate -> Semantic Parser`;Source Gate 优先于 Temporal Gate,只要来源仍待核实,就不得进入日期检查或 DeepSeek
+- 图片链路中的 pre-semantic gate 顺序固定为 `Extraction -> Source Gate -> Semantic Projection -> (多图时) Context Assembly / ambiguity review -> Pre-Semantic Context Review -> Semantic Parser`;其中 `Pre-Semantic Context Review` 合并 required temporal context 与 optional speaker context;Source Gate 优先于其它 gate,只要来源仍待核实,就不得进入 Projection、Context Assembly 或 DeepSeek
 - 图片链路中的 Source Gate 固定放在 `Extraction -> Semantic Parser` 之间:当 declared platform 明确、`observed_platform` 明确且与 declared 不同、并且 `platform_confidence >= 0.75` 时,当前 Evidence 进入 `clarification_required`,禁止创建 Semantic Run、禁止调用 DeepSeek / Event Matcher,直到用户确认或修正来源
 - Source Gate 只要求用户核实,不会自动覆盖用户来源;一旦用户确认 declared source,该 Extraction 的同一 mismatch 不得再次阻断;若用户修正来源,必须基于 `effective source` 重新跑 Vision,而不是直接拿旧 Extraction 继续 Semantic Parse
 - Temporal Gate 使用确定性代码检查 Extraction transcript / observations 中是否存在依赖记录日期才能解释的相对/不完整时间;至少包括 `今天/明天/后天/昨天/前天`、`周X/星期X`、`本周/这周/下周/下下周`、`这个月/本月/下个月/今年/明年`、`这个月16号`、缺少年份的 `8月16日` 等
 - 若命中 Temporal Gate 且当前没有可靠 `anchor_date`,当前 Evidence 必须进入 `clarification_required` 且 `clarification_reason=temporal_context`;禁止创建 Semantic Run、禁止调用 DeepSeek、禁止调用 Event Matcher;UI 复用现有 `record_date` 输入并提示“这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。”
 - 对于尚未创建过 Semantic Run 的 gated Evidence,用户补充 `record_date` 后必须先重跑 Source Gate / Temporal Gate;全部通过后才首次进入 `llm_running` 并后台启动 `_run_parse_pipeline`;这一路径不得误走“已有结果只修 due_at”的兼容逻辑
-- Semantic Parser 的输入来自 Extraction transcript + visual observations,两者均属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
+- direct-style Projection 若出现 `left_account / right_account` 且对应 display_name 缺失,必须进入一次 Pre-Semantic Context Review;`record_date` 仍是 required context,但左/右发言者称呼只属于 optional semantic context,必须明确提示“不填写也可继续”,且用户填写结果只能以独立 provenance 绑定到当前 Extraction,不得修改 Evidence 或 machine Extraction
+- speaker context 本轮只覆盖 `left_account / right_account`;source correction 或其它导致新的 Extraction 产生后,旧 speaker review 不得静默套用到结构不同的新 Extraction
+- Multi-image Context Assembly 只负责判断哪些 Evidence 应一起阅读以及组内 `analysis_order`;`Context Group != Event`,不得生成 Fact / Event / 标题 / 责任判断,也不依赖 `anchor_date` 做日期换算
+- `submission.position` 永远表示用户上传顺序,不得被 AI 修改;`analysis_order` 是独立保存的 AI 阅读顺序,允许与上传顺序不同
+- 同一 Evidence 可以属于多个 Context Group,但每个 Evidence 至少必须进入一个 group;assembler 低置信或存在 ambiguity 时必须先进入用户确认,不得直接开始 Semantic Parse;assembler 失败时只能 fallback 为 singleton groups,并显式保留 warning provenance
+- 图片的真正 Semantic Parse 必须按 Context Group 发起 multi-evidence Semantic Run;同一组内全部 Semantic Projection 必须同时发送给 DeepSeek,并保留 `evidence_id` 边界;Fact provenance 允许关联一份或多份 Evidence
+- 单图图片可跳过 Context Assembly,但仍必须使用 Semantic Projection 与同一套 Pre-Semantic Context Review 边界
+- text / doc 当前流程保持不变:本轮不引入 Context Assembly,也不把其 Extraction 输入重构为 Semantic Projection
+- Semantic Parser 的输入来自 text/doc 的 Extraction transcript + visual observations,以及图片链路的 Semantic Projection / grouped projections;这些都属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
 - production semantic parse 固定使用 `semantic_llm.extract_semantics(...)`,只传 `glossary / source_hint / anchor_date`;其中 `source_hint` 必须取 `effective source`,不传 `self_names`,也不使用 `counterpart` 参与事实判断
 - `anchor_date` 优先级固定为:1) 用户明确填写的 `record_date`;2) `infer_reliable_anchor_date(...)` 从 transcript / observation 中确定性识别出的同日消息时间;3) `None`
 - 自动识别 `anchor_date` 只允许命中明确消息时间结构(如 `小李(2026-08-09): ...`、`[2026-08-09 10:30] 小李：...`);若出现多个不同日期、普通正文交付日期,或 observation 里没有明确 `消息日期/日期/timestamp + 完整年月日`(可带时间),一律返回 `None`
@@ -726,6 +738,7 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 | 2026-08-09 | Competition Core UX Polish:首页输入互斥、首页直确认事项、人话日期提示、事项截止展示 | 抹平首页与详情之间的确认断点,并明确"记录发生日期"只能来自用户显式填写,不能自动借用上传时间 |
 | 2026-08-10 | V10 新增 Source Review / effective source / clarification_required Source Gate | 固定把来源核实放在 `Extraction -> Semantic Parser` 之间,保持 `evidence.source_hint` 不可变,并让用户确认优先于机器平台判断 |
 | 2026-08-10 | 新增 Pre-Semantic Temporal Gate、system_events、结构证据群聊保护与 emoji exact-or-unknown | 固定图片链路为 `Extraction -> Source Gate -> Temporal Gate -> Semantic Parser`,避免缺少可靠时间锚点时误调 DeepSeek,并禁止 system event / 标题语义伪造 participant 或群聊结构 |
+| 2026-08-11 | V11 新增 Image Semantic Preparation:Semantic Projection、Context Assembly、speaker context provenance 与 multi-evidence Semantic Run | 把聊天类图片的 Extraction 与 Semantic 输入彻底分层,让多图先做分组与阅读顺序决定,并将时间设为 required context、speaker real name 设为 optional context,同时保证上传顺序与 AI 分析顺序分离 |
 | 2026-08-09 | Competition Date & Input UX Hardening:输入模式真互斥、可靠 anchor 识别、详情补日期闭环、确定性相对日期换算 | 保持"用户填写优先、正文可靠日期次之、上传时间禁用"的锚点边界,并让补日期后 due_at 与首页事项截止立即联动 |
 
 ---

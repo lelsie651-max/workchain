@@ -24,6 +24,7 @@ def test_extract_image_evidence_defaults_to_current_ocr(monkeypatch):
         "provider": "dashscope",
         "model": "vanchin/deepseek-ocr",
         "warnings": [],
+        "structured_payload": None,
     }
 
 
@@ -41,6 +42,7 @@ def test_extract_image_evidence_keeps_text_only_ocr_behavior(monkeypatch):
         "provider": "dashscope",
         "model": "vanchin/deepseek-ocr",
         "warnings": ["这张图里没有识别到文字,原件已完整保存"],
+        "structured_payload": None,
     }
 
 

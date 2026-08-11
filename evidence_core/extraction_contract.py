@@ -53,6 +53,12 @@ def normalize_observations(observations: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def normalize_structured_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
 def build_extraction_result(
     *,
     transcript: str | None,
@@ -60,6 +66,7 @@ def build_extraction_result(
     provider: str,
     model: str | None,
     warnings: Any = None,
+    structured_payload: Any = None,
 ) -> dict[str, Any]:
     return {
         "transcript": coerce_optional_text(transcript),
@@ -67,4 +74,5 @@ def build_extraction_result(
         "provider": coerce_optional_text(provider) or "unknown",
         "model": coerce_optional_text(model),
         "warnings": normalize_warnings(warnings),
+        "structured_payload": normalize_structured_payload(structured_payload),
     }

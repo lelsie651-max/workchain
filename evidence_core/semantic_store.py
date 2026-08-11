@@ -24,6 +24,8 @@ EVENT_CHANGE_TYPES = {
     "responsibility_change",
     "contradiction",
 }
+ASSEMBLY_REVIEW_STATUSES = {"accepted", "needs_user_review"}
+SPEAKER_REVIEW_STATUSES = {"provided", "skipped"}
 
 
 class SemanticStoreError(ValueError):
@@ -322,6 +324,18 @@ def _load_source_review(conn: sqlite3.Connection, review_id: str) -> dict[str, A
     return dict(_get_source_review_row(conn, review_id))
 
 
+def _decode_json_object(value: Any, *, default: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return default
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return default
+    if not isinstance(parsed, dict):
+        return default
+    return parsed
+
+
 def _load_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any]:
     run = _get_semantic_run_row(conn, semantic_run_id)
     input_rows = conn.execute(
@@ -335,6 +349,42 @@ def _load_semantic_run(conn: sqlite3.Connection, semantic_run_id: str) -> dict[s
     ).fetchall()
     result = dict(run)
     result["inputs"] = [dict(row) for row in input_rows]
+    return result
+
+
+def _load_context_assembly_run(conn: sqlite3.Connection, assembly_run_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM context_assembly_runs WHERE assembly_run_id = ?",
+        (assembly_run_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"context assembly run not found: {assembly_run_id}")
+    result = dict(row)
+    result["result"] = _decode_json_object(result.get("result_json"))
+    return result
+
+
+def _load_extraction_speaker_review(conn: sqlite3.Connection, review_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM extraction_speaker_reviews WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"speaker review not found: {review_id}")
+    result = dict(row)
+    result["labels"] = _decode_json_object(result.get("labels_json"), default={}) or {}
+    return result
+
+
+def _load_context_group_review(conn: sqlite3.Connection, review_id: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM context_group_reviews WHERE review_id = ?",
+        (review_id,),
+    ).fetchone()
+    if row is None:
+        raise SemanticStoreError(f"context group review not found: {review_id}")
+    result = dict(row)
+    result["decision"] = _decode_json_object(result.get("decision_json"), default={}) or {}
     return result
 
 
@@ -1018,12 +1068,16 @@ def create_semantic_run(
     anchor_date: str | None = None,
     created_at: int | None = None,
     supersedes_run_id: str | None = None,
+    context_group_key: str | None = None,
+    context_assembly_run_id: str | None = None,
 ) -> dict[str, Any]:
     provider = _coerce_required_text("provider", provider)
     model = _coerce_required_text("model", model)
     parser_version = _coerce_required_text("parser_version", parser_version)
     anchor_date = _coerce_optional_text(anchor_date)
     supersedes_run_id = _coerce_optional_text(supersedes_run_id)
+    context_group_key = _coerce_optional_text(context_group_key)
+    context_assembly_run_id = _coerce_optional_text(context_assembly_run_id)
     created_at = _now_ms() if created_at is None else created_at
     semantic_run_id = semantic_run_id or _new_id("srun")
     normalized_inputs = _normalize_semantic_run_inputs(inputs)
@@ -1035,14 +1089,17 @@ def create_semantic_run(
             _begin(conn)
         if supersedes_run_id is not None:
             _get_semantic_run_row(conn, supersedes_run_id)
+        if context_assembly_run_id is not None:
+            _load_context_assembly_run(conn, context_assembly_run_id)
         _validate_semantic_run_inputs(conn, inputs=normalized_inputs)
 
         conn.execute(
             """
             INSERT INTO semantic_runs (
                 semantic_run_id, provider, model, parser_version, status,
-                anchor_date, created_at, completed_at, failure_type, supersedes_run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                anchor_date, created_at, completed_at, failure_type, supersedes_run_id,
+                context_group_key, context_assembly_run_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 semantic_run_id,
@@ -1055,6 +1112,8 @@ def create_semantic_run(
                 None,
                 None,
                 supersedes_run_id,
+                context_group_key,
+                context_assembly_run_id,
             ),
         )
         for item in normalized_inputs:
@@ -1674,6 +1733,304 @@ def mark_event_change_run_failed(
         if started_transaction:
             conn.rollback()
         raise
+
+
+def create_extraction_speaker_review(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction_id: str,
+    status: str,
+    labels: Mapping[str, str] | None = None,
+    review_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    if status not in SPEAKER_REVIEW_STATUSES:
+        raise SemanticStoreError("speaker review status is invalid")
+    _ensure_evidence_exists(conn, [evidence_id])
+    extraction = _get_extraction_row(conn, extraction_id)
+    if extraction["evidence_id"] != evidence_id:
+        raise SemanticStoreError("speaker review extraction_id must belong to the same evidence")
+    normalized_labels: dict[str, str] = {}
+    if labels is not None:
+        if not isinstance(labels, Mapping):
+            raise SemanticStoreError("speaker review labels must be an object")
+        for raw_ref, raw_label in labels.items():
+            speaker_ref = _coerce_required_text("speaker_ref", raw_ref)
+            label = _coerce_required_text("label", raw_label)
+            normalized_labels[speaker_ref] = label
+    review_id = review_id or _new_id("sprev")
+    created_at = _now_ms() if created_at is None else created_at
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        conn.execute(
+            """
+            INSERT INTO extraction_speaker_reviews (
+                review_id, evidence_id, extraction_id, status, labels_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id,
+                evidence_id,
+                extraction_id,
+                status,
+                json.dumps(normalized_labels, ensure_ascii=False, separators=(",", ":")),
+                created_at,
+            ),
+        )
+        result = _load_extraction_speaker_review(conn, review_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def get_latest_extraction_speaker_review(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+    *,
+    extraction_id: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT review_id
+        FROM extraction_speaker_reviews
+        WHERE evidence_id = ?
+    """
+    params: list[Any] = [evidence_id]
+    if extraction_id is not None:
+        query += " AND extraction_id = ?"
+        params.append(extraction_id)
+    query += " ORDER BY created_at DESC, review_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_extraction_speaker_review(conn, row["review_id"])
+
+
+def create_context_assembly_run(
+    conn: sqlite3.Connection,
+    *,
+    submission_id: str,
+    provider: str,
+    model: str,
+    assembler_version: str,
+    assembly_run_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    _load_submission(conn, submission_id)
+    provider = _coerce_required_text("provider", provider)
+    model = _coerce_required_text("model", model)
+    assembler_version = _coerce_required_text("assembler_version", assembler_version)
+    assembly_run_id = assembly_run_id or _new_id("arun")
+    created_at = _now_ms() if created_at is None else created_at
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        conn.execute(
+            """
+            INSERT INTO context_assembly_runs (
+                assembly_run_id, submission_id, provider, model, assembler_version,
+                status, result_json, failure_type, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                assembly_run_id,
+                submission_id,
+                provider,
+                model,
+                assembler_version,
+                "running",
+                None,
+                None,
+                created_at,
+                None,
+            ),
+        )
+        result = _load_context_assembly_run(conn, assembly_run_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def persist_context_assembly_run_result(
+    conn: sqlite3.Connection,
+    *,
+    assembly_run_id: str,
+    result: Mapping[str, Any],
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    current = _load_context_assembly_run(conn, assembly_run_id)
+    if current["status"] != "running":
+        raise SemanticStoreError("context assembly run is not running")
+    if not isinstance(result, Mapping):
+        raise SemanticStoreError("context assembly result must be an object")
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        conn.execute(
+            """
+            UPDATE context_assembly_runs
+            SET status = ?, result_json = ?, failure_type = ?, completed_at = ?
+            WHERE assembly_run_id = ?
+            """,
+            (
+                "succeeded",
+                json.dumps(dict(result), ensure_ascii=False, separators=(",", ":")),
+                None,
+                completed_at,
+                assembly_run_id,
+            ),
+        )
+        persisted = _load_context_assembly_run(conn, assembly_run_id)
+        if started_transaction:
+            conn.commit()
+        return persisted
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def mark_context_assembly_run_failed(
+    conn: sqlite3.Connection,
+    *,
+    assembly_run_id: str,
+    failure_type: str | None = None,
+    completed_at: int | None = None,
+) -> dict[str, Any]:
+    completed_at = _now_ms() if completed_at is None else completed_at
+    failure_type = _coerce_optional_text(failure_type)
+    current = _load_context_assembly_run(conn, assembly_run_id)
+    if current["status"] != "running":
+        raise SemanticStoreError("context assembly run is not running")
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        conn.execute(
+            """
+            UPDATE context_assembly_runs
+            SET status = ?, failure_type = ?, completed_at = ?
+            WHERE assembly_run_id = ?
+            """,
+            ("failed", failure_type, completed_at, assembly_run_id),
+        )
+        persisted = _load_context_assembly_run(conn, assembly_run_id)
+        if started_transaction:
+            conn.commit()
+        return persisted
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def create_context_group_review(
+    conn: sqlite3.Connection,
+    *,
+    assembly_run_id: str,
+    group_key: str,
+    review_status: str,
+    decision: Mapping[str, Any],
+    review_id: str | None = None,
+    created_at: int | None = None,
+) -> dict[str, Any]:
+    if review_status not in ASSEMBLY_REVIEW_STATUSES:
+        raise SemanticStoreError("context group review status is invalid")
+    _load_context_assembly_run(conn, assembly_run_id)
+    group_key = _coerce_required_text("group_key", group_key)
+    if not isinstance(decision, Mapping):
+        raise SemanticStoreError("context group decision must be an object")
+    review_id = review_id or _new_id("cgr")
+    created_at = _now_ms() if created_at is None else created_at
+    started_transaction = not conn.in_transaction
+
+    try:
+        if started_transaction:
+            _begin(conn)
+        conn.execute(
+            """
+            INSERT INTO context_group_reviews (
+                review_id, assembly_run_id, group_key, review_status, decision_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                review_id,
+                assembly_run_id,
+                group_key,
+                review_status,
+                json.dumps(dict(decision), ensure_ascii=False, separators=(",", ":")),
+                created_at,
+            ),
+        )
+        result = _load_context_group_review(conn, review_id)
+        if started_transaction:
+            conn.commit()
+        return result
+    except Exception:
+        if started_transaction:
+            conn.rollback()
+        raise
+
+
+def get_latest_context_assembly_run(
+    conn: sqlite3.Connection,
+    submission_id: str,
+    *,
+    status: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT assembly_run_id
+        FROM context_assembly_runs
+        WHERE submission_id = ?
+    """
+    params: list[Any] = [submission_id]
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC, assembly_run_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_context_assembly_run(conn, row["assembly_run_id"])
+
+
+def get_latest_context_group_review(
+    conn: sqlite3.Connection,
+    assembly_run_id: str,
+    *,
+    group_key: str | None = None,
+) -> dict[str, Any] | None:
+    query = """
+        SELECT review_id
+        FROM context_group_reviews
+        WHERE assembly_run_id = ?
+    """
+    params: list[Any] = [assembly_run_id]
+    if group_key is not None:
+        query += " AND group_key = ?"
+        params.append(group_key)
+    query += " ORDER BY created_at DESC, review_id DESC LIMIT 1"
+    row = conn.execute(query, tuple(params)).fetchone()
+    if row is None:
+        return None
+    return _load_context_group_review(conn, row["review_id"])
 
 
 def persist_event_change_run_result(

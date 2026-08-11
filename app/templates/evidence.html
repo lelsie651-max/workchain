@@ -145,6 +145,95 @@
                 {{ render_record_date_section(record_date_state, (temporal_gate.prompt if temporal_gate else None) or "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。", "补充记录发生日期后，系统会重新检查来源与时间条件，通过后再开始 AI 整理。") }}
             </div>
         </div>
+        {% elif parse_status == "clarification_required" and clarification_reason == "semantic_context" %}
+        <div id="semantic-context-card" class="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
+            <p class="text-sm font-medium text-amber-100">{{ semantic_context.title if semantic_context else "这份记录需要先补充整理上下文" }}</p>
+            <p id="parse-status-message" class="mt-3 text-sm leading-7 text-slate-200">
+                <span id="parse-status-message-text">{{ (semantic_context.detail if semantic_context else None) or "这份记录在 AI 整理前还需要补充一些上下文。" }}</span>
+            </p>
+            <form id="semantic-context-form" class="mt-4 space-y-4">
+                {% if semantic_context and semantic_context.assembly_review_required and semantic_context.assembly_review %}
+                <div class="space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/55 p-4">
+                    <p class="text-sm text-slate-100">这些图片的上下文分组和阅读顺序还需要你确认，确认后系统才会开始真正的 AI 整理。</p>
+                    <p class="text-sm text-slate-400">这里的 `analysis_order` 是 AI 阅读顺序，不会改动你的上传顺序。</p>
+                    {% if semantic_context.assembly_review.ambiguities %}
+                    <div class="space-y-2">
+                        <p class="text-sm text-slate-300">当前不确定点：</p>
+                        <ul class="space-y-2 text-sm text-slate-400">
+                            {% for item in semantic_context.assembly_review.ambiguities %}
+                            <li>• {{ item }}</li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    <div class="space-y-2">
+                        <p class="text-sm text-slate-300">当前分组建议：</p>
+                        <div class="space-y-2">
+                            {% for group in semantic_context.assembly_review.pending_groups if group.includes_current_evidence %}
+                            <div class="rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-sm text-slate-300">
+                                <p>Group `{{ group.group_key }}` · {{ group.relation }} · confidence {{ "%.2f"|format(group.confidence or 0) }}</p>
+                                <p class="mt-1 text-slate-400">evidence_ids: {{ group.evidence_ids|join(" -> ") }}</p>
+                                <p class="mt-1 text-slate-400">analysis_order: {{ group.analysis_order|join(" -> ") }}</p>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    </div>
+                </div>
+                {% endif %}
+                {% if semantic_context and semantic_context.temporal_required %}
+                <div class="rounded-2xl border border-slate-800/80 bg-slate-950/55 p-4">
+                    <p class="text-sm text-slate-100">记录日期是必填项。</p>
+                    <p class="mt-1 text-sm text-slate-400">补充后系统才会开始真正的 AI 整理。</p>
+                    <div class="mt-3">
+                        <input
+                            id="semantic-record-date-input"
+                            type="date"
+                            min="1900-01-01"
+                            max="2100-12-31"
+                            value="{{ record_date_state.record_date or '' }}"
+                            class="min-h-11 rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40"
+                        >
+                    </div>
+                </div>
+                {% endif %}
+                {% if semantic_context and semantic_context.speaker_fields %}
+                <div class="space-y-3 rounded-2xl border border-slate-800/80 bg-slate-950/55 p-4">
+                    <p class="text-sm text-slate-100">发言者称呼仅用于本次 AI 整理，不会修改原件或机器提取。</p>
+                    <p class="text-sm text-slate-400">不填写也可以继续。</p>
+                    {% for field in semantic_context.speaker_fields %}
+                    <div class="space-y-2">
+                        <label for="speaker-{{ field.speaker_ref }}" class="block text-sm text-slate-300">{{ field.label }}</label>
+                        <input
+                            id="speaker-{{ field.speaker_ref }}"
+                            type="text"
+                            maxlength="40"
+                            value="{{ field.value or '' }}"
+                            data-speaker-ref="{{ field.speaker_ref }}"
+                            class="min-h-11 w-full rounded-xl border border-slate-700 bg-slate-950/70 px-4 py-3 text-sm text-slate-100 outline-none transition placeholder:text-slate-500 focus:border-cyan-400/40"
+                            placeholder="可选，不填写也能继续"
+                        >
+                    </div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+                <div class="flex flex-wrap gap-3">
+                    <button
+                        id="semantic-context-save"
+                        type="submit"
+                        class="inline-flex min-h-11 items-center rounded-xl bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300"
+                    >
+                        {{ "保存并确认后继续" if semantic_context and semantic_context.assembly_review_required else "保存并继续" }}
+                    </button>
+                    <button
+                        id="semantic-context-skip"
+                        type="button"
+                        class="inline-flex min-h-11 items-center rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-cyan-400/40 hover:text-white"
+                    >
+                        {{ "确认当前分组并继续整理" if semantic_context and semantic_context.assembly_review_required else "不补充直接整理" }}
+                    </button>
+                </div>
+            </form>
+        </div>
         {% elif parse_status == "clarification_required" %}
         <div id="source-clarification-card" class="mt-4 rounded-2xl border border-amber-400/20 bg-amber-400/5 p-4">
             <p class="text-sm font-medium text-amber-100">{{ source_gate.title or "信息来源可能需要核实" }}</p>
@@ -813,6 +902,79 @@
             syncCustom();
         };
 
+        const initSemanticContextForm = () => {
+            const form = document.getElementById("semantic-context-form");
+            const skipButton = document.getElementById("semantic-context-skip");
+            const saveButton = document.getElementById("semantic-context-save");
+            if (!form || !skipButton || !saveButton) {
+                return;
+            }
+            const recordDateInput = document.getElementById("semantic-record-date-input");
+            const speakerInputs = [...form.querySelectorAll("[data-speaker-ref]")];
+
+            const setBusy = (busy) => {
+                [saveButton, skipButton, recordDateInput, ...speakerInputs].forEach((node) => {
+                    if (!node) {
+                        return;
+                    }
+                    node.disabled = busy;
+                });
+                [saveButton, skipButton].forEach((button) => {
+                    button.classList.toggle("opacity-60", busy);
+                    button.classList.toggle("cursor-not-allowed", busy);
+                });
+            };
+
+            const buildPayload = (action) => {
+                const payload = { action };
+                if (recordDateInput) {
+                    payload.record_date = recordDateInput.value;
+                }
+                speakerInputs.forEach((input) => {
+                    const speakerRef = input.dataset.speakerRef;
+                    if (!speakerRef) {
+                        return;
+                    }
+                    payload[`${speakerRef}_label`] = input.value.trim();
+                });
+                return payload;
+            };
+
+            const submitPayload = async (action) => {
+                if (recordDateInput && !recordDateInput.value) {
+                    showFlash("请选择记录发生日期", "error");
+                    return;
+                }
+                setBusy(true);
+                try {
+                    const response = await fetch(`/api/evidence/${evidenceId}/semantic-context-review`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(buildPayload(action)),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        showFlash(data.detail || "提交整理上下文失败", "error");
+                        return;
+                    }
+                    showFlash("整理上下文已保存，正在继续处理。", "success");
+                    window.setTimeout(() => window.location.reload(), 250);
+                } catch (error) {
+                    showFlash("提交整理上下文失败，请稍后再试", "error");
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                await submitPayload("save_and_continue");
+            });
+            skipButton.addEventListener("click", async () => {
+                await submitPayload("skip_and_continue");
+            });
+        };
+
         const initEventAssignmentForm = () => {
             const eventAssignmentForm = document.querySelector("[data-event-assignment-form]");
             const eventAssignmentSaveButton = document.querySelector("[data-event-assignment-save]");
@@ -1061,6 +1223,7 @@
         initEventAssignmentForm();
         initSlotsForm();
         initSourceReviewForm();
+        initSemanticContextForm();
         initStatusPolling();
         {% if diagnostics_enabled %}
         initDiagnostics();

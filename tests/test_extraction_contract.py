@@ -30,6 +30,7 @@ def test_build_extraction_result_normalizes_pure_data_fields():
         "provider": "custom-provider",
         "model": "model-1",
         "warnings": ["可能有遮挡"],
+        "structured_payload": None,
     }
 
 

@@ -1649,8 +1649,6 @@ def test_user_facing_pages_hide_internal_semantic_field_names(tmp_path, monkeypa
                 detail_response = client.get(f"/evidence/{evidence_id}")
 
     assert response.status_code == 200
-    friendly_copy = "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。"
-    assert friendly_copy in detail_response.text
     home_visible = home_response.text.split("<script>", 1)[0]
     detail_visible = detail_response.text.split("<script>", 1)[0]
     for token in ("anchor_date", "due_date", "fact_index", "event_assignment"):
@@ -3067,39 +3065,54 @@ def test_multi_image_pipeline_runs_sequentially_and_scopes_semantics_per_evidenc
             "ambiguities": [],
         }
 
+    def fake_assemble_context_groups(items):
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": "group-1",
+                        "evidence_ids": [item["evidence_id"] for item in items],
+                        "analysis_order": [item["evidence_id"] for item in items],
+                        "relation": "continuation",
+                        "confidence": 0.93,
+                    }
+                ],
+                "ambiguities": [],
+            },
+            {"success": True},
+        )
+
     with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
         with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
             with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
                 with patch("app.main.event_matcher.match_events", side_effect=fake_match_events):
-                    with client:
-                        response = _multipart_request(
-                            client,
-                            data={"source": "飞书", "source_detail": "项目复盘群"},
-                            file_parts=[
-                                ("a.png", image_a, "image/png"),
-                                ("b.png", image_b, "image/png"),
-                                ("c.png", image_c, "image/png"),
-                            ],
-                        )
+                    with patch("app.main.context_assembler.assemble_context_groups", side_effect=fake_assemble_context_groups):
+                        with client:
+                            response = _multipart_request(
+                                client,
+                                data={"source": "飞书", "source_detail": "项目复盘群"},
+                                file_parts=[
+                                    ("a.png", image_a, "image/png"),
+                                    ("b.png", image_b, "image/png"),
+                                    ("c.png", image_c, "image/png"),
+                                ],
+                            )
 
     assert response.status_code == 200
     payload = response.json()
     assert call_order == [
         ("ark", "第一张截图"),
-        ("deepseek", "第一张截图"),
-        ("matcher", "事实:第一张截图"),
         ("ark", "第二张截图"),
-        ("deepseek", "第二张截图"),
-        ("matcher", "事实:第二张截图"),
         ("ark", "第三张截图"),
-        ("deepseek", "第三张截图"),
-        ("matcher", "事实:第三张截图"),
+        ("deepseek", semantic_inputs[0][0] or ""),
+        ("matcher", f"事实:{semantic_inputs[0][0]}"),
     ]
-    assert semantic_inputs == [
-        ("第一张截图", [{"kind": "timestamp", "content": "2026-08-09", "confidence": 0.9}]),
-        ("第二张截图", [{"kind": "timestamp", "content": "2026-08-10", "confidence": 0.9}]),
-        ("第三张截图", [{"kind": "timestamp", "content": "2026-08-11", "confidence": 0.9}]),
-    ]
+    assert len(semantic_inputs) == 1
+    assert semantic_inputs[0][1] == []
+    assert "[evidence " in (semantic_inputs[0][0] or "")
+    assert "第一张截图" in (semantic_inputs[0][0] or "")
+    assert "第二张截图" in (semantic_inputs[0][0] or "")
+    assert "第三张截图" in (semantic_inputs[0][0] or "")
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
@@ -3122,14 +3135,12 @@ def test_multi_image_pipeline_runs_sequentially_and_scopes_semantics_per_evidenc
     finally:
         conn.close()
 
-    assert [(row["content"], row["evidence_id"]) for row in fact_rows] == [
-        ("事实:第一张截图", payload["evidence_ids"][0]),
-        ("事实:第二张截图", payload["evidence_ids"][1]),
-        ("事实:第三张截图", payload["evidence_ids"][2]),
-    ]
+    assert len(fact_rows) == 3
+    assert {row["evidence_id"] for row in fact_rows} == set(payload["evidence_ids"])
+    assert all(row["content"].startswith("事实:") and "[evidence " in row["content"] for row in fact_rows)
     assert len(semantic_inputs_rows) == 3
     assert {row["evidence_id"] for row in semantic_inputs_rows} == set(payload["evidence_ids"])
-    assert all(row["position"] == 0 for row in semantic_inputs_rows)
+    assert [row["position"] for row in semantic_inputs_rows] == [0, 1, 2]
 
 
 def test_multi_image_pipeline_failure_on_middle_item_does_not_block_later_items(tmp_path, monkeypatch):
@@ -3168,7 +3179,7 @@ def test_multi_image_pipeline_failure_on_middle_item_does_not_block_later_items(
 
     def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
         semantic_order.append(text or "")
-        if text == "第二张截图":
+        if "第二张截图" in (text or ""):
             return None
         return _semantic_result(
             facts=[
@@ -3185,27 +3196,49 @@ def test_multi_image_pipeline_failure_on_middle_item_does_not_block_later_items(
             ]
         )
 
+    def fake_assemble_context_groups(items):
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": f"group-{index}",
+                        "evidence_ids": [item["evidence_id"]],
+                        "analysis_order": [item["evidence_id"]],
+                        "relation": "standalone",
+                        "confidence": 0.95,
+                    }
+                    for index, item in enumerate(items, start=1)
+                ],
+                "ambiguities": [],
+            },
+            {"success": True},
+        )
+
     with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
         with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
-            with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
-                with client:
-                    response = _multipart_request(
-                        client,
-                        data={"source": "飞书", "source_detail": "项目复盘群"},
-                        file_parts=[
-                            ("a.png", image_a, "image/png"),
-                            ("b.png", image_b, "image/png"),
-                            ("c.png", image_c, "image/png"),
-                        ],
-                    )
-                    payload = response.json()
-                    statuses = [
-                        client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
-                        for evidence_id in payload["evidence_ids"]
-                    ]
+            with patch("app.main.context_assembler.assemble_context_groups", side_effect=fake_assemble_context_groups):
+                with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+                    with client:
+                        response = _multipart_request(
+                            client,
+                            data={"source": "飞书", "source_detail": "项目复盘群"},
+                            file_parts=[
+                                ("a.png", image_a, "image/png"),
+                                ("b.png", image_b, "image/png"),
+                                ("c.png", image_c, "image/png"),
+                            ],
+                        )
+                        payload = response.json()
+                        statuses = [
+                            client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
+                            for evidence_id in payload["evidence_ids"]
+                        ]
 
     assert response.status_code == 200
-    assert semantic_order == ["第一张截图", "第二张截图", "第三张截图"]
+    assert len(semantic_order) == 3
+    assert "第一张截图" in semantic_order[0]
+    assert "第二张截图" in semantic_order[1]
+    assert "第三张截图" in semantic_order[2]
     assert statuses == ["done", "failed", "done"]
 
 
@@ -3513,10 +3546,9 @@ def test_ark_provider_success_uses_ark_only_and_persists_observations(tmp_path, 
     assert vision_kwargs == {"source_hint": "微信-单聊"}
     mock_ocr.assert_not_called()
     mock_llm.assert_called_once()
-    assert mock_llm.call_args.args[0] == main_module._llm_input_text("Ark transcript")
-    assert mock_llm.call_args.kwargs["observations"] == [
-        {"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}
-    ]
+    assert "Ark transcript" in mock_llm.call_args.args[0]
+    assert "有人对该消息显示👍反应" not in mock_llm.call_args.args[0]
+    assert mock_llm.call_args.kwargs["observations"] == []
     assert mock_llm.call_args.kwargs["anchor_date"] is None
 
     db_path = _sandbox_db_path(client, sandbox_root)
@@ -4057,11 +4089,14 @@ def test_multi_image_source_gate_blocks_only_target_evidence_and_allows_later_im
                 ]
 
     assert response.status_code == 200
-    assert statuses == ["done", "clarification_required", "done"]
-    assert mock_llm.call_count == 2
+    assert statuses == ["llm_running", "clarification_required", "llm_running"]
+    assert mock_llm.call_count == 0
 
     conn = init_db(_sandbox_db_path(client, sandbox_root))
     try:
+        semantic_run_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM semantic_runs",
+        ).fetchone()["count"]
         middle_semantic_runs = conn.execute(
             "SELECT COUNT(*) AS count FROM semantic_run_inputs WHERE evidence_id = ?",
             (payload["evidence_ids"][1],),
@@ -4070,10 +4105,715 @@ def test_multi_image_source_gate_blocks_only_target_evidence_and_allows_later_im
             "SELECT COUNT(*) AS count FROM evidence_extractions WHERE evidence_id = ?",
             (payload["evidence_ids"][2],),
         ).fetchone()["count"]
+        assert semantic_run_count == 0
         assert middle_semantic_runs == 0
         assert third_extractions == 1
     finally:
         conn.close()
+
+
+def test_image_semantic_context_review_with_labels_runs_semantic_once_and_keeps_extraction_immutable(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result(
+        facts=[
+            {
+                "fact_type": "statement",
+                "content": "这是整理后的事实",
+                "actors": [],
+                "due_raw": None,
+                "due_date": None,
+                "due_anchor_date": None,
+                "occurred_date": None,
+                "confidence": 0.9,
+            }
+        ]
+    )
+
+    extraction_payload = {
+        "transcript": "[message 1][left_account] 先这样",
+        "observations": [],
+        "warnings": [],
+        "provider": "ark",
+        "model": "seed-vision",
+        "structured_payload": {
+            "payload_version": "1.0",
+            "conversation_type": "direct_chat",
+            "participants": [
+                {"speaker_ref": "left_account", "side": "left", "display_name": None},
+                {"speaker_ref": "right_account", "side": "right", "display_name": "我"},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "left_account",
+                    "side": "left",
+                        "text": "先这样",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                }
+            ],
+            "system_events": [],
+        },
+    }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", return_value={"extraction": extraction_payload, "detail": None}):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+                with client:
+                    create_response = _upload_png(client, filename="speaker-context.png", source="微信", source_detail="单聊")
+                    create_payload = create_response.json()
+                    evidence_id = create_payload["evidence_id"]
+                    status_payload = client.get(f"/api/evidence/{evidence_id}/status").json()
+
+                    assert status_payload["parse_status"] == "clarification_required"
+                    assert status_payload["clarification_reason"] == "semantic_context"
+                    assert mock_llm.call_count == 0
+
+                    resume_response = client.post(
+                        f"/api/evidence/{evidence_id}/semantic-context-review",
+                        json={
+                            "action": "save_and_continue",
+                            "left_account_label": "甲方",
+                        },
+                    )
+
+    assert resume_response.status_code == 200
+    assert mock_llm.call_count == 1
+
+    db_path = _sandbox_db_path(client, sandbox_root)
+    conn = init_db(db_path)
+    try:
+        extraction_rows = conn.execute(
+            "SELECT extraction_id, structured_payload FROM evidence_extractions WHERE evidence_id = ? ORDER BY created_at ASC",
+            (evidence_id,),
+        ).fetchall()
+        evidence_row = conn.execute(
+            "SELECT content_hash, chain_hash FROM evidence WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+        review_row = conn.execute(
+            "SELECT status, labels_json FROM extraction_speaker_reviews WHERE evidence_id = ? ORDER BY created_at DESC LIMIT 1",
+            (evidence_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert len(extraction_rows) == 1
+    assert extraction_rows[0]["structured_payload"] is not None
+    assert evidence_row["content_hash"]
+    assert evidence_row["chain_hash"]
+    assert review_row["status"] == "provided"
+    assert json.loads(review_row["labels_json"]) == {"left_account": "甲方"}
+
+
+def test_image_semantic_context_review_skip_runs_semantic_once_without_labels(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    parsed = _semantic_result()
+    extraction_payload = {
+        "transcript": "[message 1][left_account] 先这样",
+        "observations": [],
+        "warnings": [],
+        "provider": "ark",
+        "model": "seed-vision",
+        "structured_payload": {
+            "payload_version": "1.0",
+            "conversation_type": "direct_chat",
+            "participants": [
+                {"speaker_ref": "left_account", "side": "left", "display_name": None},
+                {"speaker_ref": "right_account", "side": "right", "display_name": None},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "left_account",
+                    "side": "left",
+                        "text": "先这样",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                }
+            ],
+            "system_events": [],
+        },
+    }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", return_value={"extraction": extraction_payload, "detail": None}):
+            with patch("app.main.semantic_llm.extract_semantics", return_value=parsed) as mock_llm:
+                with client:
+                    create_response = _upload_png(client, filename="speaker-context-skip.png", source="微信", source_detail="单聊")
+                    evidence_id = create_response.json()["evidence_id"]
+                    resume_response = client.post(
+                        f"/api/evidence/{evidence_id}/semantic-context-review",
+                        json={"action": "skip_and_continue"},
+                    )
+
+    assert resume_response.status_code == 200
+    assert mock_llm.call_count == 1
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        review_row = conn.execute(
+            "SELECT status, labels_json FROM extraction_speaker_reviews WHERE evidence_id = ? ORDER BY created_at DESC LIMIT 1",
+            (evidence_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert review_row["status"] == "skipped"
+    assert json.loads(review_row["labels_json"]) == {}
+
+
+def test_multi_image_context_assembly_ambiguity_blocks_semantic(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, _ = _make_client(tmp_path, monkeypatch)
+    file_parts = [
+        ("first.png", _build_png_bytes(4, 4, (10, 20, 30)), "image/png"),
+        ("second.png", _build_png_bytes(4, 4, (40, 50, 60)), "image/png"),
+    ]
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        source_hint,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        return {
+            "extraction": {
+                "transcript": "同一个项目上下文",
+                "observations": [],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+                "structured_payload": {
+                    "payload_version": "1.0",
+                    "conversation_type": "direct_chat",
+                    "participants": [
+                        {"speaker_ref": "left_account", "side": "left", "display_name": "甲"},
+                        {"speaker_ref": "right_account", "side": "right", "display_name": "乙"},
+                    ],
+                    "messages": [
+                        {
+                            "index": 1,
+                            "speaker_ref": "left_account",
+                            "side": "left",
+                            "text": "同一个项目上下文",
+                            "quote": None,
+                            "reply": None,
+                            "reactions": [],
+                        }
+                    ],
+                    "system_events": [],
+                },
+            },
+            "detail": None,
+        }
+
+    def fake_assemble_context_groups(items):
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": "group-1",
+                        "evidence_ids": [item["evidence_id"] for item in items],
+                        "analysis_order": [item["evidence_id"] for item in items],
+                        "relation": "continuation",
+                        "confidence": 0.4,
+                    }
+                ],
+                "ambiguities": ["无法可靠判断顺序"],
+            },
+            {"success": True},
+        )
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch(
+                "app.main.context_assembler.assemble_context_groups",
+                side_effect=fake_assemble_context_groups,
+            ):
+                with patch("app.main.semantic_llm.extract_semantics", side_effect=AssertionError("should not call semantic")):
+                    with client:
+                        response = _multipart_request(
+                            client,
+                            data={"source": "微信", "source_detail": "单聊"},
+                            file_parts=file_parts,
+                        )
+                        payload = response.json()
+                        statuses = [
+                            client.get(f"/api/evidence/{evidence_id}/status").json()
+                            for evidence_id in payload["evidence_ids"]
+                        ]
+
+    assert response.status_code == 200
+    assert [item["parse_status"] for item in statuses] == ["clarification_required", "clarification_required"]
+    assert all(item["clarification_reason"] == "semantic_context" for item in statuses)
+
+
+def test_multi_image_context_assembly_confirmation_reuses_reviewed_groups_without_rerunning_assembler(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    file_parts = [
+        ("first.png", _build_png_bytes(4, 4, (21, 31, 41)), "image/png"),
+        ("second.png", _build_png_bytes(4, 4, (51, 61, 71)), "image/png"),
+    ]
+    assemble_call_count = {"value": 0}
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        source_hint,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        return {
+            "extraction": {
+                "transcript": "项目讨论",
+                "observations": [],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+                "structured_payload": {
+                    "payload_version": "1.0",
+                    "conversation_type": "direct_chat",
+                    "participants": [
+                        {"speaker_ref": "left_account", "side": "left", "display_name": "甲"},
+                        {"speaker_ref": "right_account", "side": "right", "display_name": "乙"},
+                    ],
+                    "messages": [
+                        {
+                            "index": 1,
+                            "speaker_ref": "left_account",
+                            "side": "left",
+                            "text": "项目讨论",
+                            "quote": None,
+                            "reply": None,
+                            "reactions": [],
+                        }
+                    ],
+                    "system_events": [],
+                },
+            },
+            "detail": None,
+        }
+
+    def fake_assemble_context_groups(items):
+        assemble_call_count["value"] += 1
+        if assemble_call_count["value"] > 1:
+            raise AssertionError("assembler should not rerun after user confirmation")
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": "group-1",
+                        "evidence_ids": [item["evidence_id"] for item in items],
+                        "analysis_order": [item["evidence_id"] for item in items],
+                        "relation": "continuation",
+                        "confidence": 0.42,
+                    }
+                ],
+                "ambiguities": ["顺序需要用户确认"],
+            },
+            {"success": True},
+        )
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        return _semantic_result(
+            facts=[
+                {
+                    "fact_type": "statement",
+                    "content": f"事实:{text}",
+                    "actors": [],
+                    "due_raw": None,
+                    "due_date": None,
+                    "due_anchor_date": None,
+                    "occurred_date": None,
+                    "confidence": 0.9,
+                }
+            ]
+        )
+
+    def fake_match_events(facts, *, existing_events=None):
+        return {
+            "groups": [
+                {
+                    "fact_indexes": list(range(len(facts))),
+                    "target": "unassigned",
+                    "event_id": None,
+                    "proposed_title": None,
+                    "confidence": 0.0,
+                    "reason": "先不自动归入",
+                }
+            ],
+            "ambiguities": [],
+        }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch("app.main.context_assembler.assemble_context_groups", side_effect=fake_assemble_context_groups):
+                with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract) as mock_llm:
+                    with patch("app.main.event_matcher.match_events", side_effect=fake_match_events):
+                        with client:
+                            response = _multipart_request(
+                                client,
+                                data={"source": "微信", "source_detail": "单聊"},
+                                file_parts=file_parts,
+                            )
+                            payload = response.json()
+                            status_before = client.get(f"/api/evidence/{payload['evidence_ids'][0]}/status").json()
+                            resume_response = client.post(
+                                f"/api/evidence/{payload['evidence_ids'][0]}/semantic-context-review",
+                                json={"action": "skip_and_continue"},
+                            )
+                            statuses_after = [
+                                client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
+                                for evidence_id in payload["evidence_ids"]
+                            ]
+
+    assert response.status_code == 200
+    assert status_before["parse_status"] == "clarification_required"
+    assert status_before["semantic_context"]["assembly_review_required"] is True
+    assert resume_response.status_code == 200
+    assert assemble_call_count["value"] == 1
+    assert mock_llm.call_count == 1
+    assert statuses_after == ["done", "done"]
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        review_statuses = conn.execute(
+            """
+            SELECT review_status
+            FROM context_group_reviews
+            ORDER BY created_at ASC, review_id ASC
+            """
+        ).fetchall()
+        speaker_review_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM extraction_speaker_reviews"
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+
+    assert [row["review_status"] for row in review_statuses] == ["needs_user_review", "accepted"]
+    assert speaker_review_count == 0
+
+
+def test_multi_image_context_assembly_routes_five_images_with_independent_analysis_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    file_parts = [
+        ("a.png", _build_png_bytes(4, 4, (10, 11, 12)), "image/png"),
+        ("b.png", _build_png_bytes(4, 4, (20, 21, 22)), "image/png"),
+        ("c.png", _build_png_bytes(4, 4, (30, 31, 32)), "image/png"),
+        ("d.png", _build_png_bytes(4, 4, (40, 41, 42)), "image/png"),
+        ("e.png", _build_png_bytes(4, 4, (50, 51, 52)), "image/png"),
+    ]
+    semantic_texts: list[str] = []
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        source_hint,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        transcript_map = {
+            file_parts[0][1]: "截图A",
+            file_parts[1][1]: "截图B",
+            file_parts[2][1]: "截图C",
+            file_parts[3][1]: "截图D",
+            file_parts[4][1]: "截图E",
+        }
+        return {
+            "extraction": {
+                "transcript": transcript_map[image_bytes],
+                "observations": [],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+                "structured_payload": {
+                    "payload_version": "1.0",
+                    "conversation_type": "direct_chat",
+                    "participants": [
+                        {"speaker_ref": "left_account", "side": "left", "display_name": "甲"},
+                        {"speaker_ref": "right_account", "side": "right", "display_name": "乙"},
+                    ],
+                    "messages": [
+                        {
+                            "index": 1,
+                            "speaker_ref": "left_account",
+                            "side": "left",
+                            "text": transcript_map[image_bytes],
+                            "quote": None,
+                            "reply": None,
+                            "reactions": [],
+                        }
+                    ],
+                    "system_events": [],
+                },
+            },
+            "detail": None,
+        }
+
+    def fake_assemble_context_groups(items):
+        evidence_ids = [item["evidence_id"] for item in items]
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": "group-continuation",
+                        "evidence_ids": evidence_ids[:3],
+                        "analysis_order": [evidence_ids[1], evidence_ids[0], evidence_ids[2]],
+                        "relation": "continuation",
+                        "confidence": 0.95,
+                    },
+                    {
+                        "group_key": "group-standalone-4",
+                        "evidence_ids": [evidence_ids[3]],
+                        "analysis_order": [evidence_ids[3]],
+                        "relation": "standalone",
+                        "confidence": 0.96,
+                    },
+                    {
+                        "group_key": "group-standalone-5",
+                        "evidence_ids": [evidence_ids[4]],
+                        "analysis_order": [evidence_ids[4]],
+                        "relation": "standalone",
+                        "confidence": 0.97,
+                    },
+                ],
+                "ambiguities": [],
+            },
+            {"success": True},
+        )
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        semantic_texts.append(text or "")
+        return _semantic_result(
+            facts=[
+                {
+                    "fact_type": "statement",
+                    "content": f"事实:{text}",
+                    "actors": [],
+                    "due_raw": None,
+                    "due_date": None,
+                    "due_anchor_date": None,
+                    "occurred_date": None,
+                    "confidence": 0.93,
+                }
+            ]
+        )
+
+    def fake_match_events(facts, *, existing_events=None):
+        return {
+            "groups": [
+                {
+                    "fact_indexes": list(range(len(facts))),
+                    "target": "unassigned",
+                    "event_id": None,
+                    "proposed_title": None,
+                    "confidence": 0.0,
+                    "reason": "先不自动归入",
+                }
+            ],
+            "ambiguities": [],
+        }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch("app.main.context_assembler.assemble_context_groups", side_effect=fake_assemble_context_groups):
+                with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+                    with patch("app.main.event_matcher.match_events", side_effect=fake_match_events):
+                        with client:
+                            response = _multipart_request(
+                                client,
+                                data={"source": "微信", "source_detail": "单聊"},
+                                file_parts=file_parts,
+                            )
+                            payload = response.json()
+                            statuses = [
+                                client.get(f"/api/evidence/{evidence_id}/status").json()["parse_status"]
+                                for evidence_id in payload["evidence_ids"]
+                            ]
+
+    assert response.status_code == 200
+    assert statuses == ["done", "done", "done", "done", "done"]
+    assert len(semantic_texts) == 3
+    assert semantic_texts[0].find("截图B") < semantic_texts[0].find("截图A") < semantic_texts[0].find("截图C")
+    assert "截图D" in semantic_texts[1]
+    assert "截图E" in semantic_texts[2]
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        semantic_runs = conn.execute(
+            """
+            SELECT context_group_key
+            FROM semantic_runs
+            ORDER BY created_at ASC, semantic_run_id ASC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [row["context_group_key"] for row in semantic_runs] == [
+        "group-continuation",
+        "group-standalone-4",
+        "group-standalone-5",
+    ]
+
+
+def test_multi_image_context_assembly_allows_evidence_in_multiple_groups(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-test")
+    client, _, sandbox_root = _make_client(tmp_path, monkeypatch)
+    file_parts = [
+        ("a.png", _build_png_bytes(4, 4, (91, 11, 12)), "image/png"),
+        ("b.png", _build_png_bytes(4, 4, (92, 21, 22)), "image/png"),
+        ("c.png", _build_png_bytes(4, 4, (93, 31, 32)), "image/png"),
+    ]
+    semantic_texts: list[str] = []
+
+    def fake_run_production_image_extraction(
+        image_bytes,
+        mime_type,
+        *,
+        provider,
+        source_hint,
+        allow_ocr_fallback,
+        consume_ocr_fallback_budget,
+    ):
+        transcript_map = {
+            file_parts[0][1]: "重叠A",
+            file_parts[1][1]: "重叠B",
+            file_parts[2][1]: "重叠C",
+        }
+        return {
+            "extraction": {
+                "transcript": transcript_map[image_bytes],
+                "observations": [],
+                "warnings": [],
+                "provider": "ark",
+                "model": "seed-vision",
+                "structured_payload": {
+                    "payload_version": "1.0",
+                    "conversation_type": "direct_chat",
+                    "participants": [
+                        {"speaker_ref": "left_account", "side": "left", "display_name": "甲"},
+                        {"speaker_ref": "right_account", "side": "right", "display_name": "乙"},
+                    ],
+                    "messages": [
+                        {
+                            "index": 1,
+                            "speaker_ref": "left_account",
+                            "side": "left",
+                            "text": transcript_map[image_bytes],
+                            "quote": None,
+                            "reply": None,
+                            "reactions": [],
+                        }
+                    ],
+                    "system_events": [],
+                },
+            },
+            "detail": None,
+        }
+
+    def fake_assemble_context_groups(items):
+        evidence_ids = [item["evidence_id"] for item in items]
+        return (
+            {
+                "groups": [
+                    {
+                        "group_key": "group-1",
+                        "evidence_ids": [evidence_ids[0], evidence_ids[1]],
+                        "analysis_order": [evidence_ids[0], evidence_ids[1]],
+                        "relation": "continuation",
+                        "confidence": 0.94,
+                    },
+                    {
+                        "group_key": "group-2",
+                        "evidence_ids": [evidence_ids[1], evidence_ids[2]],
+                        "analysis_order": [evidence_ids[1], evidence_ids[2]],
+                        "relation": "related_context",
+                        "confidence": 0.95,
+                    },
+                ],
+                "ambiguities": [],
+            },
+            {"success": True},
+        )
+
+    def fake_extract(text, *, observations=None, anchor_date=None, glossary=None, source_hint=None):
+        semantic_texts.append(text or "")
+        return _semantic_result(
+            facts=[
+                {
+                    "fact_type": "statement",
+                    "content": f"事实:{text}",
+                    "actors": [],
+                    "due_raw": None,
+                    "due_date": None,
+                    "due_anchor_date": None,
+                    "occurred_date": None,
+                    "confidence": 0.91,
+                }
+            ]
+        )
+
+    def fake_match_events(facts, *, existing_events=None):
+        return {
+            "groups": [
+                {
+                    "fact_indexes": list(range(len(facts))),
+                    "target": "unassigned",
+                    "event_id": None,
+                    "proposed_title": None,
+                    "confidence": 0.0,
+                    "reason": "先不自动归入",
+                }
+            ],
+            "ambiguities": [],
+        }
+
+    with patch("app.main.get_image_extraction_startup", return_value={"supported": True, "configured": True, "requires_ocr_budget_on_start": False}):
+        with patch("app.main.run_production_image_extraction", side_effect=fake_run_production_image_extraction):
+            with patch("app.main.context_assembler.assemble_context_groups", side_effect=fake_assemble_context_groups):
+                with patch("app.main.semantic_llm.extract_semantics", side_effect=fake_extract):
+                    with patch("app.main.event_matcher.match_events", side_effect=fake_match_events):
+                        with client:
+                            response = _multipart_request(
+                                client,
+                                data={"source": "微信", "source_detail": "单聊"},
+                                file_parts=file_parts,
+                            )
+                            payload = response.json()
+
+    assert response.status_code == 200
+    assert len(semantic_texts) == 2
+    assert all("重叠B" in text for text in semantic_texts)
+
+    conn = init_db(_sandbox_db_path(client, sandbox_root))
+    try:
+        middle_evidence_inputs = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM semantic_run_inputs
+            WHERE evidence_id = ?
+            """,
+            (payload["evidence_ids"][1],),
+        ).fetchone()["count"]
+    finally:
+        conn.close()
+
+    assert middle_evidence_inputs == 2
 
 
 def test_ark_provider_falls_back_to_ocr_and_consumes_budget_only_on_fallback(tmp_path, monkeypatch):
@@ -4206,13 +4946,8 @@ def test_ark_provider_observations_only_enters_semantic_pipeline(tmp_path, monke
                 status_response = client.get(f"/api/evidence/{evidence_id}/status")
 
     assert response.status_code == 200
-    assert status_response.json()["parse_status"] == "done"
-    mock_llm.assert_called_once()
-    assert mock_llm.call_args.args[0] is None
-    assert mock_llm.call_args.kwargs["observations"] == [
-        {"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}
-    ]
-    assert mock_llm.call_args.kwargs["anchor_date"] is None
+    assert status_response.json()["parse_status"] == "unsupported"
+    mock_llm.assert_not_called()
 
     db_path = _sandbox_db_path(client, sandbox_root)
     conn = init_db(db_path)
@@ -4225,10 +4960,10 @@ def test_ark_provider_observations_only_enters_semantic_pipeline(tmp_path, monke
         assert row["raw_text"] == "[图片] ark-observation-only.png"
         assert extraction_row["transcript"] is None
         assert json.loads(extraction_row["observations"]) == [{"kind": "reaction", "content": "有人对该消息显示👍反应", "confidence": 0.74}]
-        fact_row = conn.execute(
-            "SELECT content FROM facts WHERE semantic_run_id IS NOT NULL ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-        assert fact_row["content"] == "画面显示该消息存在点赞反应。"
+        fact_count = conn.execute(
+            "SELECT COUNT(*) AS count FROM facts WHERE semantic_run_id IS NOT NULL"
+        ).fetchone()["count"]
+        assert fact_count == 0
         assert verify_chain(conn, blobs_root=db_path.parent / "blobs") == (True, None, None)
     finally:
         conn.close()

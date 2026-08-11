@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from evidence_core import db as db_module
 from app.llm import due_date_to_millis
 from app.semantic_llm import SEMANTIC_PARSER_VERSION
-from evidence_core.db import init_db
+from evidence_core.db import get_schema_version, init_db
 from evidence_core.extraction_store import create_extraction
 from evidence_core.semantic_store import (
     ProtectedFactError,
@@ -22,9 +23,15 @@ from evidence_core.semantic_store import (
     create_submission,
     correct_relative_due_dates_by_user,
     correct_fact_by_user,
+    create_context_assembly_run,
+    create_context_group_review,
+    create_extraction_speaker_review,
     get_effective_source_hint,
+    get_latest_context_assembly_run,
+    get_latest_context_group_review,
     get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
+    get_latest_extraction_speaker_review,
     get_semantic_run,
     get_latest_semantic_run_for_evidence,
     get_latest_source_review,
@@ -33,8 +40,10 @@ from evidence_core.semantic_store import (
     list_interpretations_for_semantic_run,
     mark_event_change_run_failed,
     mark_event_match_run_failed,
+    mark_context_assembly_run_failed,
     mark_semantic_run_failed,
     mark_semantic_run_succeeded,
+    persist_context_assembly_run_result,
     persist_event_change_run_result,
     persist_event_match_run_result,
     persist_semantic_run_result,
@@ -327,6 +336,177 @@ def test_create_semantic_run_supports_single_and_multiple_inputs(db_file, blobs_
         },
     ]
     assert loaded == created
+
+
+def test_v11_structured_payload_and_speaker_review_round_trip(db_file, blobs_root):
+    conn = init_db(db_file)
+    evidence = append_evidence(
+        conn,
+        blobs_root=blobs_root,
+        media_type="image",
+        payload=b"fake-image",
+        captured_at=1,
+        occurred_at=1,
+        source_hint="微信-单聊",
+        kind="reference",
+        evidence_id="ev-1",
+    )
+
+    extraction = create_extraction(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id="ext-1",
+        origin="machine",
+        provider="doubao-ark",
+        model="seed-vision",
+        transcript="[message 1][left_account] 今天先这样",
+        observations=[{"kind": "timestamp", "content": "2026-08-09 19:21", "confidence": 0.9}],
+        warnings=[],
+        structured_payload={
+            "payload_version": "1.0",
+            "conversation_type": "direct_chat",
+            "participants": [
+                {"speaker_ref": "left_account", "side": "left", "display_name": None},
+                {"speaker_ref": "right_account", "side": "right", "display_name": None},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "left_account",
+                    "side": "left",
+                    "text": "今天先这样",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                }
+            ],
+            "system_events": [{"type": "message_recalled", "visible_text": "撤回了一条消息", "actor_display_name": "张三"}],
+        },
+        created_at=10,
+    )
+    review = create_extraction_speaker_review(
+        conn,
+        evidence_id=evidence["evidence_id"],
+        extraction_id=extraction["extraction_id"],
+        status="provided",
+        labels={"left_account": "甲方", "right_account": "乙方"},
+        review_id="sprev-1",
+        created_at=11,
+    )
+
+    latest_extraction = conn.execute(
+        "SELECT structured_payload FROM evidence_extractions WHERE extraction_id = ?",
+        (extraction["extraction_id"],),
+    ).fetchone()
+
+    assert latest_extraction["structured_payload"] is not None
+    assert extraction["structured_payload"]["messages"][0]["speaker_ref"] == "left_account"
+    assert get_latest_extraction_speaker_review(conn, evidence["evidence_id"])["review_id"] == "sprev-1"
+    assert review["labels"] == {"left_account": "甲方", "right_account": "乙方"}
+
+
+def test_v11_context_assembly_and_semantic_run_provenance(db_file, blobs_root):
+    conn = init_db(db_file)
+    ev1 = _append_text(conn, blobs_root, evidence_id="ev-1", text="一", captured_at=1)
+    ev2 = _append_text(conn, blobs_root, evidence_id="ev-2", text="二", captured_at=2)
+    submission = create_submission(
+        conn,
+        submission_id="sub-1",
+        created_at=10,
+        source_hint="飞书-项目群",
+        evidence_ids=[ev1["evidence_id"], ev2["evidence_id"]],
+    )
+
+    assembly_run = create_context_assembly_run(
+        conn,
+        submission_id=submission["submission_id"],
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        assembler_version="1.0",
+        assembly_run_id="arun-1",
+        created_at=11,
+    )
+    persisted_assembly = persist_context_assembly_run_result(
+        conn,
+        assembly_run_id=assembly_run["assembly_run_id"],
+        result={
+            "groups": [
+                {
+                    "group_key": "group-1",
+                    "evidence_ids": ["ev-1", "ev-2"],
+                    "analysis_order": ["ev-2", "ev-1"],
+                    "relation": "continuation",
+                    "confidence": 0.91,
+                }
+            ],
+            "ambiguities": [],
+        },
+        completed_at=12,
+    )
+    review = create_context_group_review(
+        conn,
+        assembly_run_id=assembly_run["assembly_run_id"],
+        group_key="group-1",
+        review_status="accepted",
+        decision={"analysis_order": ["ev-2", "ev-1"]},
+        review_id="cgr-1",
+        created_at=13,
+    )
+    semantic_run = create_semantic_run(
+        conn,
+        semantic_run_id="srun-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        parser_version=SEMANTIC_PARSER_VERSION,
+        context_group_key="group-1",
+        context_assembly_run_id=assembly_run["assembly_run_id"],
+        inputs=[
+            {"evidence_id": ev2["evidence_id"], "position": 0},
+            {"evidence_id": ev1["evidence_id"], "position": 1},
+        ],
+        created_at=14,
+    )
+
+    loaded_run = get_semantic_run(conn, "srun-1")
+    assert persisted_assembly["status"] == "succeeded"
+    assert get_latest_context_assembly_run(conn, submission["submission_id"])["assembly_run_id"] == "arun-1"
+    assert get_latest_context_group_review(conn, assembly_run["assembly_run_id"])["review_id"] == "cgr-1"
+    assert review["review_status"] == "accepted"
+    assert loaded_run["context_group_key"] == "group-1"
+    assert loaded_run["context_assembly_run_id"] == "arun-1"
+
+
+def test_v10_to_v11_migration_adds_structured_payload_and_context_tables(tmp_path, monkeypatch):
+    db_file = tmp_path / "workchain.db"
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 10)
+    conn = init_db(db_file)
+    conn.close()
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 11)
+    migrated = init_db(db_file)
+    try:
+        version = get_schema_version(migrated)
+        extraction_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(evidence_extractions)").fetchall()
+        }
+        semantic_run_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(semantic_runs)").fetchall()
+        }
+        table_names = {
+            row["name"]
+            for row in migrated.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+    finally:
+        migrated.close()
+
+    assert version == 11
+    assert "structured_payload" in extraction_columns
+    assert "context_group_key" in semantic_run_columns
+    assert "context_assembly_run_id" in semantic_run_columns
+    assert {"extraction_speaker_reviews", "context_assembly_runs", "context_group_reviews"} <= table_names
 
 
 def test_create_semantic_run_rejects_cross_evidence_extraction_and_rolls_back(db_file, blobs_root):

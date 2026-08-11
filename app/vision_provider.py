@@ -881,7 +881,7 @@ def _build_structured_chat_result(
     payload: dict[str, Any],
     *,
     source_hint: str | None = None,
-) -> tuple[str | None, list[dict[str, Any]], list[str]] | None:
+) -> tuple[str | None, list[dict[str, Any]], list[str], dict[str, Any]] | None:
     participants = _normalize_participant_rows(payload)
     messages, message_warnings = _normalize_message_rows(payload)
     warnings = normalize_warnings(payload.get("warnings"))
@@ -1146,7 +1146,18 @@ def _build_structured_chat_result(
     )
 
     transcript = "\n".join(line_items).strip() or None
-    return transcript, observations, warnings
+    structured_payload = {
+        "payload_version": "1.0",
+        "observed_platform": observed_platform,
+        "declared_platform": declared_platform,
+        "source_consistency": _source_consistency(declared_platform, observed_platform),
+        "conversation_type": conversation_type,
+        "chat_header": chat_header,
+        "participants": canonical_participants,
+        "messages": messages,
+        "system_events": system_events,
+    }
+    return transcript, observations, warnings, structured_payload
 
 
 def _empty_response_shape() -> dict[str, Any]:
@@ -1548,13 +1559,14 @@ def _normalize_visual_result(payload: Any, *, source_hint: str | None = None) ->
         return None
     structured_chat = _build_structured_chat_result(payload, source_hint=source_hint)
     if structured_chat is not None:
-        transcript, observations, warnings = structured_chat
+        transcript, observations, warnings, structured_payload = structured_chat
         return build_extraction_result(
             transcript=transcript,
             observations=observations,
             provider=ARK_PROVIDER_NAME,
             model=get_ark_vision_model(),
             warnings=warnings,
+            structured_payload=structured_payload,
         )
     observed_platform = _normalize_observed_platform(payload)
     platform_confidence = _normalize_platform_confidence(payload)
@@ -1571,6 +1583,7 @@ def _normalize_visual_result(payload: Any, *, source_hint: str | None = None) ->
         provider=ARK_PROVIDER_NAME,
         model=get_ark_vision_model(),
         warnings=payload.get("warnings"),
+        structured_payload=None,
     )
 
 

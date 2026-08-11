@@ -25,7 +25,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from app import change_detector, event_matcher, llm, ocr, semantic_llm, vision_provider
+from app import change_detector, context_assembler, event_matcher, llm, ocr, semantic_llm, semantic_projection, vision_provider
 from app.ai_provider import (
     build_text_config_diagnostic,
     diagnose_deepseek_text_preflight,
@@ -61,6 +61,9 @@ from evidence_core.extraction_store import create_extraction, get_latest_extract
 from evidence_core.semantic_store import (
     ProtectedFactError,
     SemanticStoreError,
+    create_context_assembly_run,
+    create_context_group_review,
+    create_extraction_speaker_review,
     create_source_review,
     create_submission,
     create_event_change_run,
@@ -72,6 +75,9 @@ from evidence_core.semantic_store import (
     get_latest_event_change_run_for_event,
     get_latest_event_match_for_evidence,
     get_latest_event_match_for_semantic_run,
+    get_latest_context_assembly_run,
+    get_latest_context_group_review,
+    get_latest_extraction_speaker_review,
     get_latest_semantic_run_for_evidence,
     get_latest_source_review,
     list_event_candidates,
@@ -79,7 +85,9 @@ from evidence_core.semantic_store import (
     list_interpretations_for_semantic_run,
     mark_event_change_run_failed,
     mark_event_match_run_failed,
+    mark_context_assembly_run_failed,
     mark_semantic_run_failed,
+    persist_context_assembly_run_result,
     persist_event_change_run_result,
     persist_event_match_run_result,
     persist_semantic_run_result,
@@ -111,6 +119,8 @@ PARSE_STATUS_CLARIFICATION_REQUIRED = "clarification_required"
 SOURCE_GATE_PLATFORM_CONFIDENCE_THRESHOLD = 0.75
 CLARIFICATION_REASON_SOURCE_CONTEXT = "source_context"
 CLARIFICATION_REASON_TEMPORAL_CONTEXT = "temporal_context"
+CLARIFICATION_REASON_SEMANTIC_CONTEXT = "semantic_context"
+CONTEXT_REVIEW_PROMPT = "这份记录在 AI 整理前还需要补充一些上下文。"
 TEMPORAL_GATE_PROMPT = "这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。"
 _TEMPORAL_RELATIVE_TOKENS = (
     "今天",
@@ -164,6 +174,8 @@ def _parse_status_label_with_reason(status: str | None, clarification_reason: st
     if status == PARSE_STATUS_CLARIFICATION_REQUIRED:
         if clarification_reason == CLARIFICATION_REASON_TEMPORAL_CONTEXT:
             return "等待补充记录日期"
+        if clarification_reason == CLARIFICATION_REASON_SEMANTIC_CONTEXT:
+            return "等待补充整理上下文"
         return "等待核实信息来源"
     return _parse_status_label(status)
 
@@ -637,6 +649,23 @@ def _get_semantic_anchor_date(conn: sqlite3.Connection, evidence_id: str) -> str
     return _get_meta_value(conn, _semantic_anchor_date_key(evidence_id))
 
 
+def _resolved_semantic_anchor_date(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction: dict[str, Any] | None,
+) -> str | None:
+    explicit_anchor = _normalize_record_date_input(_get_semantic_anchor_date(conn, evidence_id))
+    if explicit_anchor is not None:
+        return explicit_anchor
+    if extraction is None:
+        return None
+    return semantic_llm.infer_reliable_anchor_date(
+        extraction.get("transcript"),
+        observations=extraction.get("observations"),
+    )
+
+
 def _get_semantic_anchor_source(conn: sqlite3.Connection, evidence_id: str) -> str | None:
     return _get_meta_value(conn, _semantic_anchor_source_key(evidence_id))
 
@@ -663,6 +692,7 @@ def _record_machine_extraction(
     provider: str,
     model: str | None,
     warnings: list[str] | None = None,
+    structured_payload: dict[str, Any] | None = None,
     created_at: int | None = None,
 ) -> None:
     create_extraction(
@@ -674,8 +704,329 @@ def _record_machine_extraction(
         transcript=transcript,
         observations=observations or [],
         warnings=warnings or [],
+        structured_payload=structured_payload,
         created_at=created_at,
     )
+
+
+def _list_submission_evidence(conn: sqlite3.Connection, submission_id: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT se.submission_id, se.evidence_id, se.position, e.media_type
+        FROM submission_evidence se
+        JOIN evidence e ON e.evidence_id = se.evidence_id
+        WHERE se.submission_id = ?
+        ORDER BY se.position ASC, se.evidence_id ASC
+        """,
+        (submission_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _submission_for_evidence(conn: sqlite3.Connection, evidence_id: str) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT s.submission_id, s.created_at, s.source_hint
+        FROM submissions s
+        JOIN submission_evidence se ON se.submission_id = s.submission_id
+        WHERE se.evidence_id = ?
+        """,
+        (evidence_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result["evidence"] = _list_submission_evidence(conn, row["submission_id"])
+    return result
+
+
+def _multi_image_submission_id_for_evidence(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+) -> str | None:
+    submission = _submission_for_evidence(conn, evidence_id)
+    if submission is None:
+        return None
+    image_items = [item for item in submission["evidence"] if item["media_type"] == "image"]
+    if len(image_items) <= 1:
+        return None
+    return submission["submission_id"]
+
+
+def _build_image_semantic_projection(extraction: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(extraction, dict):
+        return None
+    return semantic_projection.build_semantic_projection(
+        transcript=extraction.get("transcript"),
+        observations=extraction.get("observations"),
+        structured_payload=extraction.get("structured_payload"),
+    )
+
+
+def _speaker_review_labels(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction_id: str | None,
+) -> dict[str, str]:
+    if extraction_id is None:
+        return {}
+    review = get_latest_extraction_speaker_review(conn, evidence_id, extraction_id=extraction_id)
+    if review is None:
+        return {}
+    labels = review.get("labels")
+    if not isinstance(labels, dict):
+        return {}
+    return {
+        key: value
+        for key, value in labels.items()
+        if isinstance(key, str) and isinstance(value, str) and key.strip() and value.strip()
+    }
+
+
+def _speaker_context_state(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction: dict[str, Any] | None,
+) -> dict[str, Any]:
+    projection = _build_image_semantic_projection(extraction)
+    extraction_id = None if extraction is None else extraction.get("extraction_id")
+    review = None if extraction_id is None else get_latest_extraction_speaker_review(
+        conn,
+        evidence_id,
+        extraction_id=extraction_id,
+    )
+    labels = _speaker_review_labels(conn, evidence_id=evidence_id, extraction_id=extraction_id)
+    missing_refs = []
+    if not (review is not None and review.get("status") == "skipped"):
+        for speaker_ref in (projection or {}).get("missing_speaker_refs", []):
+            if speaker_ref not in labels:
+                missing_refs.append(speaker_ref)
+    return {
+        "projection": projection,
+        "review": review,
+        "labels": labels,
+        "missing_refs": missing_refs,
+        "requires_clarification": bool(missing_refs),
+    }
+
+
+def _speaker_ref_label(speaker_ref: str) -> str:
+    return {
+        "left_account": "左侧发言者称呼",
+        "right_account": "右侧发言者称呼",
+    }.get(speaker_ref, speaker_ref)
+
+
+def _submission_context_assembly_state(
+    conn: sqlite3.Connection,
+    *,
+    submission_id: str,
+) -> dict[str, Any] | None:
+    submission_items = _list_submission_evidence(conn, submission_id)
+    image_items = [item for item in submission_items if item["media_type"] == "image"]
+    if len(image_items) <= 1:
+        return None
+    latest_run = get_latest_context_assembly_run(conn, submission_id, status="succeeded")
+    if latest_run is None:
+        return None
+    result = latest_run.get("result")
+    if not isinstance(result, dict):
+        return None
+    freshness_cutoff = latest_run.get("completed_at") or latest_run.get("created_at") or 0
+    submission_evidence_ids = {item["evidence_id"] for item in image_items}
+    for item in image_items:
+        extraction = get_latest_extraction(conn, item["evidence_id"])
+        if extraction is None:
+            return None
+        extraction_created_at = extraction.get("created_at") or 0
+        if extraction_created_at > freshness_cutoff:
+            return None
+
+    normalized_groups: list[dict[str, Any]] = []
+    for fallback_index, raw_group in enumerate(result.get("groups", []), start=1):
+        if not isinstance(raw_group, dict):
+            continue
+        group_key = str(raw_group.get("group_key") or f"group_{fallback_index}").strip()
+        evidence_ids = [
+            evidence_id
+            for evidence_id in raw_group.get("evidence_ids", [])
+            if isinstance(evidence_id, str) and evidence_id in submission_evidence_ids
+        ]
+        if not evidence_ids:
+            continue
+        analysis_order = [
+            evidence_id
+            for evidence_id in raw_group.get("analysis_order", [])
+            if isinstance(evidence_id, str) and evidence_id in evidence_ids
+        ]
+        if not analysis_order:
+            analysis_order = list(evidence_ids)
+        latest_review = get_latest_context_group_review(
+            conn,
+            latest_run["assembly_run_id"],
+            group_key=group_key,
+        )
+        normalized_groups.append(
+            {
+                "group_key": group_key,
+                "evidence_ids": evidence_ids,
+                "analysis_order": analysis_order,
+                "relation": str(raw_group.get("relation") or "standalone").strip() or "standalone",
+                "confidence": raw_group.get("confidence"),
+                "review_status": None if latest_review is None else latest_review.get("review_status"),
+            }
+        )
+
+    if not normalized_groups:
+        return None
+    ambiguities = [
+        item.strip()
+        for item in result.get("ambiguities", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    pending_groups = [
+        group
+        for group in normalized_groups
+        if group.get("review_status") != "accepted"
+    ]
+    return {
+        "submission_id": submission_id,
+        "assembly_run_id": latest_run["assembly_run_id"],
+        "groups": normalized_groups,
+        "pending_groups": pending_groups,
+        "ambiguities": ambiguities,
+        "review_required": bool(pending_groups),
+    }
+
+
+def _semantic_context_detail(
+    *,
+    temporal_gate_state: dict[str, Any] | None,
+    speaker_state: dict[str, Any],
+    assembly_state: dict[str, Any] | None = None,
+) -> str:
+    parts: list[str] = []
+    if assembly_state is not None and assembly_state.get("review_required"):
+        if assembly_state.get("ambiguities"):
+            parts.append("多图上下文关联仍有不确定点，需要先确认当前分组与阅读顺序。")
+        else:
+            parts.append("多图上下文分组需要先确认后，系统才会开始 AI 整理。")
+    if temporal_gate_state is not None and temporal_gate_state.get("requires_clarification"):
+        matched_tokens = temporal_gate_state.get("matched_tokens") or []
+        if matched_tokens:
+            parts.append(f"需要补充记录日期（例如「{matched_tokens[0]}」这类相对时间）。")
+        else:
+            parts.append("需要补充记录日期。")
+    if speaker_state.get("missing_refs"):
+        labels = "、".join(_speaker_ref_label(item) for item in speaker_state["missing_refs"])
+        parts.append(f"{labels}当前缺失，不填写也可以继续。")
+    if not parts:
+        return CONTEXT_REVIEW_PROMPT
+    return " ".join(parts)
+
+
+def _apply_semantic_context_clarification(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    temporal_gate_state: dict[str, Any] | None,
+    speaker_state: dict[str, Any],
+) -> None:
+    _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+    if temporal_gate_state is not None and temporal_gate_state.get("requires_clarification") and not speaker_state.get("requires_clarification"):
+        _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_TEMPORAL_CONTEXT)
+    else:
+        _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_SEMANTIC_CONTEXT)
+    _set_parse_detail(
+        conn,
+        evidence_id,
+        _semantic_context_detail(
+            temporal_gate_state=temporal_gate_state,
+            speaker_state=speaker_state,
+            assembly_state=None,
+        ),
+    )
+
+
+def _current_semantic_context_payload(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    parse_status: str | None = None,
+) -> dict[str, Any] | None:
+    extraction = get_latest_extraction(conn, evidence_id)
+    if extraction is None:
+        return None
+    submission_id = _multi_image_submission_id_for_evidence(conn, evidence_id)
+    assembly_state = None if submission_id is None else _submission_context_assembly_state(
+        conn,
+        submission_id=submission_id,
+    )
+    temporal_gate_state = _temporal_gate_state(
+        conn,
+        evidence_id=evidence_id,
+        extraction=extraction,
+        anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+    )
+    speaker_state = _speaker_context_state(
+        conn,
+        evidence_id=evidence_id,
+        extraction=extraction,
+    )
+    requires_clarification = bool(temporal_gate_state.get("requires_clarification")) or bool(
+        speaker_state.get("requires_clarification")
+    ) or bool(assembly_state is not None and assembly_state.get("review_required"))
+    if not requires_clarification:
+        return None
+    if parse_status is None:
+        parse_status = _get_parse_status(conn, evidence_id)
+    reviewable = parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_")
+    return {
+        "requires_clarification": True,
+        "reviewable": reviewable,
+        "title": "这份记录需要先补充整理上下文",
+        "prompt": CONTEXT_REVIEW_PROMPT,
+        "detail": _semantic_context_detail(
+            temporal_gate_state=temporal_gate_state,
+            speaker_state=speaker_state,
+            assembly_state=assembly_state,
+        ),
+        "temporal_required": bool(temporal_gate_state.get("requires_clarification")),
+        "matched_tokens": temporal_gate_state.get("matched_tokens") or [],
+        "speaker_context_required": bool(speaker_state.get("requires_clarification")),
+        "speaker_fields": [
+            {
+                "speaker_ref": speaker_ref,
+                "label": _speaker_ref_label(speaker_ref),
+                "value": speaker_state["labels"].get(speaker_ref, ""),
+            }
+            for speaker_ref in speaker_state.get("missing_refs", [])
+        ],
+        "skip_allowed": True,
+        "latest_review_status": None if speaker_state.get("review") is None else speaker_state["review"].get("status"),
+        "assembly_review_required": bool(assembly_state is not None and assembly_state.get("review_required")),
+        "assembly_review": None if assembly_state is None else {
+            "submission_id": assembly_state["submission_id"],
+            "assembly_run_id": assembly_state["assembly_run_id"],
+            "ambiguities": assembly_state["ambiguities"],
+            "groups": [
+                {
+                    **group,
+                    "includes_current_evidence": evidence_id in group["evidence_ids"],
+                }
+                for group in assembly_state["groups"]
+            ],
+            "pending_groups": [
+                {
+                    **group,
+                    "includes_current_evidence": evidence_id in group["evidence_ids"],
+                }
+                for group in assembly_state["pending_groups"]
+            ],
+        },
+    }
 
 
 def _record_user_extraction(
@@ -1100,6 +1451,322 @@ def _build_relative_due_updates(
     return updates
 
 
+def _semantic_group_input(
+    conn: sqlite3.Connection,
+    *,
+    evidence_id: str,
+    extraction: dict[str, Any],
+    position: int,
+) -> dict[str, Any] | None:
+    speaker_state = _speaker_context_state(
+        conn,
+        evidence_id=evidence_id,
+        extraction=extraction,
+    )
+    projection = speaker_state.get("projection")
+    if projection is None:
+        return None
+    projection_text = semantic_projection.serialize_semantic_projection(
+        projection,
+        evidence_id=evidence_id,
+        speaker_labels=speaker_state.get("labels"),
+    )
+    if projection_text is None:
+        return None
+    return {
+        "evidence_id": evidence_id,
+        "extraction_id": extraction["extraction_id"],
+        "position": position,
+        "projection_text": projection_text,
+        "anchor_date": _resolved_semantic_anchor_date(
+            conn,
+            evidence_id=evidence_id,
+            extraction=extraction,
+        ),
+        "source_hint": get_effective_source_hint(conn, evidence_id),
+    }
+
+
+def _build_semantic_group_text(inputs: list[dict[str, Any]]) -> str | None:
+    sections: list[str] = []
+    for item in inputs:
+        projection_text = item.get("projection_text")
+        if not isinstance(projection_text, str) or not projection_text.strip():
+            continue
+        anchor_date = _normalize_record_date_input(item.get("anchor_date"))
+        if anchor_date is not None:
+            sections.append(f"[record_date evidence={item['evidence_id']}] {anchor_date}")
+        sections.append(projection_text.strip())
+    rendered = "\n\n".join(sections).strip()
+    return rendered or None
+
+
+def _semantic_group_anchor_date(inputs: list[dict[str, Any]]) -> str | None:
+    anchor_dates = {
+        anchor_date
+        for anchor_date in (_normalize_record_date_input(item.get("anchor_date")) for item in inputs)
+        if anchor_date is not None
+    }
+    if len(anchor_dates) != 1:
+        return None
+    return next(iter(anchor_dates))
+
+
+def _run_semantic_parse_for_group(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    *,
+    inputs: list[dict[str, Any]],
+    context_group_key: str | None = None,
+    context_assembly_run_id: str | None = None,
+) -> None:
+    if not inputs:
+        return
+    primary_evidence_id = inputs[0]["evidence_id"]
+    semantic_text = _build_semantic_group_text(inputs)
+    glossary = get_settings(sandbox_db_path).get("glossary", [])
+    anchor_date = _semantic_group_anchor_date(inputs)
+    effective_source_hint = None
+    source_hints = [item.get("source_hint") for item in inputs if isinstance(item.get("source_hint"), str)]
+    if len(set(source_hints)) == 1 and source_hints:
+        effective_source_hint = source_hints[0]
+
+    conn = init_db(sandbox_db_path)
+    semantic_run_id: str | None = None
+    previous_run = None
+    try:
+        previous_run = get_latest_semantic_run_for_evidence(conn, primary_evidence_id)
+        semantic_run = create_semantic_run(
+            conn,
+            provider="deepseek",
+            model=get_text_model(),
+            parser_version=semantic_llm.SEMANTIC_PARSER_VERSION,
+            anchor_date=anchor_date,
+            supersedes_run_id=None if previous_run is None else previous_run["semantic_run_id"],
+            context_group_key=context_group_key,
+            context_assembly_run_id=context_assembly_run_id,
+            inputs=[
+                {
+                    "evidence_id": item["evidence_id"],
+                    "extraction_id": item["extraction_id"],
+                    "position": item["position"],
+                }
+                for item in inputs
+            ],
+        )
+        semantic_run_id = semantic_run["semantic_run_id"]
+    finally:
+        conn.close()
+
+    should_call_model = semantic_text is not None
+    if not should_call_model:
+        conn = init_db(sandbox_db_path)
+        try:
+            fact_payloads = _semantic_fact_payloads(
+                conn,
+                evidence_ids=[item["evidence_id"] for item in inputs],
+                semantics={"facts": [], "interpretations": [], "ambiguities": []},
+                glossary=glossary,
+                created_at=int(time.time() * 1000),
+            )
+            interpretation_payloads = _semantic_interpretation_payloads(
+                [item["evidence_id"] for item in inputs],
+                {"facts": [], "interpretations": [], "ambiguities": []},
+                created_at=int(time.time() * 1000),
+            )
+            persist_semantic_run_result(
+                conn,
+                semantic_run_id=semantic_run_id,
+                facts=fact_payloads,
+                interpretations=interpretation_payloads,
+            )
+            for item in inputs:
+                _clear_clarification_state(conn, item["evidence_id"])
+                _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_DONE)
+                _set_parse_detail(conn, item["evidence_id"], "")
+        finally:
+            conn.close()
+        return
+
+    if not get_text_api_key():
+        diagnostic = build_text_config_diagnostic()
+        conn = init_db(sandbox_db_path)
+        try:
+            if semantic_run_id is not None:
+                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
+                mark_semantic_run_failed(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    failure_type=_semantic_failure_type_from_diagnostic(diagnostic),
+                )
+            for item in inputs:
+                _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_FAILED)
+                _set_parse_detail(conn, item["evidence_id"], "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    allowed, reason = _consume_parse_budget(sandbox_db_path, global_meta_db_path)
+    if not allowed:
+        conn = init_db(sandbox_db_path)
+        try:
+            if semantic_run_id is not None:
+                mark_semantic_run_failed(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    failure_type="budget_exhausted",
+                )
+            for item in inputs:
+                _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_FAILED)
+                _set_parse_detail(conn, item["evidence_id"], reason or "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    diagnostic = None
+    try:
+        parsed = semantic_llm.extract_semantics(
+            _llm_input_text(semantic_text),
+            observations=[],
+            anchor_date=anchor_date,
+            glossary=glossary,
+            source_hint=effective_source_hint,
+        )
+        diagnostic = semantic_llm.pop_last_extract_diagnostic()
+    except Exception as exc:
+        diagnostic = semantic_llm.pop_last_extract_diagnostic()
+        if diagnostic is None:
+            is_timeout = isinstance(exc, httpx.TimeoutException)
+            diagnostic = {
+                "success": False,
+                "stage": "timeout" if is_timeout else "network",
+                "status_code": None,
+                "error_code": "timeout" if is_timeout else "request_error",
+                "error_type": type(exc).__name__,
+                "safe_message": "DeepSeek request failed before a safe provider diagnostic was available",
+                "request_id": None,
+                "latency_ms": 0,
+                "timeout_seconds": get_text_timeout_seconds(),
+                "thinking_mode": "disabled",
+                "model": get_text_model(),
+            }
+        parsed = None
+    if parsed is None:
+        failure_type = _semantic_failure_type_from_diagnostic(diagnostic)
+        conn = init_db(sandbox_db_path)
+        try:
+            if semantic_run_id is not None:
+                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
+                mark_semantic_run_failed(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    failure_type=failure_type,
+                )
+            for item in inputs:
+                _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_FAILED)
+                _set_parse_detail(conn, item["evidence_id"], "解析暂不可用,记录已完整保存")
+        finally:
+            conn.close()
+        return
+
+    conn = init_db(sandbox_db_path)
+    try:
+        if semantic_run_id is not None:
+            _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
+        fact_payloads = _semantic_fact_payloads(
+            conn,
+            evidence_ids=[item["evidence_id"] for item in inputs],
+            semantics=parsed,
+            glossary=glossary,
+            created_at=int(time.time() * 1000),
+        )
+        interpretation_payloads = _semantic_interpretation_payloads(
+            [item["evidence_id"] for item in inputs],
+            parsed,
+            created_at=int(time.time() * 1000),
+        )
+        persisted = persist_semantic_run_result(
+            conn,
+            semantic_run_id=semantic_run_id,
+            facts=fact_payloads,
+            interpretations=interpretation_payloads,
+        )
+        if semantic_run_id is not None and persisted["facts"]:
+            previous_match_run = get_latest_event_match_for_evidence(conn, primary_evidence_id)
+            event_match_run = create_event_match_run(
+                conn,
+                semantic_run_id=semantic_run_id,
+                provider="deepseek",
+                model=get_text_model(),
+                matcher_version=event_matcher.EVENT_MATCHER_VERSION,
+                supersedes_run_id=None if previous_match_run is None else previous_match_run["event_match_run_id"],
+            )
+            try:
+                normalized_match = event_matcher.match_events(
+                    _event_matcher_fact_payload(conn, persisted["facts"]),
+                    existing_events=list_event_candidates(conn),
+                )
+                if normalized_match is None:
+                    raise ValueError("matcher returned no normalized result")
+                persist_event_match_run_result(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    semantic_run_id=semantic_run_id,
+                    routing_mode=event_matcher.decide_assignment_mode(normalized_match),
+                    normalized_match=normalized_match,
+                    facts=persisted["facts"],
+                )
+                affected_event_rows = conn.execute(
+                    """
+                    SELECT DISTINCT event_id
+                    FROM facts
+                    WHERE semantic_run_id = ?
+                      AND event_id IS NOT NULL
+                    ORDER BY event_id ASC
+                    """,
+                    (semantic_run_id,),
+                ).fetchall()
+                for row in affected_event_rows:
+                    _maybe_run_event_change_detection(conn, row["event_id"])
+            except ProtectedFactError:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="protected_fact",
+                )
+            except ValueError:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="provider_invalid_response",
+                )
+            except Exception:
+                mark_event_match_run_failed(
+                    conn,
+                    event_match_run_id=event_match_run["event_match_run_id"],
+                    failure_type="persistence_error",
+                )
+        for item in inputs:
+            _clear_clarification_state(conn, item["evidence_id"])
+            _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_DONE)
+            _set_parse_detail(conn, item["evidence_id"], "")
+    except Exception:
+        try:
+            if semantic_run_id is not None:
+                mark_semantic_run_failed(
+                    conn,
+                    semantic_run_id=semantic_run_id,
+                    failure_type="persistence_error",
+                )
+        except Exception:
+            pass
+        for item in inputs:
+            _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_FAILED)
+            _set_parse_detail(conn, item["evidence_id"], "解析暂不可用,记录已完整保存")
+    finally:
+        conn.close()
+
+
 def _person_glossary_map(glossary: list[dict[str, Any]] | None) -> dict[str, str]:
     mapping: dict[str, str] = {}
     for item in glossary or []:
@@ -1220,7 +1887,7 @@ def _semantic_actor_roles(
 def _semantic_fact_payloads(
     conn: sqlite3.Connection,
     *,
-    evidence_id: str,
+    evidence_ids: list[str],
     semantics: dict[str, Any],
     glossary: list[dict[str, Any]] | None,
     created_at: int,
@@ -1233,7 +1900,7 @@ def _semantic_fact_payloads(
             {
                 "fact_type": fact.get("fact_type"),
                 "content": fact.get("content"),
-                "evidence_ids": [evidence_id],
+                "evidence_ids": list(evidence_ids),
                 "occurred_at": _date_to_millis(fact.get("occurred_date")),
                 "due_at": _date_to_millis(fact.get("due_date")),
                 "due_raw": fact.get("due_raw"),
@@ -1256,7 +1923,7 @@ def _semantic_fact_payloads(
 
 
 def _semantic_interpretation_payloads(
-    evidence_id: str,
+    evidence_ids: list[str],
     semantics: dict[str, Any],
     *,
     created_at: int,
@@ -1278,7 +1945,7 @@ def _semantic_interpretation_payloads(
         if isinstance(ambiguity, str) and ambiguity.strip():
             payloads.append(
                 {
-                    "evidence_id": evidence_id,
+                    "evidence_id": evidence_ids[0] if evidence_ids else None,
                     "kind": "uncertainty",
                     "content": ambiguity.strip(),
                     "confidence": None,
@@ -2217,439 +2884,333 @@ def _final_kind(parsed: dict[str, Any], slot_requester: str | None, slot_owner: 
     return "reference"
 
 
+def _resume_semantic_pipeline_for_evidence(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    evidence_id: str,
+) -> None:
+    conn = init_db(sandbox_db_path)
+    try:
+        submission_id = _multi_image_submission_id_for_evidence(conn, evidence_id)
+    finally:
+        conn.close()
+    if submission_id is not None:
+        _run_multi_image_pipeline(
+            sandbox_db_path,
+            global_meta_db_path,
+            [],
+            submission_id=submission_id,
+        )
+        return
+    _run_parse_pipeline(
+        sandbox_db_path,
+        global_meta_db_path,
+        evidence_id,
+    )
+
+
+def _run_submission_context_pipeline(
+    sandbox_db_path: Path,
+    global_meta_db_path: Path,
+    *,
+    submission_id: str,
+) -> None:
+    conn = init_db(sandbox_db_path)
+    try:
+        submission_items = _list_submission_evidence(conn, submission_id)
+        image_items = [item for item in submission_items if item["media_type"] == "image"]
+        if not image_items:
+            return
+
+        semantic_inputs: list[dict[str, Any]] = []
+        blocked = False
+        for item in image_items:
+            evidence_id = item["evidence_id"]
+            extraction = get_latest_extraction(conn, evidence_id)
+            if extraction is None:
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
+                _set_parse_detail(conn, evidence_id, "解析缺少提取版本,记录已完整保存")
+                blocked = True
+                continue
+            source_gate_state = _source_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+            )
+            if source_gate_state["requires_clarification"]:
+                _apply_source_gate_clarification(
+                    conn,
+                    evidence_id=evidence_id,
+                    gate_state=source_gate_state,
+                )
+                blocked = True
+                continue
+            temporal_gate_state = _temporal_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+                anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+            )
+            speaker_state = _speaker_context_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+            )
+            if temporal_gate_state["requires_clarification"] or speaker_state["requires_clarification"]:
+                _apply_semantic_context_clarification(
+                    conn,
+                    evidence_id=evidence_id,
+                    temporal_gate_state=temporal_gate_state,
+                    speaker_state=speaker_state,
+                )
+                blocked = True
+                continue
+            semantic_input = _semantic_group_input(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+                position=item["position"],
+            )
+            if semantic_input is None:
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
+                _set_parse_detail(conn, evidence_id, _saved_original_detail("图片提取未产生可供语义整理的上下文"))
+                blocked = True
+                continue
+            _clear_extract_note(conn, evidence_id)
+            _clear_clarification_state(conn, evidence_id)
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+            _set_parse_detail(conn, evidence_id, "")
+            semantic_inputs.append(
+                {
+                    **semantic_input,
+                    "submission_position": item["position"],
+                }
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if blocked or not semantic_inputs:
+        return
+
+    assembly_run_id: str | None = None
+    result: dict[str, Any] | None = None
+    if len(semantic_inputs) > 1:
+        conn = init_db(sandbox_db_path)
+        try:
+            existing_assembly_state = _submission_context_assembly_state(
+                conn,
+                submission_id=submission_id,
+            )
+        finally:
+            conn.close()
+
+        if existing_assembly_state is not None:
+            if existing_assembly_state["review_required"]:
+                conn = init_db(sandbox_db_path)
+                try:
+                    for item in image_items:
+                        _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_CLARIFICATION_REQUIRED)
+                        _set_clarification_reason(conn, item["evidence_id"], CLARIFICATION_REASON_SEMANTIC_CONTEXT)
+                        _set_parse_detail(
+                            conn,
+                            item["evidence_id"],
+                            "多图上下文关联仍有不确定点，需要先确认当前分组与阅读顺序。",
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+                return
+
+            for group in existing_assembly_state["groups"]:
+                analysis_order = group.get("analysis_order") or group.get("evidence_ids") or []
+                grouped_inputs = [
+                    item
+                    for evidence_id in analysis_order
+                    for item in semantic_inputs
+                    if item["evidence_id"] == evidence_id
+                ]
+                _run_semantic_parse_for_group(
+                    sandbox_db_path,
+                    global_meta_db_path,
+                    inputs=grouped_inputs,
+                    context_group_key=group.get("group_key"),
+                    context_assembly_run_id=existing_assembly_state["assembly_run_id"],
+                )
+            return
+
+        conn = init_db(sandbox_db_path)
+        try:
+            assembly_run = create_context_assembly_run(
+                conn,
+                submission_id=submission_id,
+                provider=context_assembler.ASSEMBLER_PROVIDER,
+                model=get_text_model(),
+                assembler_version=context_assembler.ASSEMBLER_VERSION,
+            )
+            assembly_run_id = assembly_run["assembly_run_id"]
+        finally:
+            conn.close()
+
+        result, _diagnostic = context_assembler.assemble_context_groups(semantic_inputs)
+        conn = init_db(sandbox_db_path)
+        try:
+            persist_context_assembly_run_result(
+                conn,
+                assembly_run_id=assembly_run_id,
+                result=result,
+            )
+            if context_assembler.groups_require_user_review(result):
+                for group in result.get("groups", []):
+                    if not isinstance(group, dict):
+                        continue
+                    create_context_group_review(
+                        conn,
+                        assembly_run_id=assembly_run_id,
+                        group_key=group.get("group_key") or "group",
+                        review_status="needs_user_review",
+                        decision=group,
+                    )
+                    for evidence_id in group.get("evidence_ids", []):
+                        _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+                        _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_SEMANTIC_CONTEXT)
+                        _set_parse_detail(conn, evidence_id, "多图上下文关联仍有不确定点，当前不会直接开始 AI 整理。")
+                conn.commit()
+                return
+            for group in result.get("groups", []):
+                if not isinstance(group, dict):
+                    continue
+                create_context_group_review(
+                    conn,
+                    assembly_run_id=assembly_run_id,
+                    group_key=group.get("group_key") or "group",
+                    review_status="accepted",
+                    decision=group,
+                )
+            conn.commit()
+        except Exception:
+            try:
+                mark_context_assembly_run_failed(
+                    conn,
+                    assembly_run_id=assembly_run_id,
+                    failure_type="persistence_error",
+                )
+            except Exception:
+                pass
+            raise
+
+        for group in result.get("groups", []):
+            if not isinstance(group, dict):
+                continue
+            analysis_order = group.get("analysis_order") or group.get("evidence_ids") or []
+            grouped_inputs = [
+                item
+                for evidence_id in analysis_order
+                for item in semantic_inputs
+                if item["evidence_id"] == evidence_id
+            ]
+            _run_semantic_parse_for_group(
+                sandbox_db_path,
+                global_meta_db_path,
+                inputs=grouped_inputs,
+                context_group_key=group.get("group_key"),
+                context_assembly_run_id=assembly_run_id,
+            )
+        return
+
+    _run_semantic_parse_for_group(
+        sandbox_db_path,
+        global_meta_db_path,
+        inputs=semantic_inputs,
+    )
+
+
 def _run_parse_pipeline(
     sandbox_db_path: Path,
     global_meta_db_path: Path,
     evidence_id: str,
 ) -> None:
     conn = init_db(sandbox_db_path)
-    semantic_run_id: str | None = None
-    parse_start = time.perf_counter()
-    evidence_row = None
-    extraction = None
-    transcript = None
-    observations: list[dict[str, Any]] = []
-    glossary: list[dict[str, Any]] = []
-    anchor_date: str | None = None
-    anchor_source: str | None = None
-    effective_source_hint: str | None = None
-    temporal_gate_state: dict[str, Any] | None = None
     try:
         evidence_row = conn.execute(
-            "SELECT evidence_id FROM evidence WHERE evidence_id = ?",
+            "SELECT evidence_id, media_type FROM evidence WHERE evidence_id = ?",
             (evidence_id,),
         ).fetchone()
         extraction = get_latest_extraction(conn, evidence_id)
-        if evidence_row is not None:
-            glossary = get_settings(sandbox_db_path).get("glossary", [])
-            stored_anchor_date = _get_semantic_anchor_date(conn, evidence_id)
-            stored_anchor_source = _get_semantic_anchor_source(conn, evidence_id)
-            effective_source_hint = get_effective_source_hint(conn, evidence_id)
-        if extraction is not None:
-            transcript = extraction.get("transcript")
-            observations = extraction.get("observations") if isinstance(extraction.get("observations"), list) else []
-        if evidence_row is not None:
-            if stored_anchor_source == "user" and stored_anchor_date is not None:
-                anchor_date = stored_anchor_date
-                anchor_source = "user"
-            else:
-                anchor_date = semantic_llm.infer_reliable_anchor_date(transcript, observations=observations)
-                anchor_source = None if anchor_date is None else "content"
-                _set_semantic_anchor(conn, evidence_id, anchor_date, anchor_source)
-            temporal_gate_state = _temporal_gate_state(
-                conn,
-                evidence_id=evidence_id,
-                extraction=extraction,
-                anchor_date=anchor_date,
-            )
-    finally:
-        conn.close()
-
-    log_base = {
-        "evidence_id": evidence_id,
-        "provider": "deepseek",
-        "model": get_text_model(),
-        "input_chars": len(transcript or ""),
-        "observation_count": len(observations),
-    }
-    if evidence_row is None:
-        return
-    should_call_model = _can_run_semantic_parse(transcript, observations)
-
-    previous_run = None
-    conn = init_db(sandbox_db_path)
-    try:
-        previous_run = get_latest_semantic_run_for_evidence(conn, evidence_id)
+        if evidence_row is None:
+            return
         if extraction is None:
             _clear_clarification_state(conn, evidence_id)
             _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
             _set_parse_detail(conn, evidence_id, "解析缺少提取版本,记录已完整保存")
             return
-        if temporal_gate_state is not None and temporal_gate_state["requires_clarification"]:
-            _apply_temporal_gate_clarification(
+        if evidence_row["media_type"] == "image":
+            source_gate_state = _source_gate_state(
                 conn,
                 evidence_id=evidence_id,
-                gate_state=temporal_gate_state,
+                extraction=extraction,
             )
-            return
-        semantic_run = create_semantic_run(
-            conn,
-            provider="deepseek",
-            model=get_text_model(),
-            parser_version=semantic_llm.SEMANTIC_PARSER_VERSION,
-            anchor_date=anchor_date,
-            supersedes_run_id=None if previous_run is None else previous_run["semantic_run_id"],
-            inputs=[
-                {
-                    "evidence_id": evidence_id,
-                    "extraction_id": extraction["extraction_id"],
-                    "position": 0,
-                }
-            ],
-        )
-        semantic_run_id = semantic_run["semantic_run_id"]
-    finally:
-        conn.close()
-
-    _emit_structured_log(
-        "semantic_parse",
-        {
-            **log_base,
-            "semantic_run_id": semantic_run_id,
-            "status": "started",
-            "latency_ms": 0,
-            "parse_success": False,
-            "failure_type": None,
-        },
-    )
-    if not should_call_model:
-        conn = init_db(sandbox_db_path)
-        try:
-            if semantic_run_id is not None:
-                _set_semantic_diagnostic(
+            if source_gate_state["requires_clarification"]:
+                _apply_source_gate_clarification(
                     conn,
-                    semantic_run_id,
-                    {
-                        "success": True,
-                        "stage": "success",
-                        "status_code": None,
-                        "error_code": None,
-                        "error_type": None,
-                        "safe_message": "No transcript or visual observations; semantic parse short-circuited",
-                        "request_id": None,
-                        "latency_ms": 0,
-                        "timeout_seconds": get_text_timeout_seconds(),
-                        "thinking_mode": "disabled",
-                        "model": get_text_model(),
-                    },
+                    evidence_id=evidence_id,
+                    gate_state=source_gate_state,
                 )
-            fact_payloads = _semantic_fact_payloads(
+                return
+            temporal_gate_state = _temporal_gate_state(
                 conn,
                 evidence_id=evidence_id,
-                semantics={"facts": [], "interpretations": [], "ambiguities": []},
-                glossary=glossary,
-                created_at=int(time.time() * 1000),
+                extraction=extraction,
+                anchor_date=_get_semantic_anchor_date(conn, evidence_id),
             )
-            interpretation_payloads = _semantic_interpretation_payloads(
-                evidence_id,
-                {"facts": [], "interpretations": [], "ambiguities": []},
-                created_at=int(time.time() * 1000),
-            )
-            persist_semantic_run_result(
+            speaker_state = _speaker_context_state(
                 conn,
-                semantic_run_id=semantic_run_id,
-                facts=fact_payloads,
-                interpretations=interpretation_payloads,
+                evidence_id=evidence_id,
+                extraction=extraction,
             )
+            if temporal_gate_state["requires_clarification"] or speaker_state["requires_clarification"]:
+                _apply_semantic_context_clarification(
+                    conn,
+                    evidence_id=evidence_id,
+                    temporal_gate_state=temporal_gate_state,
+                    speaker_state=speaker_state,
+                )
+                return
+            semantic_input = _semantic_group_input(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+                position=0,
+            )
+            if semantic_input is None:
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_UNSUPPORTED)
+                _set_parse_detail(conn, evidence_id, _saved_original_detail("图片提取未产生可供语义整理的上下文"))
+                return
+            _clear_extract_note(conn, evidence_id)
             _clear_clarification_state(conn, evidence_id)
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
             _set_parse_detail(conn, evidence_id, "")
-        except Exception:
-            try:
-                if semantic_run_id is not None:
-                    mark_semantic_run_failed(
-                        conn,
-                        semantic_run_id=semantic_run_id,
-                        failure_type="persistence_error",
-                    )
-            except Exception:
-                pass
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
-            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
-            _emit_structured_log(
-                "semantic_parse",
-                {
-                    **log_base,
-                    "semantic_run_id": semantic_run_id,
-                    "status": "failed",
-                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                    "parse_success": False,
-                    "failure_type": "persistence_error",
-                },
-            )
+            conn.commit()
         else:
-            _emit_structured_log(
-                "semantic_parse",
-                {
-                    **log_base,
-                    "semantic_run_id": semantic_run_id,
-                    "status": "succeeded",
-                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                    "parse_success": True,
-                    "failure_type": None,
-                },
-            )
-        finally:
-            conn.close()
-        return
-
-    if not get_text_api_key():
-        diagnostic = build_text_config_diagnostic()
-        conn = init_db(sandbox_db_path)
-        try:
-            if semantic_run_id is not None:
-                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
-                try:
-                    mark_semantic_run_failed(
-                        conn,
-                        semantic_run_id=semantic_run_id,
-                        failure_type=_semantic_failure_type_from_diagnostic(diagnostic),
-                    )
-                except Exception:
-                    pass
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
-            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
-        finally:
-            conn.close()
-        _emit_structured_log(
-            "semantic_parse",
-            {
-                **log_base,
-                "semantic_run_id": semantic_run_id,
-                "status": "failed",
-                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                "parse_success": False,
-                "failure_type": _semantic_failure_type_from_diagnostic(diagnostic),
-            },
-        )
-        return
-
-    allowed, reason = _consume_parse_budget(sandbox_db_path, global_meta_db_path)
-    if not allowed:
-        conn = init_db(sandbox_db_path)
-        try:
-            if semantic_run_id is not None:
-                try:
-                    mark_semantic_run_failed(
-                        conn,
-                        semantic_run_id=semantic_run_id,
-                        failure_type="budget_exhausted",
-                    )
-                except Exception:
-                    pass
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
-            _set_parse_detail(conn, evidence_id, reason or "解析暂不可用,记录已完整保存")
-        finally:
-            conn.close()
-        _emit_structured_log(
-            "semantic_parse",
-            {
-                **log_base,
-                "semantic_run_id": semantic_run_id,
-                "status": "failed",
-                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                "parse_success": False,
-                "failure_type": "budget_exhausted",
-            },
-        )
-        return
-
-    diagnostic = None
-    try:
-        parsed = semantic_llm.extract_semantics(
-            _llm_input_text(transcript) if transcript is not None else None,
-            observations=observations,
-            anchor_date=anchor_date,
-            glossary=glossary,
-            source_hint=effective_source_hint,
-        )
-        diagnostic = semantic_llm.pop_last_extract_diagnostic()
-    except Exception as exc:
-        diagnostic = semantic_llm.pop_last_extract_diagnostic()
-        if diagnostic is None:
-            if isinstance(exc, httpx.TimeoutException):
-                diagnostic = {
-                    "success": False,
-                    "stage": "timeout",
-                    "status_code": None,
-                    "error_code": "timeout",
-                    "error_type": type(exc).__name__,
-                    "safe_message": f"DeepSeek request timed out after {get_text_timeout_seconds():g} seconds",
-                    "request_id": None,
-                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                    "timeout_seconds": get_text_timeout_seconds(),
-                    "thinking_mode": "disabled",
-                    "model": get_text_model(),
-                }
-            else:
-                diagnostic = {
-                    "success": False,
-                    "stage": "network",
-                    "status_code": None,
-                    "error_code": "request_error",
-                    "error_type": type(exc).__name__,
-                    "safe_message": "DeepSeek request failed before a safe provider diagnostic was available",
-                    "request_id": None,
-                    "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                    "timeout_seconds": get_text_timeout_seconds(),
-                    "thinking_mode": "disabled",
-                    "model": get_text_model(),
-                }
-        parsed = None
-    if parsed is None:
-        failure_type = _semantic_failure_type_from_diagnostic(diagnostic)
-        conn = init_db(sandbox_db_path)
-        try:
-            if semantic_run_id is not None:
-                _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
-                try:
-                    mark_semantic_run_failed(
-                        conn,
-                        semantic_run_id=semantic_run_id,
-                        failure_type=failure_type,
-                    )
-                except Exception:
-                    pass
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
-            _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
-        finally:
-            conn.close()
-        _emit_structured_log(
-            "semantic_parse",
-            {
-                **log_base,
-                "semantic_run_id": semantic_run_id,
-                "status": "failed",
-                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                "parse_success": False,
-                "failure_type": failure_type,
-            },
-        )
-        return
-
-    conn = init_db(sandbox_db_path)
-    try:
-        if semantic_run_id is not None:
-            _set_semantic_diagnostic(conn, semantic_run_id, diagnostic)
-        fact_payloads = _semantic_fact_payloads(
-            conn,
-            evidence_id=evidence_id,
-            semantics=parsed,
-            glossary=glossary,
-            created_at=int(time.time() * 1000),
-        )
-        interpretation_payloads = _semantic_interpretation_payloads(
-            evidence_id,
-            parsed,
-            created_at=int(time.time() * 1000),
-        )
-        persisted = persist_semantic_run_result(
-            conn,
-            semantic_run_id=semantic_run_id,
-            facts=fact_payloads,
-            interpretations=interpretation_payloads,
-        )
-        if semantic_run_id is not None and persisted["facts"]:
-            previous_match_run = get_latest_event_match_for_evidence(conn, evidence_id)
-            event_match_run = create_event_match_run(
-                conn,
-                semantic_run_id=semantic_run_id,
-                provider="deepseek",
-                model=get_text_model(),
-                matcher_version=event_matcher.EVENT_MATCHER_VERSION,
-                supersedes_run_id=None if previous_match_run is None else previous_match_run["event_match_run_id"],
-            )
-            try:
-                normalized_match = event_matcher.match_events(
-                    _event_matcher_fact_payload(conn, persisted["facts"]),
-                    existing_events=list_event_candidates(conn),
-                )
-                if normalized_match is None:
-                    raise ValueError("matcher returned no normalized result")
-                stored_match = persist_event_match_run_result(
+            semantic_input = {
+                "evidence_id": evidence_id,
+                "extraction_id": extraction["extraction_id"],
+                "position": 0,
+                "projection_text": extraction.get("transcript"),
+                "anchor_date": _resolved_semantic_anchor_date(
                     conn,
-                    event_match_run_id=event_match_run["event_match_run_id"],
-                    semantic_run_id=semantic_run_id,
-                    routing_mode=event_matcher.decide_assignment_mode(normalized_match),
-                    normalized_match=normalized_match,
-                    facts=persisted["facts"],
-                )
-                if stored_match["routing_mode"] == "auto":
-                    groups = stored_match.get("result", {}).get("groups") or []
-                    target_event_ids = {
-                        group.get("event_id")
-                        for group in groups
-                        if group.get("target") in {"existing", "new"} and group.get("event_id")
-                    }
-                    for target_event_id in target_event_ids:
-                        _maybe_run_event_change_detection(conn, target_event_id)
-            except ProtectedFactError:
-                mark_event_match_run_failed(
-                    conn,
-                    event_match_run_id=event_match_run["event_match_run_id"],
-                    failure_type="protected_fact",
-                )
-            except ValueError:
-                mark_event_match_run_failed(
-                    conn,
-                    event_match_run_id=event_match_run["event_match_run_id"],
-                    failure_type="provider_invalid_response",
-                )
-            except Exception:
-                mark_event_match_run_failed(
-                    conn,
-                    event_match_run_id=event_match_run["event_match_run_id"],
-                    failure_type="persistence_error",
-                )
-        _clear_clarification_state(conn, evidence_id)
-        _set_parse_status(conn, evidence_id, PARSE_STATUS_DONE)
-        _set_parse_detail(conn, evidence_id, "")
-        _emit_structured_log(
-            "semantic_parse",
-            {
-                **log_base,
-                "semantic_run_id": semantic_run_id,
-                "status": "succeeded",
-                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                "parse_success": True,
-                "failure_type": None,
-            },
-        )
-    except Exception:
-        try:
-            if semantic_run_id is not None:
-                mark_semantic_run_failed(
-                    conn,
-                    semantic_run_id=semantic_run_id,
-                    failure_type="persistence_error",
-                )
-        except Exception:
-            pass
-        _set_parse_status(conn, evidence_id, PARSE_STATUS_FAILED)
-        _set_parse_detail(conn, evidence_id, "解析暂不可用,记录已完整保存")
-        _emit_structured_log(
-            "semantic_parse",
-            {
-                **log_base,
-                "semantic_run_id": semantic_run_id,
-                "status": "failed",
-                "latency_ms": int((time.perf_counter() - parse_start) * 1000),
-                "parse_success": False,
-                "failure_type": "persistence_error",
-            },
-        )
+                    evidence_id=evidence_id,
+                    extraction=extraction,
+                ),
+                "source_hint": get_effective_source_hint(conn, evidence_id),
+            }
     finally:
         conn.close()
+    _run_semantic_parse_for_group(
+        sandbox_db_path,
+        global_meta_db_path,
+        inputs=[semantic_input],
+    )
 
 
 def _run_image_pipeline(
@@ -2659,6 +3220,7 @@ def _run_image_pipeline(
     image_bytes: bytes,
     filename: str | None,
     counterpart: str | None,
+    defer_resume: bool = False,
 ) -> None:
     mime_type = _detect_blob_content_type(image_bytes, filename)
     selected_provider = get_image_extraction_provider()
@@ -2683,6 +3245,7 @@ def _run_image_pipeline(
     transcript = None if extraction is None else extraction.get("transcript")
     observations = [] if extraction is None else extraction.get("observations", [])
     warnings = [] if extraction is None else extraction.get("warnings", [])
+    structured_payload = None if extraction is None else extraction.get("structured_payload")
     conn = init_db(sandbox_db_path)
     try:
         if extraction is None:
@@ -2700,12 +3263,12 @@ def _run_image_pipeline(
             provider=extraction.get("provider") or "unknown",
             model=extraction.get("model"),
             warnings=warnings,
+            structured_payload=structured_payload,
         )
         conn.execute(
             "UPDATE evidence SET raw_text = ? WHERE evidence_id = ?",
             (_build_attachment_raw_text("image", filename, transcript), evidence_id),
         )
-        latest_extraction = get_latest_extraction(conn, evidence_id)
         _clear_extract_note(conn, evidence_id)
         if not _can_run_semantic_parse(transcript, observations):
             note = "图片提取未产生可供语义解析的 transcript 或 observations"
@@ -2714,49 +3277,16 @@ def _run_image_pipeline(
             _set_extract_note(conn, evidence_id, note)
             conn.commit()
             return
-
-        gate_state = _source_gate_state(
-            conn,
-            evidence_id=evidence_id,
-            extraction=latest_extraction,
-        )
-        if gate_state["requires_clarification"]:
-            _apply_source_gate_clarification(
-                conn,
-                evidence_id=evidence_id,
-                gate_state=gate_state,
-            )
-            conn.commit()
-            return
-
-        temporal_gate_state = _temporal_gate_state(
-            conn,
-            evidence_id=evidence_id,
-            extraction=latest_extraction,
-            anchor_date=_get_semantic_anchor_date(conn, evidence_id),
-        )
-        if temporal_gate_state["requires_clarification"]:
-            _apply_temporal_gate_clarification(
-                conn,
-                evidence_id=evidence_id,
-                gate_state=temporal_gate_state,
-            )
-            conn.commit()
-            return
-
-        _clear_extract_note(conn, evidence_id)
-        _clear_clarification_state(conn, evidence_id)
-        _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
-        _set_parse_detail(conn, evidence_id, "")
         conn.commit()
     finally:
         conn.close()
 
-    _run_parse_pipeline(
-        sandbox_db_path,
-        global_meta_db_path,
-        evidence_id,
-    )
+    if not defer_resume:
+        _resume_semantic_pipeline_for_evidence(
+            sandbox_db_path,
+            global_meta_db_path,
+            evidence_id,
+        )
 
 
 def _mark_pipeline_exception(
@@ -2778,6 +3308,8 @@ def _run_multi_image_pipeline(
     sandbox_db_path: Path,
     global_meta_db_path: Path,
     image_items: list[dict[str, Any]],
+    *,
+    submission_id: str | None = None,
 ) -> None:
     for item in image_items:
         try:
@@ -2788,9 +3320,16 @@ def _run_multi_image_pipeline(
                 item["image_bytes"],
                 item.get("filename"),
                 None,
+                True,
             )
         except Exception:
             _mark_pipeline_exception(sandbox_db_path, item["evidence_id"])
+    if submission_id is not None:
+        _run_submission_context_pipeline(
+            sandbox_db_path,
+            global_meta_db_path,
+            submission_id=submission_id,
+        )
 
 
 def _prepare_thread_card(row: sqlite3.Row) -> dict[str, Any]:
@@ -3545,6 +4084,7 @@ def _fetch_evidence_detail(conn: sqlite3.Connection, evidence_id: str) -> dict[s
             "transcript": latest_extraction.get("transcript"),
             "observations": latest_extraction.get("observations") if isinstance(latest_extraction.get("observations"), list) else [],
             "warnings": latest_extraction.get("warnings") if isinstance(latest_extraction.get("warnings"), list) else [],
+            "structured_payload": latest_extraction.get("structured_payload"),
         }
     semantic_result = _build_semantic_result(conn, evidence_id)
     return {
@@ -4102,6 +4642,15 @@ def create_app() -> FastAPI:
                 if row["media_type"] == "image"
                 else None
             )
+            semantic_context = (
+                _current_semantic_context_payload(
+                    conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                )
+                if row["media_type"] == "image"
+                else None
+            )
             return {
                 "parse_status": parse_status,
                 "parse_status_label": _parse_status_label_with_reason(parse_status, clarification_reason),
@@ -4123,6 +4672,7 @@ def create_app() -> FastAPI:
                 "is_ocr_corrected": _is_ocr_corrected(conn, evidence_id),
                 "source_gate": source_gate,
                 "temporal_gate": temporal_gate,
+                "semantic_context": semantic_context,
             }
         finally:
             conn.close()
@@ -4241,7 +4791,7 @@ def create_app() -> FastAPI:
 
         if decision == "confirmed_declared":
             background_tasks.add_task(
-                _run_parse_pipeline,
+                _resume_semantic_pipeline_for_evidence,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 evidence_id,
@@ -4285,6 +4835,7 @@ def create_app() -> FastAPI:
         conn = init_db(sandbox.db_path)
         should_start_parse = False
         next_parse_status: str | None = None
+        submission_id: str | None = None
         try:
             evidence_row = conn.execute(
                 "SELECT evidence_id, media_type FROM evidence WHERE evidence_id = ?",
@@ -4332,20 +4883,7 @@ def create_app() -> FastAPI:
                     )
                     next_parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
                 else:
-                    temporal_gate_state = _temporal_gate_state(
-                        conn,
-                        evidence_id=evidence_id,
-                        extraction=latest_extraction,
-                        anchor_date=record_date,
-                    )
-                    if temporal_gate_state["requires_clarification"]:
-                        _apply_temporal_gate_clarification(
-                            conn,
-                            evidence_id=evidence_id,
-                            gate_state=temporal_gate_state,
-                        )
-                        next_parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
-                    elif _can_run_semantic_parse(
+                    if _can_run_semantic_parse(
                         latest_extraction.get("transcript"),
                         latest_extraction.get("observations"),
                     ):
@@ -4373,7 +4911,7 @@ def create_app() -> FastAPI:
 
         if should_start_parse:
             background_tasks.add_task(
-                _run_parse_pipeline,
+                _resume_semantic_pipeline_for_evidence,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 evidence_id,
@@ -4387,6 +4925,148 @@ def create_app() -> FastAPI:
                 "record_date_source_label": _semantic_anchor_source_label("user"),
                 "updated_fact_count": len(relative_due_updates),
                 "parse_status": next_parse_status,
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/evidence/{evidence_id}/semantic-context-review")
+    async def submit_semantic_context_review(
+        evidence_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(
+            set(payload) - {"record_date", "left_account_label", "right_account_label", "action"}
+        )
+        if unexpected_fields:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unsupported fields: {', '.join(unexpected_fields)}",
+            )
+
+        action = str(payload.get("action", "")).strip()
+        if action not in {"save_and_continue", "skip_and_continue"}:
+            raise HTTPException(status_code=400, detail="action must be save_and_continue or skip_and_continue")
+
+        record_date = _normalize_record_date_input(payload.get("record_date"))
+        left_account_label = str(payload.get("left_account_label", "")).strip()
+        right_account_label = str(payload.get("right_account_label", "")).strip()
+        labels = {
+            key: value
+            for key, value in {
+                "left_account": left_account_label,
+                "right_account": right_account_label,
+            }.items()
+            if value
+        }
+
+        conn = init_db(sandbox.db_path)
+        should_start_parse = False
+        next_parse_status = PARSE_STATUS_CLARIFICATION_REQUIRED
+        try:
+            evidence_row = conn.execute(
+                "SELECT evidence_id, media_type FROM evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if evidence_row is None:
+                raise HTTPException(status_code=404, detail="evidence not found")
+            if evidence_id.startswith("ev_demo_"):
+                raise HTTPException(status_code=403, detail="演示记录不可修改")
+            if evidence_row["media_type"] != "image":
+                raise HTTPException(status_code=400, detail="只有图片记录支持补充整理上下文")
+
+            latest_extraction = get_latest_extraction(conn, evidence_id)
+            if latest_extraction is None:
+                raise HTTPException(status_code=400, detail="当前记录缺少可核实的提取版本")
+
+            submission_id = _multi_image_submission_id_for_evidence(conn, evidence_id)
+            current_context = _current_semantic_context_payload(
+                conn,
+                evidence_id=evidence_id,
+                parse_status=_get_parse_status(conn, evidence_id),
+            )
+            if current_context is None:
+                raise HTTPException(status_code=409, detail="当前记录不需要补充整理上下文")
+
+            if current_context["temporal_required"] and record_date is None:
+                raise HTTPException(status_code=400, detail="请选择记录发生日期")
+
+            conn.execute("BEGIN IMMEDIATE")
+            if record_date is not None:
+                _set_semantic_anchor(conn, evidence_id, record_date, "user", commit=False)
+            if current_context.get("speaker_context_required") or labels:
+                create_extraction_speaker_review(
+                    conn,
+                    evidence_id=evidence_id,
+                    extraction_id=latest_extraction["extraction_id"],
+                    status="provided" if action == "save_and_continue" and labels else "skipped",
+                    labels=labels,
+                )
+            assembly_review = current_context.get("assembly_review")
+            if current_context.get("assembly_review_required") and isinstance(assembly_review, dict):
+                assembly_run_id = assembly_review.get("assembly_run_id")
+                pending_groups = assembly_review.get("pending_groups") or []
+                if not isinstance(assembly_run_id, str) or not assembly_run_id.strip():
+                    raise HTTPException(status_code=409, detail="当前多图上下文确认状态不可用，请刷新后重试")
+                for group in pending_groups:
+                    if not isinstance(group, dict):
+                        continue
+                    group_key = str(group.get("group_key") or "").strip()
+                    if not group_key:
+                        continue
+                    create_context_group_review(
+                        conn,
+                        assembly_run_id=assembly_run_id,
+                        group_key=group_key,
+                        review_status="accepted",
+                        decision=group,
+                    )
+            _clear_extract_note(conn, evidence_id)
+            _clear_clarification_state(conn, evidence_id)
+            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+            _set_parse_detail(conn, evidence_id, "")
+            should_start_parse = True
+            next_parse_status = PARSE_STATUS_LLM_RUNNING
+            conn.commit()
+        except HTTPException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        if should_start_parse:
+            if submission_id is not None:
+                background_tasks.add_task(
+                    _run_multi_image_pipeline,
+                    sandbox.db_path,
+                    request.app.state.global_meta_db_path,
+                    [],
+                    submission_id=submission_id,
+                )
+            else:
+                background_tasks.add_task(
+                    _resume_semantic_pipeline_for_evidence,
+                    sandbox.db_path,
+                    request.app.state.global_meta_db_path,
+                    evidence_id,
+                )
+
+        response = JSONResponse(
+            {
+                "evidence_id": evidence_id,
+                "parse_status": next_parse_status,
+                "labels": labels,
+                "action": action,
             }
         )
         apply_sandbox_cookie(response, sandbox)
@@ -4596,19 +5276,10 @@ def create_app() -> FastAPI:
                     gate_state=gate_state,
                 )
             else:
-                temporal_gate_state = _temporal_gate_state(
-                    conn,
-                    evidence_id=evidence_id,
-                    extraction=latest_extraction,
-                    anchor_date=_get_semantic_anchor_date(conn, evidence_id),
-                )
-                if temporal_gate_state["requires_clarification"]:
-                    _apply_temporal_gate_clarification(
-                        conn,
-                        evidence_id=evidence_id,
-                        gate_state=temporal_gate_state,
-                    )
-                else:
+                if _can_run_semantic_parse(
+                    latest_extraction.get("transcript"),
+                    latest_extraction.get("observations"),
+                ):
                     _clear_clarification_state(conn, evidence_id)
                     _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
                     _set_parse_detail(conn, evidence_id, "")
@@ -4620,7 +5291,7 @@ def create_app() -> FastAPI:
 
         if should_start_parse:
             background_tasks.add_task(
-                _run_parse_pipeline,
+                _resume_semantic_pipeline_for_evidence,
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 evidence_id,
@@ -4970,6 +5641,15 @@ def create_app() -> FastAPI:
                 if context["media_type"] == "image"
                 else None
             )
+            semantic_context = (
+                _current_semantic_context_payload(
+                    status_conn,
+                    evidence_id=evidence_id,
+                    parse_status=parse_status,
+                )
+                if context["media_type"] == "image"
+                else None
+            )
             record_date = _get_semantic_anchor_date(status_conn, evidence_id)
             record_date_source = _get_semantic_anchor_source(status_conn, evidence_id)
             record_date_state = {
@@ -5009,6 +5689,7 @@ def create_app() -> FastAPI:
                 "is_ocr_corrected": is_ocr_corrected,
                 "source_gate": source_gate,
                 "temporal_gate": temporal_gate,
+                "semantic_context": semantic_context,
                 "record_date_state": record_date_state,
                 "source_presets": SOURCE_PRESETS,
                 "diagnostics_enabled": _diagnostics_enabled(),
@@ -5377,6 +6058,7 @@ def create_app() -> FastAPI:
                 sandbox.db_path,
                 request.app.state.global_meta_db_path,
                 image_pipeline_items,
+                submission_id=submission["submission_id"],
             )
 
         response_payload: dict[str, Any] = {
