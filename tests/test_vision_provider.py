@@ -539,6 +539,98 @@ def test_semantic_projection_filters_system_events_and_keeps_message_context():
     assert '[reaction emoji="👍" actor="unknown"]' in rendered
 
 
+def test_semantic_projection_aliases_single_left_right_even_when_group_chat_flag_is_wrong():
+    projection = semantic_projection.build_semantic_projection(
+        transcript=None,
+        observations=[],
+        structured_payload={
+            "payload_version": "1.0",
+            "observed_platform": "飞书",
+            "conversation_type": "group_chat",
+            "chat_header": "A大冲小强",
+            "participants": [
+                {"speaker_ref": "participant_1", "side": "left", "display_name": None},
+                {"speaker_ref": "right_account", "side": "right", "display_name": None},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "participant_1",
+                    "side": "left",
+                    "visible_sender_label": None,
+                    "avatar_ref": "avatar-left",
+                    "text": "先这样",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                },
+                {
+                    "index": 2,
+                    "speaker_ref": "right_account",
+                    "side": "right",
+                    "visible_sender_label": None,
+                    "avatar_ref": "avatar-right",
+                    "text": "收到",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                },
+            ],
+            "system_events": [],
+        },
+    )
+
+    assert [item["speaker_ref"] for item in projection["messages"]] == ["left_account", "right_account"]
+    assert projection["missing_speaker_refs"] == ["left_account", "right_account"]
+    assert projection["speaker_topology"]["supports_group_labels"] is True
+
+
+def test_semantic_projection_keeps_multiple_left_participants_unfolded():
+    projection = semantic_projection.build_semantic_projection(
+        transcript=None,
+        observations=[],
+        structured_payload={
+            "payload_version": "1.0",
+            "observed_platform": "微信",
+            "conversation_type": "group_chat",
+            "participants": [
+                {"speaker_ref": "participant_1", "side": "left", "display_name": "凡"},
+                {"speaker_ref": "participant_2", "side": "left", "display_name": "念文雯"},
+                {"speaker_ref": "right_account", "side": "right", "display_name": None},
+            ],
+            "messages": [
+                {
+                    "index": 1,
+                    "speaker_ref": "participant_1",
+                    "side": "left",
+                    "visible_sender_label": "凡",
+                    "avatar_ref": "avatar-a",
+                    "text": "我先看下",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                },
+                {
+                    "index": 2,
+                    "speaker_ref": "participant_2",
+                    "side": "left",
+                    "visible_sender_label": "念文雯",
+                    "avatar_ref": "avatar-b",
+                    "text": "我补截图",
+                    "quote": None,
+                    "reply": None,
+                    "reactions": [],
+                },
+            ],
+            "system_events": [],
+        },
+    )
+
+    assert [item["speaker_ref"] for item in projection["messages"]] == ["participant_1", "participant_2"]
+    assert projection["missing_speaker_refs"] == []
+    assert projection["speaker_topology"]["supports_group_labels"] is False
+
+
 def test_context_assembly_normalization_adds_singleton_for_uncovered_evidence():
     result = context_assembler.normalize_context_assembly_result(
         {

@@ -1,6 +1,6 @@
 # WorkChain 项目说明书
 
-> 版本 v1.4 · 最后更新 2026-08-10
+> 版本 v1.4 · 最后更新 2026-08-11
 > 本文档是项目的唯一事实来源。当 IDE 上下文丢失、记忆偏差或需要交接时,以本文档为准。
 
 ---
@@ -129,17 +129,23 @@
 - Ark 实验 Extraction 在 diagnostics-only 场景下使用 disabled thinking,并区分 text probe 与 vision 请求的独立 timeout
 - 所有新 Evidence 的 production semantic parse 都从 latest Extraction 驱动:text 证据会先生成 builtin machine extraction,图片/文档复用已有 machine extraction,OCR 人工校正生成新的 user extraction
 - 图片链路中的 pre-semantic gate 顺序固定为 `Extraction -> Source Gate -> Semantic Projection -> (多图时) Context Assembly / ambiguity review -> Pre-Semantic Context Review -> Semantic Parser`;其中 `Pre-Semantic Context Review` 合并 required temporal context 与 optional speaker context;Source Gate 优先于其它 gate,只要来源仍待核实,就不得进入 Projection、Context Assembly 或 DeepSeek
+- 多图 submission 的真实执行顺序固定为 `逐图 Extraction -> 逐图 Source Gate -> 逐图 Semantic Projection -> Context Assembly -> submission-level Context Review -> per-group Semantic Parse`;Temporal / speaker context 不得在 Assembly 前逐图阻断,单图仍走 `Extraction -> Source Gate -> Projection -> Context Review -> Semantic`
 - 图片链路中的 Source Gate 固定放在 `Extraction -> Semantic Parser` 之间:当 declared platform 明确、`observed_platform` 明确且与 declared 不同、并且 `platform_confidence >= 0.75` 时,当前 Evidence 进入 `clarification_required`,禁止创建 Semantic Run、禁止调用 DeepSeek / Event Matcher,直到用户确认或修正来源
 - Source Gate 只要求用户核实,不会自动覆盖用户来源;一旦用户确认 declared source,该 Extraction 的同一 mismatch 不得再次阻断;若用户修正来源,必须基于 `effective source` 重新跑 Vision,而不是直接拿旧 Extraction 继续 Semantic Parse
 - Temporal Gate 使用确定性代码检查 Extraction transcript / observations 中是否存在依赖记录日期才能解释的相对/不完整时间;至少包括 `今天/明天/后天/昨天/前天`、`周X/星期X`、`本周/这周/下周/下下周`、`这个月/本月/下个月/今年/明年`、`这个月16号`、缺少年份的 `8月16日` 等
 - 若命中 Temporal Gate 且当前没有可靠 `anchor_date`,当前 Evidence 必须进入 `clarification_required` 且 `clarification_reason=temporal_context`;禁止创建 Semantic Run、禁止调用 DeepSeek、禁止调用 Event Matcher;UI 复用现有 `record_date` 输入并提示“这份记录包含相对时间，需要先确认记录发生日期，再进行 AI 整理。”
 - 对于尚未创建过 Semantic Run 的 gated Evidence,用户补充 `record_date` 后必须先重跑 Source Gate / Temporal Gate;全部通过后才首次进入 `llm_running` 并后台启动 `_run_parse_pipeline`;这一路径不得误走“已有结果只修 due_at”的兼容逻辑
 - direct-style Projection 若出现 `left_account / right_account` 且对应 display_name 缺失,必须进入一次 Pre-Semantic Context Review;`record_date` 仍是 required context,但左/右发言者称呼只属于 optional semantic context,必须明确提示“不填写也可继续”,且用户填写结果只能以独立 provenance 绑定到当前 Extraction,不得修改 Evidence 或 machine Extraction
+- Projection 的 speaker topology 必须按 messages 的实际 `side + stable visual identity` 决定,而不是依赖 `conversation_type` 标签:若全部正常消息只有唯一 left identity,可 alias 为 `left_account`;只有唯一 right identity 时可 alias 为 `right_account`;若存在多个可区分 left identity,必须继续保留 `participant_n`,不得强行压成单一 left
+- speaker name 是否已知的优先级固定为:1) 用户 review;2) `message.visible_sender_label`;3) 明确可信的平台 direct-chat header mapping;不得仅因模型 `participant.display_name` 或泛化 `chat_header` 推断就跳过 optional speaker review
 - speaker context 本轮只覆盖 `left_account / right_account`;source correction 或其它导致新的 Extraction 产生后,旧 speaker review 不得静默套用到结构不同的新 Extraction
 - Multi-image Context Assembly 只负责判断哪些 Evidence 应一起阅读以及组内 `analysis_order`;`Context Group != Event`,不得生成 Fact / Event / 标题 / 责任判断,也不依赖 `anchor_date` 做日期换算
 - `submission.position` 永远表示用户上传顺序,不得被 AI 修改;`analysis_order` 是独立保存的 AI 阅读顺序,允许与上传顺序不同
 - 同一 Evidence 可以属于多个 Context Group,但每个 Evidence 至少必须进入一个 group;assembler 低置信或存在 ambiguity 时必须先进入用户确认,不得直接开始 Semantic Parse;assembler 失败时只能 fallback 为 singleton groups,并显式保留 warning provenance
 - 图片的真正 Semantic Parse 必须按 Context Group 发起 multi-evidence Semantic Run;同一组内全部 Semantic Projection 必须同时发送给 DeepSeek,并保留 `evidence_id` 边界;Fact provenance 允许关联一份或多份 Evidence
+- 多图的 Context Review 与 Result UX 必须以 `Submission -> Context Group` 为单位,而不是逐 Evidence 展开:用户在 `/submission/{submission_id}` 一次看到本次上传的紧凑缩略图状态、Context Group、assembly ambiguity、required date 与 optional speaker context,并通过一次 bulk submit 完成本次 Submission 所需 review
+- continuation group 必须支持“同一天”一次填写并广播到组内所有需要 anchor 的 Evidence;用户也可以切换为逐图填写不同日期;所有 review 输入必须先整体校验,再事务写入,不得半批保存
+- multi-evidence Semantic Run 的 shared result 只允许在 Context Group 上展示一次;若某条 Evidence 属于 multi-evidence group,其 Detail 页继续展示原件 / Extraction / provenance,并提示“此记录参与组合整理”及跳转入口,不得在多个 Evidence Detail 中重复渲染同一套 shared AI result
 - 单图图片可跳过 Context Assembly,但仍必须使用 Semantic Projection 与同一套 Pre-Semantic Context Review 边界
 - text / doc 当前流程保持不变:本轮不引入 Context Assembly,也不把其 Extraction 输入重构为 Semantic Projection
 - Semantic Parser 的输入来自 text/doc 的 Extraction transcript + visual observations,以及图片链路的 Semantic Projection / grouped projections;这些都属于不可信待分析数据,只能放在 user payload,不得混入 system prompt
@@ -656,8 +662,9 @@ verify_chain 校验 checkpoint.at_seq 是否仍存在、chain_hash 是否一致�
 - 首页提交区现为单输入模式:textarea 与 file upload 必须二选一;前端互斥仅做 UX 引导,服务端仍会拒绝 text + file 同时提交
 - 首页图片上传现支持一次多选多张图片:前端保留选择顺序、展示编号/缩略图/文件名/大小,允许逐项移除与继续添加,拖拽同样支持多图;文档仍保持一次一个
 - 首页图片粘贴入口现属于整个 evidence upload area:第一次 Ctrl/Cmd+V 贴图后,上传区会保持焦点以便继续粘贴第 2 / 3 张图片;粘贴、本地选择、拖拽三种入口最终都走同一个 `appendFiles / validation` 流程,且不会干扰 `source / source_detail / record_date` 等其它表单输入
-- `/api/evidence` 现统一以 Submission 为入口:单文字/单图片/单文档会创建 `1 Submission + 1 Evidence`,多图会创建 `1 Submission + N Evidence`;后台对多图只启动一个顺序 wrapper,按 `submission_evidence.position` 逐张执行现有 `Extraction -> Semantic Parse -> Event Matcher`
+- `/api/evidence` 现统一以 Submission 为入口:单文字/单图片/单文档会创建 `1 Submission + 1 Evidence`,多图会创建 `1 Submission + N Evidence`;多图后台先逐张完成 `Extraction + Source Gate` 所需准备,再进入 submission-level 的 `Projection -> Context Assembly -> Context Review -> per-group Semantic Parse`
 - 多图批次禁止共用一个 `record_date`:前端会禁用并清空日期输入,服务端也会拒绝 `multi-image + non-empty record_date`,避免把同一日期广播到全部图片
+- 多图上传成功后,前端不得跳去 records 或逐 Evidence detail,而应跳到 `/submission/{submission_id}`;该页面第一阶段只展示紧凑图片缩略图与短状态(`读取中 / 来源待核实 / 已读取 / 失败`),Context Assembly 完成后再按用户友好的 `连续记录 / 相关上下文 / 独立记录` 展示 Context Group,阅读顺序用“图片1 -> 图片2”表达,不得暴露 `group_key / evidence_id / confidence` 等内部字段
 - 首页补充信息现仅保留 `source / source_detail / record_date`,继续收纳进"补充信息(可选)"折叠区;前端已移除 `counterpart`,但服务端兼容字段仍保留
 - 首页示例 chips 已移除,避免次要引导继续抢占首屏与主输入动作
 - 首页主输入区下方不再保留额外产品说明或营销文案,只保留三步流程说明;Header 品牌副标题继续作为轻量品牌信息

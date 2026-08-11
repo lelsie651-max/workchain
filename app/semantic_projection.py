@@ -52,6 +52,33 @@ def _normalize_reactions(value: Any) -> list[dict[str, str]]:
     return normalized
 
 
+def _normalize_side(value: Any) -> str:
+    normalized = (_coerce_text(value) or "").lower()
+    if normalized in {"left", "left_side", "lhs"}:
+        return "left"
+    if normalized in {"right", "right_side", "rhs"}:
+        return "right"
+    return "unknown"
+
+
+def _trusted_header_display_name(payload: dict[str, Any], speaker_ref: str) -> str | None:
+    if speaker_ref != "left_account":
+        return None
+    if _coerce_text(payload.get("conversation_type")) != "direct_chat":
+        return None
+    if _coerce_text(payload.get("observed_platform")) != "微信":
+        return None
+    return _coerce_text(payload.get("chat_header"))
+
+
+def _message_identity_key(item: dict[str, Any]) -> str | None:
+    for key in ("speaker_ref", "avatar_ref", "visible_sender_label"):
+        value = _coerce_text(item.get(key))
+        if value is not None:
+            return f"{key}:{value}"
+    return None
+
+
 def _normalize_projection_messages(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -69,6 +96,10 @@ def _normalize_projection_messages(value: Any) -> list[dict[str, Any]]:
             {
                 "index": _coerce_message_index(item.get("index"), fallback_index),
                 "speaker_ref": _coerce_text(item.get("speaker_ref")) or "unknown",
+                "raw_speaker_ref": _coerce_text(item.get("speaker_ref")) or "unknown",
+                "side": _normalize_side(item.get("side")),
+                "visible_sender_label": _coerce_text(item.get("visible_sender_label")),
+                "avatar_ref": _coerce_text(item.get("avatar_ref")),
                 "display_name": _coerce_text(item.get("display_name")),
                 "text": text,
                 "quote": quote,
@@ -148,18 +179,72 @@ def build_semantic_projection(
         for item in participants
         if item.get("speaker_ref")
     }
-    messages = _normalize_projection_messages(payload.get("messages"))
-    for item in messages:
-        item["display_name"] = participant_name_map.get(item["speaker_ref"])
+    raw_messages = _normalize_projection_messages(payload.get("messages"))
+
+    left_identities = {
+        identity
+        for item in raw_messages
+        if item.get("side") == "left"
+        for identity in [_message_identity_key(item)]
+        if identity is not None
+    }
+    right_identities = {
+        identity
+        for item in raw_messages
+        if item.get("side") == "right"
+        for identity in [_message_identity_key(item)]
+        if identity is not None
+    }
+    alias_map: dict[str, str] = {}
+    if len(left_identities) == 1:
+        alias_map[next(iter(left_identities))] = "left_account"
+    if len(right_identities) == 1:
+        alias_map[next(iter(right_identities))] = "right_account"
+
+    visible_sender_name_map: dict[str, str] = {}
+    messages: list[dict[str, Any]] = []
+    for item in raw_messages:
+        identity_key = _message_identity_key(item)
+        aliased_ref = alias_map.get(identity_key, item["speaker_ref"])
+        visible_sender_label = _coerce_text(item.get("visible_sender_label"))
+        if visible_sender_label is not None and aliased_ref in {"left_account", "right_account"}:
+            visible_sender_name_map.setdefault(aliased_ref, visible_sender_label)
+        trusted_header_name = _trusted_header_display_name(payload, aliased_ref)
+        display_name = (
+            visible_sender_label
+            or trusted_header_name
+            or (
+                participant_name_map.get(item["speaker_ref"])
+                if aliased_ref not in {"left_account", "right_account"}
+                else None
+            )
+        )
+        messages.append(
+            {
+                "index": item["index"],
+                "speaker_ref": aliased_ref,
+                "display_name": display_name,
+                "text": item.get("text"),
+                "quote": item.get("quote"),
+                "reply": item.get("reply"),
+                "reactions": item.get("reactions") or [],
+            }
+        )
 
     time_markers = _timestamp_markers_from_observations(observations)
     conversation_type = _coerce_text(payload.get("conversation_type")) or "unknown"
     missing_speaker_refs: list[str] = []
-    if conversation_type == "direct_chat":
-        for speaker_ref in ("left_account", "right_account"):
-            if any(message["speaker_ref"] == speaker_ref for message in messages):
-                if _coerce_text(participant_name_map.get(speaker_ref)) is None:
-                    missing_speaker_refs.append(speaker_ref)
+    known_alias_names = {
+        speaker_ref: (
+            visible_sender_name_map.get(speaker_ref)
+            or _trusted_header_display_name(payload, speaker_ref)
+        )
+        for speaker_ref in ("left_account", "right_account")
+    }
+    for speaker_ref in ("left_account", "right_account"):
+        if any(message["speaker_ref"] == speaker_ref for message in messages):
+            if _coerce_text(known_alias_names.get(speaker_ref)) is None:
+                missing_speaker_refs.append(speaker_ref)
 
     if not messages and not time_markers:
         return None
@@ -172,6 +257,11 @@ def build_semantic_projection(
         "time_markers": time_markers,
         "messages": messages,
         "missing_speaker_refs": missing_speaker_refs,
+        "speaker_topology": {
+            "left_identity_count": len(left_identities),
+            "right_identity_count": len(right_identities),
+            "supports_group_labels": bool(messages) and len(left_identities) <= 1 and len(right_identities) <= 1,
+        },
     }
 
 

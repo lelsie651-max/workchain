@@ -538,7 +538,7 @@
 
                 const items = Array.isArray(parsed.value?.items) ? parsed.value.items : [];
                 if (items.length > 1) {
-                    window.location.href = "/records";
+                    window.location.href = `/submission/${encodeURIComponent(parsed.value.submission_id)}`;
                     return;
                 }
                 if (!parsed.value?.evidence_id) {

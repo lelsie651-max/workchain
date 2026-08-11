@@ -799,7 +799,7 @@ def _speaker_context_state(
     )
     labels = _speaker_review_labels(conn, evidence_id=evidence_id, extraction_id=extraction_id)
     missing_refs = []
-    if not (review is not None and review.get("status") == "skipped"):
+    if review is None:
         for speaker_ref in (projection or {}).get("missing_speaker_refs", []):
             if speaker_ref not in labels:
                 missing_refs.append(speaker_ref)
@@ -817,6 +817,313 @@ def _speaker_ref_label(speaker_ref: str) -> str:
         "left_account": "左侧发言者称呼",
         "right_account": "右侧发言者称呼",
     }.get(speaker_ref, speaker_ref)
+
+
+def _submission_image_label(position: int) -> str:
+    return f"图片{position + 1}"
+
+
+def _context_group_relation_label(relation: str | None) -> str:
+    return {
+        "continuation": "连续记录",
+        "related_context": "相关上下文",
+        "standalone": "独立记录",
+    }.get((relation or "standalone").strip() or "standalone", "独立记录")
+
+
+def _projection_supports_group_speaker_labels(projection: dict[str, Any] | None) -> bool:
+    if not isinstance(projection, dict):
+        return False
+    topology = projection.get("speaker_topology")
+    if not isinstance(topology, dict):
+        return False
+    return bool(topology.get("supports_group_labels"))
+
+
+def _submission_item_stage(
+    *,
+    parse_status: str | None,
+    source_gate_state: dict[str, Any] | None,
+    extraction: dict[str, Any] | None,
+) -> str:
+    if parse_status in {PARSE_STATUS_FAILED, PARSE_STATUS_UNSUPPORTED}:
+        return "failed"
+    if source_gate_state is not None and source_gate_state.get("requires_clarification"):
+        return "source_review"
+    if extraction is None or parse_status == PARSE_STATUS_OCR_RUNNING:
+        return "reading"
+    return "ready"
+
+
+def _submission_item_stage_label(stage: str) -> str:
+    return {
+        "reading": "读取中",
+        "source_review": "来源待核实",
+        "ready": "已读取",
+        "failed": "失败",
+    }.get(stage, "读取中")
+
+
+def _group_run_for_submission(
+    conn: sqlite3.Connection,
+    *,
+    submission_id: str,
+    context_group_key: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT sr.semantic_run_id
+        FROM semantic_runs sr
+        JOIN context_assembly_runs car ON car.assembly_run_id = sr.context_assembly_run_id
+        WHERE car.submission_id = ?
+          AND sr.context_group_key = ?
+          AND sr.status = 'succeeded'
+        ORDER BY sr.created_at DESC, sr.semantic_run_id DESC
+        LIMIT 1
+        """,
+        (submission_id, context_group_key),
+    ).fetchone()
+    if row is None:
+        return None
+    return conn.execute(
+        """
+        SELECT semantic_run_id, provider, model, parser_version, created_at, completed_at
+        FROM semantic_runs
+        WHERE semantic_run_id = ?
+        """,
+        (row["semantic_run_id"],),
+    ).fetchone()
+
+
+def _build_group_semantic_result(conn: sqlite3.Connection, semantic_run_id: str) -> dict[str, Any] | None:
+    run = conn.execute(
+        """
+        SELECT semantic_run_id, provider, model, parser_version, created_at, completed_at
+        FROM semantic_runs
+        WHERE semantic_run_id = ?
+        """,
+        (semantic_run_id,),
+    ).fetchone()
+    if run is None:
+        return None
+    facts = list_facts_for_semantic_run(conn, semantic_run_id)
+    interpretations = list_interpretations_for_semantic_run(conn, semantic_run_id)
+    fact_map = {fact["fact_id"]: fact for fact in facts}
+    grouped_help_items: dict[str, list[dict[str, Any]]] = {fact["fact_id"]: [] for fact in facts}
+    evidence_help_items: list[dict[str, Any]] = []
+    for item in interpretations:
+        help_item = {
+            "kind": item["kind"],
+            "label": _friendly_interpretation_label(item["kind"]),
+            "content": _humanize_user_facing_text(item["content"]) or "",
+            "confidence": item["confidence"],
+            "is_uncertainty": item["kind"] == "uncertainty",
+            "fact_id": item["fact_id"],
+        }
+        fact_id = item.get("fact_id")
+        if isinstance(fact_id, str) and fact_id in grouped_help_items:
+            grouped_help_items[fact_id].append(help_item)
+        else:
+            evidence_help_items.append(help_item)
+    return {
+        "semantic_run_id": run["semantic_run_id"],
+        "provider": run["provider"],
+        "provider_label": _provider_label(run["provider"]),
+        "model": run["model"],
+        "parser_version": run["parser_version"],
+        "created_at_text": _format_datetime(run["created_at"], "%Y-%m-%d %H:%M:%S"),
+        "facts": [
+            {
+                "fact_id": fact["fact_id"],
+                "fact_type": fact["fact_type"],
+                "fact_type_label": _event_fact_type_label(fact["fact_type"]),
+                "content": fact["content"],
+                "due_raw": fact["due_raw"],
+                "due_date_value": _format_datetime(fact["due_at"], "%Y-%m-%d"),
+                "help_items": grouped_help_items.get(fact["fact_id"], []),
+                "evidence_ids": fact["evidence_ids"],
+            }
+            for fact in facts
+        ],
+        "evidence_help_items": evidence_help_items,
+        "fact_count": len(facts),
+        "event_match": _build_event_match_result(conn, semantic_run_id),
+    }
+
+
+def _build_submission_review_payload(
+    conn: sqlite3.Connection,
+    *,
+    submission_id: str,
+) -> dict[str, Any] | None:
+    submission_row = conn.execute(
+        "SELECT submission_id, created_at, source_hint FROM submissions WHERE submission_id = ?",
+        (submission_id,),
+    ).fetchone()
+    if submission_row is None:
+        return None
+
+    submission_items = _list_submission_evidence(conn, submission_id)
+    image_items = [item for item in submission_items if item["media_type"] == "image"]
+    if not image_items:
+        return None
+
+    item_states: dict[str, dict[str, Any]] = {}
+    source_blocked = False
+    for item in image_items:
+        evidence_id = item["evidence_id"]
+        extraction = get_latest_extraction(conn, evidence_id)
+        parse_status = _get_parse_status(conn, evidence_id)
+        source_gate_state = None
+        if extraction is not None:
+            source_gate_state = _source_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+            )
+        stage = _submission_item_stage(
+            parse_status=parse_status,
+            source_gate_state=source_gate_state,
+            extraction=extraction,
+        )
+        source_blocked = source_blocked or stage == "source_review"
+        item_states[evidence_id] = {
+            "evidence_id": evidence_id,
+            "position": item["position"],
+            "image_label": _submission_image_label(item["position"]),
+            "blob_url": f"/blob/{evidence_id}",
+            "detail_url": f"/evidence/{evidence_id}",
+            "thumbnail_url": f"/blob/{evidence_id}",
+            "parse_status": parse_status,
+            "stage": stage,
+            "stage_label": _submission_item_stage_label(stage),
+            "extraction": extraction,
+            "source_gate_state": source_gate_state,
+            "temporal_gate_state": None if extraction is None else _temporal_gate_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+                anchor_date=_get_semantic_anchor_date(conn, evidence_id),
+            ),
+            "speaker_state": _speaker_context_state(
+                conn,
+                evidence_id=evidence_id,
+                extraction=extraction,
+            ) if extraction is not None else {
+                "projection": None,
+                "review": None,
+                "labels": {},
+                "missing_refs": [],
+                "requires_clarification": False,
+            },
+        }
+
+    assembly_state = None if source_blocked else _submission_context_assembly_state(
+        conn,
+        submission_id=submission_id,
+    )
+    groups: list[dict[str, Any]] = []
+    requires_review = False
+
+    if assembly_state is not None:
+        groups_by_key = {group["group_key"]: group for group in assembly_state["groups"]}
+        for group in assembly_state["groups"]:
+            analysis_order = group.get("analysis_order") or group.get("evidence_ids") or []
+            ordered_items = [
+                item_states[evidence_id]
+                for evidence_id in analysis_order
+                if evidence_id in item_states
+            ]
+            temporal_items = [
+                {
+                    "evidence_id": current["evidence_id"],
+                    "image_label": current["image_label"],
+                    "current_value": _get_semantic_anchor_date(conn, current["evidence_id"]) or "",
+                }
+                for current in ordered_items
+                if current["temporal_gate_state"].get("requires_clarification")
+            ]
+            speaker_eligible = bool(ordered_items) and all(
+                _projection_supports_group_speaker_labels(current["speaker_state"].get("projection"))
+                for current in ordered_items
+            )
+            speaker_fields: list[dict[str, str]] = []
+            if speaker_eligible:
+                for speaker_ref in ("left_account", "right_account"):
+                    if any(speaker_ref in current["speaker_state"].get("missing_refs", []) for current in ordered_items):
+                        existing_value = ""
+                        for current in ordered_items:
+                            label_value = current["speaker_state"].get("labels", {}).get(speaker_ref, "")
+                            if label_value:
+                                existing_value = label_value
+                                break
+                        speaker_fields.append(
+                            {
+                                "speaker_ref": speaker_ref,
+                                "label": _speaker_ref_label(speaker_ref),
+                                "value": existing_value,
+                            }
+                        )
+            run_row = _group_run_for_submission(
+                conn,
+                submission_id=submission_id,
+                context_group_key=group["group_key"],
+            )
+            semantic_result = None if run_row is None else _build_group_semantic_result(
+                conn,
+                run_row["semantic_run_id"],
+            )
+            group_requires_review = (
+                group.get("review_status") != "accepted"
+                or bool(temporal_items)
+                or bool(speaker_fields)
+            )
+            requires_review = requires_review or group_requires_review
+            groups.append(
+                {
+                    "group_key": group["group_key"],
+                    "dom_id": f"group-{group['group_key']}",
+                    "relation": group["relation"],
+                    "relation_label": _context_group_relation_label(group["relation"]),
+                    "evidence_ids": group["evidence_ids"],
+                    "analysis_order": analysis_order,
+                    "analysis_order_text": " -> ".join(
+                        item_states[evidence_id]["image_label"]
+                        for evidence_id in analysis_order
+                        if evidence_id in item_states
+                    ),
+                    "items": ordered_items,
+                    "review_status": group.get("review_status"),
+                    "assembly_pending": group.get("review_status") != "accepted",
+                    "assembly_message": None if group.get("review_status") == "accepted" else (
+                        f"系统认为{ '、'.join(item_states[evidence_id]['image_label'] for evidence_id in analysis_order if evidence_id in item_states) }可能属于同一段记录，请确认。"
+                    ),
+                    "temporal_items": temporal_items,
+                    "allows_shared_date": group.get("relation") == "continuation" and len(temporal_items) > 1,
+                    "speaker_fields": speaker_fields,
+                    "speaker_review_supported": speaker_eligible,
+                    "requires_review": group_requires_review,
+                    "semantic_result": semantic_result,
+                }
+            )
+
+    return {
+        "submission_id": submission_id,
+        "created_at_text": _format_datetime(submission_row["created_at"], "%Y-%m-%d %H:%M"),
+        "source_hint": submission_row["source_hint"],
+        "items": [item_states[item["evidence_id"]] for item in image_items],
+        "item_count": len(image_items),
+        "assembly_review": assembly_state,
+        "groups": groups,
+        "requires_review": requires_review,
+        "source_blocked": source_blocked,
+        "has_active_processing": any(
+            item["parse_status"] in {PARSE_STATUS_OCR_RUNNING, PARSE_STATUS_LLM_RUNNING, "pending"}
+            for item in item_states.values()
+        ),
+        "has_any_result": any(group.get("semantic_result") is not None for group in groups),
+        "ambiguities": [] if assembly_state is None else assembly_state.get("ambiguities", []),
+    }
 
 
 def _submission_context_assembly_state(
@@ -983,6 +1290,7 @@ def _current_semantic_context_payload(
     if parse_status is None:
         parse_status = _get_parse_status(conn, evidence_id)
     reviewable = parse_status == PARSE_STATUS_CLARIFICATION_REQUIRED and not evidence_id.startswith("ev_demo_")
+    submission_review_url = None if submission_id is None else f"/submission/{submission_id}"
     return {
         "requires_clarification": True,
         "reviewable": reviewable,
@@ -1007,6 +1315,8 @@ def _current_semantic_context_payload(
         "skip_allowed": True,
         "latest_review_status": None if speaker_state.get("review") is None else speaker_state["review"].get("status"),
         "assembly_review_required": bool(assembly_state is not None and assembly_state.get("review_required")),
+        "submission_id": submission_id,
+        "submission_review_url": submission_review_url,
         "assembly_review": None if assembly_state is None else {
             "submission_id": assembly_state["submission_id"],
             "assembly_run_id": assembly_state["assembly_run_id"],
@@ -2066,6 +2376,64 @@ def _build_semantic_result(conn: sqlite3.Connection, evidence_id: str) -> dict[s
     }
 
 
+def _latest_shared_submission_groups_for_evidence(
+    conn: sqlite3.Connection,
+    evidence_id: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT car.submission_id, sr.context_group_key
+        FROM semantic_runs sr
+        JOIN semantic_run_inputs sri ON sri.semantic_run_id = sr.semantic_run_id
+        JOIN semantic_run_inputs sra ON sra.semantic_run_id = sr.semantic_run_id
+        JOIN context_assembly_runs car ON car.assembly_run_id = sr.context_assembly_run_id
+        WHERE sri.evidence_id = ?
+          AND sr.status = 'succeeded'
+          AND sr.context_group_key IS NOT NULL
+        GROUP BY car.submission_id, sr.context_group_key, sr.semantic_run_id
+        HAVING COUNT(DISTINCT sra.evidence_id) > 1
+        ORDER BY MAX(sr.created_at) DESC, sr.context_group_key ASC
+        """,
+        (evidence_id,),
+    ).fetchall()
+    if not rows:
+        return []
+
+    links: list[dict[str, Any]] = []
+    cached_submissions: dict[str, dict[str, Any] | None] = {}
+    for row in rows:
+        submission_id = row["submission_id"]
+        if submission_id not in cached_submissions:
+            cached_submissions[submission_id] = _build_submission_review_payload(
+                conn,
+                submission_id=submission_id,
+            )
+        submission_payload = cached_submissions[submission_id]
+        if submission_payload is None:
+            continue
+        matched_group = next(
+            (
+                group
+                for group in submission_payload["groups"]
+                if group["group_key"] == row["context_group_key"]
+            ),
+            None,
+        )
+        if matched_group is None:
+            continue
+        links.append(
+            {
+                "submission_id": submission_id,
+                "group_key": matched_group["group_key"],
+                "dom_id": matched_group["dom_id"],
+                "relation_label": matched_group["relation_label"],
+                "analysis_order_text": matched_group["analysis_order_text"],
+                "url": f"/submission/{submission_id}#{matched_group['dom_id']}",
+            }
+        )
+    return links
+
+
 def _event_title(conn: sqlite3.Connection, event_id: str | None) -> str | None:
     if not event_id:
         return None
@@ -2945,26 +3313,6 @@ def _run_submission_context_pipeline(
                 )
                 blocked = True
                 continue
-            temporal_gate_state = _temporal_gate_state(
-                conn,
-                evidence_id=evidence_id,
-                extraction=extraction,
-                anchor_date=_get_semantic_anchor_date(conn, evidence_id),
-            )
-            speaker_state = _speaker_context_state(
-                conn,
-                evidence_id=evidence_id,
-                extraction=extraction,
-            )
-            if temporal_gate_state["requires_clarification"] or speaker_state["requires_clarification"]:
-                _apply_semantic_context_clarification(
-                    conn,
-                    evidence_id=evidence_id,
-                    temporal_gate_state=temporal_gate_state,
-                    speaker_state=speaker_state,
-                )
-                blocked = True
-                continue
             semantic_input = _semantic_group_input(
                 conn,
                 evidence_id=evidence_id,
@@ -2976,10 +3324,6 @@ def _run_submission_context_pipeline(
                 _set_parse_detail(conn, evidence_id, _saved_original_detail("图片提取未产生可供语义整理的上下文"))
                 blocked = True
                 continue
-            _clear_extract_note(conn, evidence_id)
-            _clear_clarification_state(conn, evidence_id)
-            _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
-            _set_parse_detail(conn, evidence_id, "")
             semantic_inputs.append(
                 {
                     **semantic_input,
@@ -2994,7 +3338,6 @@ def _run_submission_context_pipeline(
         return
 
     assembly_run_id: str | None = None
-    result: dict[str, Any] | None = None
     if len(semantic_inputs) > 1:
         conn = init_db(sandbox_db_path)
         try:
@@ -3005,62 +3348,29 @@ def _run_submission_context_pipeline(
         finally:
             conn.close()
 
-        if existing_assembly_state is not None:
-            if existing_assembly_state["review_required"]:
-                conn = init_db(sandbox_db_path)
-                try:
-                    for item in image_items:
-                        _set_parse_status(conn, item["evidence_id"], PARSE_STATUS_CLARIFICATION_REQUIRED)
-                        _set_clarification_reason(conn, item["evidence_id"], CLARIFICATION_REASON_SEMANTIC_CONTEXT)
-                        _set_parse_detail(
-                            conn,
-                            item["evidence_id"],
-                            "多图上下文关联仍有不确定点，需要先确认当前分组与阅读顺序。",
-                        )
-                    conn.commit()
-                finally:
-                    conn.close()
-                return
-
-            for group in existing_assembly_state["groups"]:
-                analysis_order = group.get("analysis_order") or group.get("evidence_ids") or []
-                grouped_inputs = [
-                    item
-                    for evidence_id in analysis_order
-                    for item in semantic_inputs
-                    if item["evidence_id"] == evidence_id
-                ]
-                _run_semantic_parse_for_group(
-                    sandbox_db_path,
-                    global_meta_db_path,
-                    inputs=grouped_inputs,
-                    context_group_key=group.get("group_key"),
-                    context_assembly_run_id=existing_assembly_state["assembly_run_id"],
+        if existing_assembly_state is None:
+            conn = init_db(sandbox_db_path)
+            try:
+                assembly_run = create_context_assembly_run(
+                    conn,
+                    submission_id=submission_id,
+                    provider=context_assembler.ASSEMBLER_PROVIDER,
+                    model=get_text_model(),
+                    assembler_version=context_assembler.ASSEMBLER_VERSION,
                 )
-            return
+                assembly_run_id = assembly_run["assembly_run_id"]
+            finally:
+                conn.close()
 
-        conn = init_db(sandbox_db_path)
-        try:
-            assembly_run = create_context_assembly_run(
-                conn,
-                submission_id=submission_id,
-                provider=context_assembler.ASSEMBLER_PROVIDER,
-                model=get_text_model(),
-                assembler_version=context_assembler.ASSEMBLER_VERSION,
-            )
-            assembly_run_id = assembly_run["assembly_run_id"]
-        finally:
-            conn.close()
-
-        result, _diagnostic = context_assembler.assemble_context_groups(semantic_inputs)
-        conn = init_db(sandbox_db_path)
-        try:
-            persist_context_assembly_run_result(
-                conn,
-                assembly_run_id=assembly_run_id,
-                result=result,
-            )
-            if context_assembler.groups_require_user_review(result):
+            result, _diagnostic = context_assembler.assemble_context_groups(semantic_inputs)
+            conn = init_db(sandbox_db_path)
+            try:
+                persist_context_assembly_run_result(
+                    conn,
+                    assembly_run_id=assembly_run_id,
+                    result=result,
+                )
+                review_status = "needs_user_review" if context_assembler.groups_require_user_review(result) else "accepted"
                 for group in result.get("groups", []):
                     if not isinstance(group, dict):
                         continue
@@ -3068,40 +3378,58 @@ def _run_submission_context_pipeline(
                         conn,
                         assembly_run_id=assembly_run_id,
                         group_key=group.get("group_key") or "group",
-                        review_status="needs_user_review",
+                        review_status=review_status,
                         decision=group,
                     )
-                    for evidence_id in group.get("evidence_ids", []):
-                        _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
-                        _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_SEMANTIC_CONTEXT)
-                        _set_parse_detail(conn, evidence_id, "多图上下文关联仍有不确定点，当前不会直接开始 AI 整理。")
+                conn.commit()
+            except Exception:
+                try:
+                    mark_context_assembly_run_failed(
+                        conn,
+                        assembly_run_id=assembly_run_id,
+                        failure_type="persistence_error",
+                    )
+                except Exception:
+                    pass
+                raise
+
+        conn = init_db(sandbox_db_path)
+        try:
+            submission_review = _build_submission_review_payload(
+                conn,
+                submission_id=submission_id,
+            )
+            if submission_review is None:
+                return
+            if submission_review["requires_review"]:
+                for current in submission_review["items"]:
+                    evidence_id = current["evidence_id"]
+                    if current["stage"] in {"failed", "source_review"}:
+                        continue
+                    _set_parse_status(conn, evidence_id, PARSE_STATUS_CLARIFICATION_REQUIRED)
+                    _set_clarification_reason(conn, evidence_id, CLARIFICATION_REASON_SEMANTIC_CONTEXT)
+                    _set_parse_detail(conn, evidence_id, "这次上传需要先确认上下文分组、记录日期或发言者称呼。")
                 conn.commit()
                 return
-            for group in result.get("groups", []):
-                if not isinstance(group, dict):
-                    continue
-                create_context_group_review(
-                    conn,
-                    assembly_run_id=assembly_run_id,
-                    group_key=group.get("group_key") or "group",
-                    review_status="accepted",
-                    decision=group,
-                )
-            conn.commit()
-        except Exception:
-            try:
-                mark_context_assembly_run_failed(
-                    conn,
-                    assembly_run_id=assembly_run_id,
-                    failure_type="persistence_error",
-                )
-            except Exception:
-                pass
-            raise
 
-        for group in result.get("groups", []):
-            if not isinstance(group, dict):
-                continue
+            for current in submission_review["items"]:
+                evidence_id = current["evidence_id"]
+                if current["stage"] == "failed":
+                    continue
+                _clear_extract_note(conn, evidence_id)
+                _clear_clarification_state(conn, evidence_id)
+                _set_parse_status(conn, evidence_id, PARSE_STATUS_LLM_RUNNING)
+                _set_parse_detail(conn, evidence_id, "")
+            conn.commit()
+
+            groups_to_run = submission_review["groups"]
+            assembly_run_id = None
+            if submission_review["assembly_review"] is not None:
+                assembly_run_id = submission_review["assembly_review"]["assembly_run_id"]
+        finally:
+            conn.close()
+
+        for group in groups_to_run:
             analysis_order = group.get("analysis_order") or group.get("evidence_ids") or []
             grouped_inputs = [
                 item
@@ -4985,6 +5313,8 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=400, detail="当前记录缺少可核实的提取版本")
 
             submission_id = _multi_image_submission_id_for_evidence(conn, evidence_id)
+            if submission_id is not None:
+                raise HTTPException(status_code=409, detail="多图提交请在本次上传页面统一确认上下文")
             current_context = _current_semantic_context_payload(
                 conn,
                 evidence_id=evidence_id,
@@ -5392,6 +5722,234 @@ def create_app() -> FastAPI:
         apply_sandbox_cookie(response, sandbox)
         return response
 
+    @app.get("/submission/{submission_id}", response_class=HTMLResponse)
+    def submission_detail(
+        request: Request,
+        submission_id: str,
+        sandbox: SandboxContext = Depends(get_sandbox),
+        conn: sqlite3.Connection = Depends(get_conn),
+    ) -> HTMLResponse:
+        submission = _build_submission_review_payload(conn, submission_id=submission_id)
+        if submission is None:
+            raise HTTPException(status_code=404, detail="submission not found")
+        response = TEMPLATES.TemplateResponse(
+            request,
+            "submission.html",
+            {
+                "page_title": "本次上传",
+                "submission": submission,
+                "current_search_q": "",
+            },
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
+    @app.post("/api/submission/{submission_id}/context-review")
+    async def submit_submission_context_review(
+        submission_id: str,
+        request: Request,
+        background_tasks: BackgroundTasks,
+        sandbox: SandboxContext = Depends(get_sandbox),
+    ) -> JSONResponse:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid request body")
+        unexpected_fields = sorted(set(payload) - {"groups", "accept_suggested_groups"})
+        if unexpected_fields:
+            raise HTTPException(status_code=400, detail=f"unsupported fields: {', '.join(unexpected_fields)}")
+
+        group_payloads = payload.get("groups")
+        if not isinstance(group_payloads, list):
+            raise HTTPException(status_code=400, detail="groups must be a list")
+        accept_suggested_groups = payload.get("accept_suggested_groups", True)
+        if not isinstance(accept_suggested_groups, bool):
+            raise HTTPException(status_code=400, detail="accept_suggested_groups must be boolean")
+
+        conn = init_db(sandbox.db_path)
+        try:
+            current = _build_submission_review_payload(conn, submission_id=submission_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="submission not found")
+            if current["source_blocked"]:
+                raise HTTPException(status_code=409, detail="当前仍有图片需要先核实来源")
+            if not current["requires_review"]:
+                raise HTTPException(status_code=409, detail="当前提交不需要补充整理上下文")
+
+            required_groups = {
+                group["group_key"]: group
+                for group in current["groups"]
+                if group["requires_review"]
+            }
+            provided_groups: dict[str, dict[str, Any]] = {}
+            validated_groups: list[dict[str, Any]] = []
+            for item in group_payloads:
+                if not isinstance(item, dict):
+                    raise HTTPException(status_code=400, detail="groups items must be objects")
+                unexpected_group_fields = sorted(
+                    set(item) - {"group_key", "date_mode", "record_date", "record_dates", "speaker_labels"}
+                )
+                if unexpected_group_fields:
+                    raise HTTPException(status_code=400, detail=f"unsupported group fields: {', '.join(unexpected_group_fields)}")
+                group_key = str(item.get("group_key", "")).strip()
+                if not group_key:
+                    raise HTTPException(status_code=400, detail="group_key is required")
+                if group_key in provided_groups:
+                    raise HTTPException(status_code=400, detail="group_key duplicated in request")
+                group = required_groups.get(group_key)
+                if group is None:
+                    raise HTTPException(status_code=400, detail="request contains unknown or unnecessary group")
+                date_mode = str(item.get("date_mode", "")).strip() or "same_day"
+                record_date = _normalize_record_date_input(item.get("record_date"))
+                raw_record_dates = item.get("record_dates")
+                if raw_record_dates is None:
+                    record_dates_payload: dict[str, str] = {}
+                elif isinstance(raw_record_dates, dict):
+                    record_dates_payload = {}
+                    for evidence_id, value in raw_record_dates.items():
+                        if not isinstance(evidence_id, str):
+                            raise HTTPException(status_code=400, detail="record_dates keys must be evidence ids")
+                        normalized_value = _normalize_record_date_input(value)
+                        if normalized_value is None:
+                            raise HTTPException(status_code=400, detail="record_dates contains invalid date")
+                        record_dates_payload[evidence_id] = normalized_value
+                else:
+                    raise HTTPException(status_code=400, detail="record_dates must be an object")
+
+                required_temporal_ids = [current_item["evidence_id"] for current_item in group["temporal_items"]]
+                resolved_dates: dict[str, str] = {}
+                if required_temporal_ids:
+                    if group["allows_shared_date"] and date_mode not in {"same_day", "per_evidence"}:
+                        raise HTTPException(status_code=400, detail="continuation group date_mode must be same_day or per_evidence")
+                    if not group["allows_shared_date"]:
+                        date_mode = "per_evidence"
+                    if date_mode == "same_day":
+                        if record_date is None:
+                            raise HTTPException(status_code=400, detail="请选择组内统一记录日期")
+                        resolved_dates = {evidence_id: record_date for evidence_id in required_temporal_ids}
+                    else:
+                        missing_temporal = [
+                            evidence_id for evidence_id in required_temporal_ids
+                            if evidence_id not in record_dates_payload
+                        ]
+                        if missing_temporal:
+                            raise HTTPException(status_code=400, detail="请补全每张需要日期的图片")
+                        resolved_dates = {
+                            evidence_id: record_dates_payload[evidence_id]
+                            for evidence_id in required_temporal_ids
+                        }
+                elif record_date is not None or record_dates_payload:
+                    raise HTTPException(status_code=400, detail="当前组不需要补充记录日期")
+
+                raw_speaker_labels = item.get("speaker_labels")
+                if raw_speaker_labels is None:
+                    speaker_labels: dict[str, str] = {}
+                elif isinstance(raw_speaker_labels, dict):
+                    speaker_labels = {}
+                    allowed_refs = {field["speaker_ref"] for field in group["speaker_fields"]}
+                    for speaker_ref, label in raw_speaker_labels.items():
+                        if speaker_ref not in {"left_account", "right_account"}:
+                            raise HTTPException(status_code=400, detail="speaker_labels 只支持 left_account/right_account")
+                        if speaker_ref not in allowed_refs:
+                            raise HTTPException(status_code=400, detail="当前组不需要该发言者称呼")
+                        if not isinstance(label, str):
+                            raise HTTPException(status_code=400, detail="speaker_labels value must be string")
+                        normalized_label = label.strip()
+                        if normalized_label:
+                            speaker_labels[speaker_ref] = normalized_label
+                else:
+                    raise HTTPException(status_code=400, detail="speaker_labels must be an object")
+
+                if group["assembly_pending"] and not accept_suggested_groups:
+                    raise HTTPException(status_code=400, detail="当前仅支持确认系统建议后继续")
+
+                validated_groups.append(
+                    {
+                        "group": group,
+                        "resolved_dates": resolved_dates,
+                        "speaker_labels": speaker_labels,
+                    }
+                )
+                provided_groups[group_key] = item
+
+            missing_group_keys = [group_key for group_key in required_groups if group_key not in provided_groups]
+            if missing_group_keys:
+                raise HTTPException(status_code=400, detail="请一次提交本次上传需要确认的全部上下文")
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for validated in validated_groups:
+                    group = validated["group"]
+                    if group["assembly_pending"]:
+                        create_context_group_review(
+                            conn,
+                            assembly_run_id=current["assembly_review"]["assembly_run_id"],
+                            group_key=group["group_key"],
+                            review_status="accepted",
+                            decision={
+                                "group_key": group["group_key"],
+                                "evidence_ids": group["evidence_ids"],
+                                "analysis_order": group["analysis_order"],
+                                "relation": group["relation"],
+                            },
+                        )
+                    for evidence_id, resolved_date in validated["resolved_dates"].items():
+                        _set_semantic_anchor(conn, evidence_id, resolved_date, "user", commit=False)
+                    if group["speaker_review_supported"]:
+                        for current_item in group["items"]:
+                            extraction = current_item["extraction"]
+                            if not isinstance(extraction, dict):
+                                continue
+                            relevant_labels = {
+                                speaker_ref: label
+                                for speaker_ref, label in validated["speaker_labels"].items()
+                                if speaker_ref in current_item["speaker_state"].get("missing_refs", [])
+                            }
+                            if current_item["speaker_state"].get("missing_refs") or relevant_labels:
+                                create_extraction_speaker_review(
+                                    conn,
+                                    evidence_id=current_item["evidence_id"],
+                                    extraction_id=extraction["extraction_id"],
+                                    status="provided" if relevant_labels else "skipped",
+                                    labels=relevant_labels,
+                                )
+
+                for item in current["items"]:
+                    if item["stage"] in {"failed", "source_review"}:
+                        continue
+                    _set_meta_value(conn, _parse_status_key(item["evidence_id"]), PARSE_STATUS_LLM_RUNNING)
+                    _set_meta_value(conn, _parse_detail_key(item["evidence_id"]), "")
+                    conn.execute(
+                        "DELETE FROM meta WHERE key IN (?, ?)",
+                        (
+                            _clarification_reason_key(item["evidence_id"]),
+                            _extract_note_key(item["evidence_id"]),
+                        ),
+                    )
+                conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+        finally:
+            conn.close()
+
+        background_tasks.add_task(
+            _run_multi_image_pipeline,
+            sandbox.db_path,
+            request.app.state.global_meta_db_path,
+            [],
+            submission_id=submission_id,
+        )
+
+        response = JSONResponse(
+            {
+                "submission_id": submission_id,
+                "parse_status": PARSE_STATUS_LLM_RUNNING,
+            }
+        )
+        apply_sandbox_cookie(response, sandbox)
+        return response
+
     @app.get("/", response_class=HTMLResponse)
     def index(
         request: Request,
@@ -5650,6 +6208,23 @@ def create_app() -> FastAPI:
                 if context["media_type"] == "image"
                 else None
             )
+            latest_semantic_run = get_latest_semantic_run_for_evidence(
+                status_conn,
+                evidence_id,
+                status="succeeded",
+            )
+            shared_submission_groups = _latest_shared_submission_groups_for_evidence(
+                status_conn,
+                evidence_id,
+            )
+            has_shared_group_result = bool(
+                latest_semantic_run is not None
+                and latest_semantic_run.get("context_group_key")
+                and len(latest_semantic_run.get("inputs", [])) > 1
+                and shared_submission_groups
+            )
+            if has_shared_group_result:
+                context["semantic_result"] = None
             record_date = _get_semantic_anchor_date(status_conn, evidence_id)
             record_date_source = _get_semantic_anchor_source(status_conn, evidence_id)
             record_date_state = {
@@ -5690,6 +6265,8 @@ def create_app() -> FastAPI:
                 "source_gate": source_gate,
                 "temporal_gate": temporal_gate,
                 "semantic_context": semantic_context,
+                "shared_submission_groups": shared_submission_groups,
+                "has_shared_group_result": has_shared_group_result,
                 "record_date_state": record_date_state,
                 "source_presets": SOURCE_PRESETS,
                 "diagnostics_enabled": _diagnostics_enabled(),
